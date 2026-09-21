@@ -20,8 +20,17 @@ setting.
 ## Risk stamp
 
 `PaperLedger.submit` requires a `RiskStamp` minted by `RiskGuard`. Tokens are
-HMAC-SHA256 over proposal identity fields. A CEO, a test, or a dashboard
-cannot forge a stamp without the process secret.
+HMAC-SHA256 over proposal identity fields. There is **no published default
+secret**. `GROW_RISK_SECRET` must be set, or tests must inject a secret into
+`RiskGuard(..., secret=...)`. Known values such as `grow-risk-v1-paper-only`
+are refused. A CEO, a test, or a dashboard cannot forge a stamp without that
+process secret.
+
+## Cash long-only
+
+`OPEN+SELL` is a short. Risk Guard rejects it (`policy.long_only`). The
+ledger refuses negative inventory even if a stamp is missing or forged.
+`SELL` is legal only as flatten/reduce/square-off of an existing long.
 
 ## Square-off
 

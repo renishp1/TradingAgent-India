@@ -2,12 +2,15 @@
 
 The only venue Grow can fill. Every fill requires a RiskStamp that verifies
 against the current Risk Guard. No network, no broker, no persistence yet.
+
+Architecture Review #1: cash book is long-only. Negative quantity is a
+safety error, not a short inventory. P&L is realized-at-cost; mark-to-market
+is deferred until licensed quotes exist.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
 from uuid import uuid4
 
 from grow.clock import Clock, SystemClock
@@ -23,6 +26,10 @@ class Position:
     symbol: Symbol
     quantity: int
     average_price: float
+
+    def __post_init__(self) -> None:
+        if self.quantity < 0:
+            raise GrowSafetyError("Cash book refuses short inventory.")
 
     @property
     def notional(self) -> float:
@@ -51,6 +58,11 @@ class PaperBook:
             "currency": self.currency,
             "gross_notional": self.gross_notional,
             "realized_pnl": self.realized_pnl,
+            "valuation": {
+                "method": "cost_notional",
+                "unrealized_pnl": None,
+                "note": "MTM / drawdown deferred until licensed quotes. Do not treat realized_pnl as strategy performance.",
+            },
             "positions": {
                 key: {
                     "ticker": pos.symbol.ticker,
@@ -79,6 +91,8 @@ class PaperLedger:
         )
         if proposal.venue is not Venue.PAPER:
             raise GrowSafetyError("Paper ledger received a non-paper venue.")
+        if proposal.intent is Intent.OPEN and proposal.side is Side.SELL and not self.config.risk.allow_short:
+            raise GrowSafetyError("Cash book refuses to open a short.")
         self.guard.require_stamp(proposal, stamp)
 
         fill = Fill(
@@ -106,9 +120,13 @@ class PaperLedger:
             self.book.cash += fill.notional
 
         if pos is None:
+            if signed < 0:
+                raise GrowSafetyError("Cash book refuses to open a short.")
             self.book.positions[key] = Position(symbol=fill.symbol, quantity=signed, average_price=fill.price)
         else:
             new_qty = pos.quantity + signed
+            if new_qty < 0:
+                raise GrowSafetyError("Cash book refuses short inventory.")
             if pos.quantity != 0 and (pos.quantity > 0) != (signed > 0):
                 closed = min(abs(pos.quantity), abs(signed))
                 direction = 1 if pos.quantity > 0 else -1
@@ -131,14 +149,13 @@ class PaperLedger:
         pos = self.book.positions.get(ticker)
         if pos is None or pos.quantity == 0:
             return None
-        side = Side.SELL if pos.quantity > 0 else Side.BUY
+        if pos.quantity < 0:
+            raise GrowSafetyError("Cash book has illegal short inventory.")
         qty = abs(pos.quantity)
-        from grow.types import TradeProposal
-
         return TradeProposal(
             proposal_id=f"sqoff-{ticker}-{uuid4().hex[:8]}",
             symbol=pos.symbol,
-            side=side,
+            side=Side.SELL,
             intent=Intent.SQUARE_OFF,
             quantity=qty,
             limit_price=last_price,

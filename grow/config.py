@@ -125,6 +125,7 @@ class MarketConfig:
     session_close: str
     square_off: str
     universe: tuple[str, ...]
+    product: str
 
 
 @dataclass(frozen=True)
@@ -135,6 +136,8 @@ class RiskConfig:
     require_stop_loss: bool
     max_symbol_concentration: float
     ruleset: str
+    allow_short: bool
+    concentration_basis: str
 
 
 @dataclass(frozen=True)
@@ -176,6 +179,12 @@ class GrowConfig:
             raise GrowLiveTradingDisabled("config.execution.live_trading_enabled must be false")
         if self.paper.venue_id.upper() not in {"GROW_PAPER", "PAPER"}:
             raise GrowLiveTradingDisabled(f"Unknown paper venue {self.paper.venue_id!r}")
+        if self.market.product != "CASH":
+            raise GrowConfigError("Milestone 1 product must be CASH.")
+        if self.risk.allow_short:
+            raise GrowConfigError("Milestone 1 cash book forbids shorts. allow_short must be false.")
+        if self.risk.concentration_basis != "cost_notional":
+            raise GrowConfigError("Milestone 1 concentration_basis must be cost_notional until MTM exists.")
 
 
 def _overlay_env(raw: dict[str, Any], environ: dict[str, str]) -> dict[str, Any]:
@@ -235,6 +244,7 @@ def _build(raw: dict[str, Any], source_path: str) -> GrowConfig:
             session_close=str(market.get("session_close", "15:30")),
             square_off=str(market.get("square_off", "15:15")),
             universe=tuple(str(s).strip().upper() for s in universe),
+            product=str(market.get("product", "CASH")).upper(),
         ),
         risk=RiskConfig(
             max_position_notional=_as_float(risk.get("max_position_notional", 100000), "max_position_notional"),
@@ -245,6 +255,8 @@ def _build(raw: dict[str, Any], source_path: str) -> GrowConfig:
                 risk.get("max_symbol_concentration", 0.35), "max_symbol_concentration"
             ),
             ruleset=str(risk.get("ruleset", "grow.risk.v1")),
+            allow_short=_as_bool(risk.get("allow_short", False), "allow_short"),
+            concentration_basis=str(risk.get("concentration_basis", "cost_notional")),
         ),
         paper=PaperConfig(
             starting_cash=_as_float(paper.get("starting_cash", 1_000_000), "starting_cash"),

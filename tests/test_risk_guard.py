@@ -2,15 +2,21 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime
+from pathlib import Path
 from uuid import uuid4
 
 from grow.clock import FrozenClock, IST
 from grow.config import load_config
-from grow.errors import GrowSafetyError
+from grow.errors import GrowConfigError, GrowSafetyError
 from grow.market.research import MarketResearch
 from grow.paper.ledger import PaperLedger
 from grow.risk.guard import RiskGuard
+from grow.risk.secret import resolve_risk_secret
 from grow.types import Intent, Regime, RiskStamp, Side, Symbol, TradeProposal, Venue
+
+from tests.helpers import TEST_RISK_SECRET, make_guard
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _proposal(**kwargs) -> TradeProposal:
@@ -38,9 +44,9 @@ def _proposal(**kwargs) -> TradeProposal:
 
 class RiskGuardTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.clock = FrozenClock(datetime(2026, 9, 21, 11, 0, tzinfo=IST))  # Monday in session
+        self.clock = FrozenClock(datetime(2026, 9, 21, 11, 0, tzinfo=IST))
         self.config = load_config()
-        self.guard = RiskGuard(self.config, clock=self.clock)
+        self.guard = make_guard(self.config, clock=self.clock)
         brief = MarketResearch(self.config, clock=self.clock).research("RELIANCE")
         object.__setattr__(brief, "regime", Regime.RANGING)
         self.brief = brief
@@ -60,7 +66,7 @@ class RiskGuardTests(unittest.TestCase):
         self.assertTrue(verdict.approved, verdict.reason)
         self.assertIsNotNone(verdict.stamp)
         self.assertTrue(self.guard.verify_stamp(
-            _proposal(  # different id — should fail
+            _proposal(
                 proposal_id="other",
                 limit_price=self.brief.last_price,
                 notional=self.brief.last_price * 10,
@@ -82,7 +88,7 @@ class RiskGuardTests(unittest.TestCase):
 
     def test_after_hours_open_rejected(self) -> None:
         night = FrozenClock(datetime(2026, 9, 21, 18, 0, tzinfo=IST))
-        guard = RiskGuard(self.config, clock=night)
+        guard = make_guard(self.config, clock=night)
         p = _proposal(limit_price=self.brief.last_price, notional=self.brief.last_price * 5)
         verdict = guard.evaluate(
             p, self.brief, cash=1_000_000, gross_notional=0, daily_pnl=0, symbol_notional=0
@@ -92,7 +98,7 @@ class RiskGuardTests(unittest.TestCase):
 
     def test_square_off_window_blocks_new_entries(self) -> None:
         late = FrozenClock(datetime(2026, 9, 21, 15, 20, tzinfo=IST))
-        guard = RiskGuard(self.config, clock=late)
+        guard = make_guard(self.config, clock=late)
         p = _proposal(limit_price=self.brief.last_price, notional=self.brief.last_price)
         verdict = guard.evaluate(
             p, self.brief, cash=1_000_000, gross_notional=0, daily_pnl=0, symbol_notional=0
@@ -102,7 +108,7 @@ class RiskGuardTests(unittest.TestCase):
 
     def test_square_off_window_allows_flatten(self) -> None:
         late = FrozenClock(datetime(2026, 9, 21, 15, 20, tzinfo=IST))
-        guard = RiskGuard(self.config, clock=late)
+        guard = make_guard(self.config, clock=late)
         p = _proposal(
             intent=Intent.SQUARE_OFF,
             side=Side.SELL,
@@ -140,6 +146,54 @@ class RiskGuardTests(unittest.TestCase):
         verdict = self._eval(p, daily_pnl=-50_000)
         self.assertFalse(verdict.approved)
         self.assertIn("loss.daily", verdict.reason)
+
+    def test_open_sell_rejected_as_short(self) -> None:
+        p = _proposal(
+            side=Side.SELL,
+            intent=Intent.OPEN,
+            limit_price=self.brief.last_price,
+            stop_loss=round(self.brief.last_price * 1.02, 2),
+            notional=self.brief.last_price,
+        )
+        verdict = self._eval(p)
+        self.assertFalse(verdict.approved)
+        self.assertIn("policy.long_only", verdict.reason)
+
+    def test_concentration_reports_cost_notional_basis(self) -> None:
+        verdict = self._eval(_proposal(limit_price=self.brief.last_price, notional=self.brief.last_price))
+        conc = [r for r in verdict.rule_results if r[0] == "concentration.symbol"][0]
+        self.assertIn("basis=cost_notional", conc[2])
+
+
+class RiskSecretTests(unittest.TestCase):
+    def test_missing_secret_fails_closed(self) -> None:
+        with self.assertRaises(GrowConfigError):
+            resolve_risk_secret(explicit=None, environ={})
+        with self.assertRaises(GrowConfigError):
+            RiskGuard(load_config(), secret="")
+
+    def test_published_default_refused(self) -> None:
+        with self.assertRaises(GrowConfigError):
+            resolve_risk_secret(explicit="grow-risk-v1-paper-only")
+
+    def test_source_has_no_default_secret_fallback(self) -> None:
+        src = (ROOT / "grow" / "risk" / "guard.py").read_text(encoding="utf-8")
+        self.assertNotIn("grow-risk-v1-paper-only", src)
+        self.assertNotIn('os.environ.get("GROW_RISK_SECRET"', src)
+
+    def test_injected_secret_stamps(self) -> None:
+        secret = TEST_RISK_SECRET
+        other = "grow-test-hmac-v2"
+        clock = FrozenClock(datetime(2026, 9, 21, 11, 0, tzinfo=IST))
+        config = load_config()
+        a = RiskGuard(config, clock=clock, secret=secret)
+        b = RiskGuard(config, clock=clock, secret=other)
+        brief = MarketResearch(config, clock=clock).research("RELIANCE")
+        object.__setattr__(brief, "regime", Regime.RANGING)
+        p = _proposal(limit_price=brief.last_price, notional=brief.last_price)
+        verdict = a.evaluate(p, brief, cash=1_000_000, gross_notional=0, daily_pnl=0, symbol_notional=0)
+        self.assertTrue(verdict.approved, verdict.reason)
+        self.assertFalse(b.verify_stamp(p, verdict.stamp))
 
 
 if __name__ == "__main__":
