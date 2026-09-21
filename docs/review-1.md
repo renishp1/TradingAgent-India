@@ -18,24 +18,34 @@ engine**, not execution.
 | TradingAgents graph | Architecture skeleton. Stub notes on purpose. Not intelligence. |
 | Safety lock | Keep all three layers. No broker SDKs. |
 
+## Follow-ups after acceptance (landed)
+
+| Item | Decision |
+|---|---|
+| RiskStamp binding | Canonical JSON of the fill-relevant proposal (`grow.risk.stamp.v2`) → SHA-256 → HMAC-SHA256. SL, TP, and notional are bound. Thesis/confidence are not. |
+| Ledger invariants | Stamp is necessary, not sufficient. Ledger checks qty, price, notional=qty×price, venue, long-only, flatten qty ≤ open position. |
+| Square-off tests | Unknown position, oversize flatten, OPEN-session flatten allowed, 15:29 allowed, 15:30+ rejected. |
+| Daily P&L | **Known limitation.** `loss.daily` currently sees lifetime `realized_pnl`, not a session-day accumulator. `pnl.true_daily_pnl = null` until 2A valuation. |
+
 ## Control plane (unchanged)
 
 ```
 Market research + research graph
-            |
-            v
+            │
+            ▼
            CEO          (TradeProposal only, cash long-only OPEN)
-            |
-            v
-        Risk Guard      (code, HMAC RiskStamp)
-            |
-            v
-       Paper ledger     (GROW_PAPER, no shorts)
+            │
+            ▼
+        Risk Guard      (code, HMAC RiskStamp of the exact proposal)
+            │
+            ▼
+       Paper ledger     (GROW_PAPER, no shorts, own fill invariants)
 ```
 
 ## Milestone 2 (not started here)
 
 Phase 2A — data layer (OHLCV / indices / later options fields), broker still disconnected.  
+Do not attach a live feed until the holiday calendar is the official circular.  
 Phase 2B — quantitative `StrategySignal` book.  
 Phase 2C — LLM research over **signals**, not LLM-as-trader.
 

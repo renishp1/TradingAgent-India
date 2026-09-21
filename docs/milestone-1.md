@@ -19,6 +19,10 @@ Review #1 follow-ups that landed in this tree:
 - Explicit CASH long-only policy (`OPEN+SELL` rejected)
 - Valuation labeled `cost_notional` (MTM deferred)
 - CEO SL/TP marked `probe_placeholder`
+- Canonical RiskStamp (`grow.risk.stamp.v2`) binds SL / TP / notional
+- Ledger fill invariants (stamp is not the only check)
+- Square-off path tests (15:29 allowed, 15:30+ rejected)
+- Daily P&L limitation documented (`pnl.true_daily_pnl = null`)
 
 ## Not in this milestone
 
