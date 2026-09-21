@@ -1,31 +1,36 @@
 # Milestone 1 checklist
 
-Shipped in the first commit:
+Shipped, then tightened by [Architecture Review #1](review-1.md):
 
-1. TradingAgents foundation (`tradingagents/`) — roles, default config, sequential graph
+1. TradingAgents foundation (`tradingagents/`) — roles, default config, sequential graph (stub intelligence)
 2. Grow project tree (`grow/` with CEO, market, options, strategies, risk, execution, paper, data, learning, model_gateway, dashboard)
-3. Configuration system (`configs/grow.default.yaml` + env overlay)
+3. Configuration (`configs/grow.default.yaml` + env overlay)
 4. Model gateway abstraction (mock default)
-5. CEO interface (proposal only)
-6. Risk Guard interface (deterministic + HMAC stamp)
-7. Market Research interface (stub brief + NSE session)
+5. CEO interface (proposal only, cash long-only OPEN)
+6. Risk Guard (deterministic + HMAC stamp, secret required)
+7. Market Research (stub brief + NSE session)
 8. Paper-trading-only safety lock (compile + boot + runtime)
 9. Automated tests (`python -m unittest discover -s tests -v`)
-10. Architecture documentation (`docs/architecture.md`, `docs/safety.md`)
+10. Architecture documentation
 
-Explicitly **not** in this commit:
+Review #1 follow-ups that landed in this tree:
 
-- Options chains / greeks
-- Live or scraped NSE/BSE/FII data
-- Broker SDKs
-- LangGraph upstream adapter
-- Persistent storage
-- Production web dashboard (schema only)
+- HMAC secret fail-closed (no published default)
+- Explicit CASH long-only policy (`OPEN+SELL` rejected)
+- Valuation labeled `cost_notional` (MTM deferred)
+- CEO SL/TP marked `probe_placeholder`
 
-## How to review
+## Not in this milestone
 
-1. Read `docs/architecture.md` and `docs/safety.md`.
-2. Run the test suite.
-3. Try to break the lock: `GROW_EXECUTION_MODE=live python -m grow` (it must refuse).
-4. Run `python scripts/run_paper_cycle.py RELIANCE` and confirm fills, if any, have `venue_id=GROW_PAPER`.
-5. Do not start options/data/execution work until this review passes.
+- Licensed OHLCV / options / FII data (that's 2A)
+- Strategy engine (2B)
+- LLM debate over real signals (2C)
+- Broker SDKs / live execution
+
+## How to probe
+
+```bash
+export GROW_RISK_SECRET=$(python -c "import secrets; print(secrets.token_hex(32))")
+python -m unittest discover -s tests -v
+python scripts/run_paper_cycle.py RELIANCE
+```

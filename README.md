@@ -2,8 +2,9 @@
 
 Indian-market multi-agent trading **research** system. **Paper-trading only.**
 
-This repository is the source of truth for Grow. Milestone 1 is a foundation
-commit for Architecture Review #1 — not a complete desk.
+This repository is the source of truth for Grow. Milestone 1 passed
+**Architecture Review #1** ([`docs/review-1.md`](docs/review-1.md)). It is
+still a constrained paper-trading foundation, not a desk.
 
 > Not financial advice. Not a broker. Not SEBI-registered. Live execution is
 > not compiled into this software.
@@ -21,8 +22,9 @@ commit for Architecture Review #1 — not a complete desk.
 9. Automated tests.
 10. Architecture docs: [`docs/architecture.md`](docs/architecture.md), [`docs/safety.md`](docs/safety.md), [`docs/milestone-1.md`](docs/milestone-1.md).
 
-Options, live data, brokers, and LangGraph are **out of scope** until the
-review passes.
+Options, live data, brokers, and LangGraph remain **out of scope**.
+Milestone 2 is licensed market data + research — not broker APIs.
+See [`docs/review-1.md`](docs/review-1.md).
 
 ## Layout
 
@@ -53,10 +55,13 @@ Python 3.10+. No third-party dependencies in milestone 1.
 
 ```bash
 python -m unittest discover -s tests -v
+export GROW_RISK_SECRET=$(python -c "import secrets; print(secrets.token_hex(32))")
 python scripts/run_paper_cycle.py RELIANCE
 ```
 
 Copy `.env.example` only if you need env overlays. Leave live flags false.
+`GROW_RISK_SECRET` is required for any process that mints a RiskStamp.
+Tests inject their own secret and do not read a default.
 
 ## Safety
 
@@ -66,7 +71,9 @@ Copy `.env.example` only if you need env overlays. Leave live flags false.
 | `GROW_LIVE_TRADING=true` | `GrowLiveTradingDisabled` |
 | `LiveBroker()` | `GrowLiveTradingDisabled` |
 | Paper fill without RiskStamp | `GrowSafetyError` |
+| `OPEN+SELL` (short) | Risk Guard `policy.long_only` |
 | New entries after 15:15 IST | Risk Guard reject |
+| Missing `GROW_RISK_SECRET` | `GrowConfigError` |
 | Broker SDK import | not present in the tree |
 
 `LIVE_TRADING_COMPILED` is a constant set to `False`. Environment variables
@@ -84,6 +91,5 @@ cannot flip it.
 
 ## Review
 
-See [`docs/milestone-1.md`](docs/milestone-1.md). Please treat GitHub as the
-source of truth and complete Architecture Review #1 before any
-options / data / execution work.
+See [`docs/review-1.md`](docs/review-1.md). Next work is Milestone 2A
+(data layer), not brokers.
