@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from grow.config import AIConfig
 from grow.research.models import (
     DECISION_SCHEMA,
     CEODecision,
@@ -32,6 +33,18 @@ _PROHIBITED = frozenset(
     }
 )
 _REQUIRED_AGENTS = ("bull", "bear", "quant", "risk_context")
+
+
+def asof_failures(packet: ResearchPacket) -> tuple[str, ...]:
+    expected = packet.as_of.isoformat()
+    view_asof = packet.market_research_view.get("as_of")
+    signal_asof = packet.strategy_evidence.get("as_of")
+    if view_asof != expected or signal_asof != expected:
+        return ("ASOF_MISMATCH",)
+    candidate = packet.option_candidate
+    if candidate is not None and candidate.get("as_of") not in {None, expected}:
+        return ("ASOF_MISMATCH",)
+    return ()
 
 
 def _scan_prohibited(payload: Any, found: list[str]) -> None:
@@ -88,6 +101,9 @@ def no_trade(
 
 
 class DecisionValidator:
+    def __init__(self, ai: AIConfig | None = None) -> None:
+        self.ai = ai
+
     def validate(
         self,
         packet: ResearchPacket,
@@ -96,8 +112,11 @@ class DecisionValidator:
         raw: Mapping[str, Any] | None = None,
     ) -> CEODecision:
         failures = list(decision.validation_failures)
+        failures.extend(asof_failures(packet))
         if packet.packet_schema_version != "research.packet.v1":
             failures.append("PACKET_SCHEMA")
+        if decision.decision_schema_version != DECISION_SCHEMA:
+            failures.append("DECISION_SCHEMA")
         if decision.packet_id != packet.packet_id:
             failures.append("PACKET_ID_MISMATCH")
         if decision.as_of != packet.as_of:
@@ -153,6 +172,14 @@ class DecisionValidator:
             failures.append("RISK_CONTEXT_OPPOSE")
         if packet.options_status != "CANDIDATE":
             failures.append("OPTIONS_NO_TRADE")
+        ai = self.ai
+        if (
+            ai is not None
+            and ai.confidence_enabled
+            and decision.decision is CEOVerdict.TRADE_APPROVE
+            and decision.confidence < ai.min_ceo_confidence
+        ):
+            failures.append("CEO_CONFIDENCE")
         unique = tuple(dict.fromkeys(failures))
         if unique:
             return no_trade(

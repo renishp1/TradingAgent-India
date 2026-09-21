@@ -264,6 +264,93 @@ class ResearchCEOTests(unittest.TestCase):
         self.assertNotIn("strike", raw.to_dict() or {})
         self.assertIsNone(raw.to_dict().get("quantity"))
 
+    def test_packet_maps_are_deeply_frozen(self) -> None:
+        packet, _, _ = _packet("BULLISH")
+        with self.assertRaises(TypeError):
+            packet.market_research_view["last_price"] = 1  # type: ignore[index]
+        with self.assertRaises(TypeError):
+            packet.strategy_evidence["confidence"] = 0  # type: ignore[index]
+        with self.assertRaises(TypeError):
+            packet.session_context["session"] = "CLOSED"  # type: ignore[index]
+        with self.assertRaises(TypeError):
+            packet.data_snapshot_ids["market"] = "x"  # type: ignore[index]
+        assert packet.option_candidate is not None
+        with self.assertRaises(TypeError):
+            packet.option_candidate["strike"] = 0  # type: ignore[index]
+        again = packet.to_dict()
+        self.assertEqual(again["packet_id"], packet.packet_id)
+        self.assertIsInstance(again["market_research_view"], dict)
+        self.assertIsInstance(again["option_candidate"], dict)
+
+    def test_asof_mismatch_no_trade(self) -> None:
+        packet, _, config = _packet("BULLISH")
+        other = (packet.as_of + timedelta(minutes=15)).isoformat()
+        evidence = dict(packet.strategy_evidence)
+        evidence["as_of"] = other
+        mutated = replace(packet, strategy_evidence=evidence)
+        decision = ResearchOrchestrator(config).run(mutated)
+        self.assertEqual(decision.decision, CEOVerdict.NO_TRADE)
+        self.assertIn("ASOF_MISMATCH", decision.rejection_reasons)
+        view = dict(packet.market_research_view)
+        view["as_of"] = other
+        mutated = replace(packet, market_research_view=view)
+        decision = ResearchOrchestrator(config).run(mutated)
+        self.assertIn("ASOF_MISMATCH", decision.rejection_reasons)
+        cand = dict(packet.option_candidate or {})
+        cand["as_of"] = other
+        mutated = replace(packet, option_candidate=cand)
+        decision = ResearchOrchestrator(config).run(mutated)
+        self.assertIn("ASOF_MISMATCH", decision.rejection_reasons)
+
+    def test_build_packet_rejects_asof_mismatch(self) -> None:
+        packet, options, config = _packet("BULLISH")
+        as_of = packet.as_of
+        later = as_of + timedelta(hours=1)
+        snap = _snapshot("NIFTY", later, 25000.0)
+        view = research_view(snap)
+        with self.assertRaises(ValueError) as ctx:
+            build_packet(
+                view=view,
+                signal=_signal("NIFTY", "BULLISH", as_of),
+                options=options,
+                configuration_version=config.version,
+            )
+        self.assertIn("ASOF_MISMATCH", str(ctx.exception))
+
+    def test_confidence_gate_disabled_by_default(self) -> None:
+        packet, _, config = _packet("BULLISH")
+        self.assertFalse(config.ai.confidence_enabled)
+        decision = ResearchOrchestrator(config).run(packet)
+        self.assertEqual(decision.decision, CEOVerdict.TRADE_APPROVE)
+
+    def test_confidence_gate_pass_and_fail(self) -> None:
+        packet, _, config = _packet("BULLISH")
+        orch = ResearchOrchestrator(config)
+        reports = tuple(a.research(packet) for a in orch.agents)
+        raw = orch.ceo.synthesize(packet, reports)
+        self.assertEqual(raw.confidence, 0.5)
+        passing = replace(config, ai=replace(config.ai, confidence_enabled=True, min_ceo_confidence=0.4))
+        fail_cfg = replace(config, ai=replace(config.ai, confidence_enabled=True, min_ceo_confidence=0.6))
+        ok = DecisionValidator(passing.ai).validate(packet, raw, reports)
+        self.assertEqual(ok.decision, CEOVerdict.TRADE_APPROVE)
+        blocked = DecisionValidator(fail_cfg.ai).validate(packet, raw, reports)
+        self.assertEqual(blocked.decision, CEOVerdict.NO_TRADE)
+        self.assertIn("CEO_CONFIDENCE", blocked.rejection_reasons)
+        still = ResearchOrchestrator(passing).run(packet)
+        self.assertEqual(still.decision, CEOVerdict.TRADE_APPROVE)
+        gated = ResearchOrchestrator(fail_cfg).run(packet)
+        self.assertEqual(gated.decision, CEOVerdict.NO_TRADE)
+
+    def test_decision_schema_version(self) -> None:
+        packet, _, config = _packet("BULLISH")
+        orch = ResearchOrchestrator(config)
+        reports = tuple(a.research(packet) for a in orch.agents)
+        raw = orch.ceo.synthesize(packet, reports)
+        raw = replace(raw, decision_schema_version="research.decision.v0")
+        decision = orch.validator.validate(packet, raw, reports)
+        self.assertEqual(decision.decision, CEOVerdict.NO_TRADE)
+        self.assertIn("DECISION_SCHEMA", decision.rejection_reasons)
+
 
 if __name__ == "__main__":
     unittest.main()

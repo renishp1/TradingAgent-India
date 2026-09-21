@@ -7,6 +7,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+from types import MappingProxyType
 from typing import Any, Mapping
 
 
@@ -31,6 +32,23 @@ class Recommendation(str, Enum):
 class CEOVerdict(str, Enum):
     TRADE_APPROVE = "TRADE_APPROVE"
     NO_TRADE = "NO_TRADE"
+
+
+def freeze_map(value: Any) -> Any:
+    """Deep-freeze mappings so packet evidence cannot be mutated in place."""
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: freeze_map(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(freeze_map(item) for item in value)
+    return value
+
+
+def thaw_map(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: thaw_map(item) for key, item in value.items()}
+    if isinstance(value, tuple) and not isinstance(value, (str, bytes)):
+        return [thaw_map(item) for item in value]
+    return value
 
 
 def _digest(payload: Mapping[str, Any]) -> str:
@@ -59,6 +77,17 @@ class ResearchPacket:
     strategy_direction: str
     evidence_for_agents: tuple[str, ...]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "market_research_view", freeze_map(self.market_research_view))
+        object.__setattr__(self, "strategy_evidence", freeze_map(self.strategy_evidence))
+        object.__setattr__(
+            self,
+            "option_candidate",
+            None if self.option_candidate is None else freeze_map(self.option_candidate),
+        )
+        object.__setattr__(self, "session_context", freeze_map(self.session_context))
+        object.__setattr__(self, "data_snapshot_ids", freeze_map(self.data_snapshot_ids))
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "packet_id": self.packet_id,
@@ -68,13 +97,13 @@ class ResearchPacket:
             "strategy_signal_version": self.strategy_signal_version,
             "options_decision_id": self.options_decision_id,
             "option_candidate_id": self.option_candidate_id,
-            "market_research_view": dict(self.market_research_view),
-            "strategy_evidence": dict(self.strategy_evidence),
-            "option_candidate": None if self.option_candidate is None else dict(self.option_candidate),
+            "market_research_view": thaw_map(self.market_research_view),
+            "strategy_evidence": thaw_map(self.strategy_evidence),
+            "option_candidate": None if self.option_candidate is None else thaw_map(self.option_candidate),
             "rejected_candidate_summary": list(self.rejected_candidate_summary),
-            "session_context": dict(self.session_context),
+            "session_context": thaw_map(self.session_context),
             "configuration_version": self.configuration_version,
-            "data_snapshot_ids": dict(self.data_snapshot_ids),
+            "data_snapshot_ids": thaw_map(self.data_snapshot_ids),
             "packet_schema_version": self.packet_schema_version,
             "options_status": self.options_status,
             "strategy_direction": self.strategy_direction,

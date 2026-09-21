@@ -55,6 +55,8 @@ def build_packet(
     _ist(view.as_of)
     _ist(signal.as_of)
     _ist(options.as_of)
+    if not (view.as_of == signal.as_of == options.as_of):
+        raise ValueError("ASOF_MISMATCH")
     candidate = options.candidate
     summary = None if candidate is None else candidate_summary(candidate)
     rejected = tuple(f"{item.identity[3]} {item.identity[2]}:{item.reason}" for item in options.rejected[:12])

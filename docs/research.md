@@ -29,7 +29,7 @@ later: Risk Guard → paper
 | Material disagreement | Quant **OPPOSE** or Risk-context **OPPOSE** → `NO_TRADE` |
 | Bull vs Bear conflict | preserved on the decision; does **not** auto-kill |
 | `INSUFFICIENT_DATA` | any of Bull/Bear/Quant/Risk-context → `NO_TRADE` |
-| Confidence gating | off (`ai.confidence.enabled: false`) |
+| Confidence gating | off by default; if `ai.confidence.enabled`, CEO confidence `< min_ceo_confidence` → `NO_TRADE` |
 | Execution | never |
 
 The cash `grow.ceo.CEO.propose` path is unchanged (Milestone 1 probe). 2D lives in `grow.research`.
@@ -37,7 +37,10 @@ The cash `grow.ceo.CEO.propose` path is unchanged (Milestone 1 probe). 2D lives 
 ## ResearchPacket
 
 Deterministic `packet_id` from snapshot / signal / candidate / schema.
-Timestamps are `Asia/Kolkata`. The packet is frozen. LLM payloads go through
+Timestamps are `Asia/Kolkata`. Nested evidence maps are **deep-frozen**
+(`MappingProxyType`) after creation. `to_dict()` still emits plain dicts.
+`view.as_of`, `signal.as_of`, and `options.as_of` must be identical;
+mismatch is `NO_TRADE` / `ASOF_MISMATCH`. LLM payloads go through
 `assert_research_payload` (no OHLCV keys). Candidate `volume` is exposed as
 `option_volume`.
 
@@ -63,9 +66,11 @@ mapping + no material disagreement / insufficient data → approve.
 ## Validator
 
 Any failure rewrites the result to `NO_TRADE` with structured reasons.
-Includes: schema, snapshot consistency, unknown candidate, BULLISH+PE,
-BEARISH+CE, NEUTRAL+candidate, prohibited execution keys, candidate
-mutation, 2C NO_TRADE, Quant/Risk OPPOSE, insufficient reports.
+Includes: schema (`research.packet.v1` / `research.decision.v1`), snapshot
+consistency, `ASOF_MISMATCH`, unknown candidate, BULLISH+PE, BEARISH+CE,
+NEUTRAL+candidate, prohibited execution keys, candidate mutation, 2C
+NO_TRADE, Quant/Risk OPPOSE, insufficient reports, and (when enabled)
+`CEO_CONFIDENCE`.
 
 ## Failure policy
 

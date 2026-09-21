@@ -9,7 +9,7 @@ from grow.research.agents import BearAgent, BullAgent, QuantAgent, ResearchAgent
 from grow.research.audit import AuditLog
 from grow.research.ceo_agent import CEOAgent
 from grow.research.models import CEODecision, ResearchPacket, ResearchReport
-from grow.research.validate import DecisionValidator, no_trade
+from grow.research.validate import DecisionValidator, asof_failures, no_trade
 
 
 class ResearchOrchestrator:
@@ -21,7 +21,7 @@ class ResearchOrchestrator:
         if ai.provider != "fixture":
             raise GrowConfigError("2D ai.provider must be fixture.")
         self.audit = audit or AuditLog()
-        self.validator = DecisionValidator()
+        self.validator = DecisionValidator(ai)
         versions = ai.prompt_versions
         self.agents: tuple[ResearchAgent, ...] = (
             BullAgent(versions.get("bull", "v1")),
@@ -47,6 +47,11 @@ class ResearchOrchestrator:
             return decision
         if not self.config.ai.enabled:
             decision = no_trade(packet, reasons=("AI_DISABLED",), prompt_version=prompts["ceo"])
+            self.audit.append(packet, (), decision, prompts)
+            return decision
+        mismatch = asof_failures(packet)
+        if mismatch:
+            decision = no_trade(packet, reasons=mismatch, prompt_version=prompts["ceo"])
             self.audit.append(packet, (), decision, prompts)
             return decision
         reports: list[ResearchReport] = []
