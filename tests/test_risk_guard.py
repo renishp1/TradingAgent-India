@@ -14,7 +14,7 @@ from grow.market.research import MarketResearch
 from grow.paper.ledger import PaperLedger
 from grow.risk.guard import RiskGuard
 from grow.risk.secret import resolve_risk_secret
-from grow.risk.stamp import STAMP_VERSION, canonical_proposal_json
+from grow.risk.stamp import STAMP_VERSION, canonical_proposal_json, stamp_token
 from grow.types import Intent, Regime, RiskStamp, Side, Symbol, TradeProposal, Venue
 
 from tests.helpers import TEST_RISK_SECRET, make_guard
@@ -197,6 +197,14 @@ class RiskGuardTests(unittest.TestCase):
         self.assertFalse(verdict.approved)
         self.assertIn("notional.matches", verdict.reason)
 
+    def test_guard_token_equals_stamp_module(self) -> None:
+        original = _proposal(limit_price=self.brief.last_price, notional=self.brief.last_price * 10)
+        verdict = self._eval(original)
+        self.assertTrue(verdict.approved, verdict.reason)
+        expected = stamp_token(original, self.config.risk.ruleset, TEST_RISK_SECRET)
+        self.assertEqual(verdict.stamp.token, expected)
+        self.assertEqual(json.loads(canonical_proposal_json(original, self.config.risk.ruleset))["v"], STAMP_VERSION)
+
 
 class RiskSecretTests(unittest.TestCase):
     def test_missing_secret_fails_closed(self) -> None:
@@ -212,7 +220,29 @@ class RiskSecretTests(unittest.TestCase):
     def test_source_has_no_default_secret_fallback(self) -> None:
         src = (ROOT / "grow" / "risk" / "guard.py").read_text(encoding="utf-8")
         self.assertNotIn("grow-risk-v1-paper-only", src)
+        self.assertNotIn("_RULESET_SECRET", src)
         self.assertNotIn('os.environ.get("GROW_RISK_SECRET"', src)
+        self.assertNotIn("hmac.new", src)
+        self.assertNotIn("hashlib", src)
+        self.assertIn("from grow.risk.stamp import stamp_token", src)
+        self.assertIn("from grow.risk.secret import resolve_risk_secret", src)
+        self.assertIn("stamp_token(proposal, self.config.risk.ruleset, self._secret)", src)
+
+    def test_executable_tree_has_no_published_secret_fallback(self) -> None:
+        """The old default may appear only as a refused value, never as a fallback."""
+        forbidden_as_fallback = (
+            '_RULESET_SECRET',
+            'os.environ.get("GROW_RISK_SECRET", "grow-risk-v1-paper-only")',
+            "os.environ.get('GROW_RISK_SECRET', 'grow-risk-v1-paper-only')",
+        )
+        for path in (ROOT / "grow").rglob("*.py"):
+            src = path.read_text(encoding="utf-8")
+            for needle in forbidden_as_fallback:
+                self.assertNotIn(needle, src, f"{path.relative_to(ROOT)} still contains {needle}")
+            if path.name == "secret.py":
+                self.assertIn("grow-risk-v1-paper-only", src)
+                continue
+            self.assertNotIn("grow-risk-v1-paper-only", src, path)
 
     def test_injected_secret_stamps(self) -> None:
         secret = TEST_RISK_SECRET
