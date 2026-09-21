@@ -162,6 +162,16 @@ class TradingAgentsConfig:
 
 
 @dataclass(frozen=True)
+class DataConfig:
+    provider: str
+    allow_live_feed: bool
+    allow_options_chain: bool
+    timeframes: tuple[str, ...]
+    stale_after_seconds: int
+    history_sessions: int
+
+
+@dataclass(frozen=True)
 class GrowConfig:
     version: str
     timezone: str
@@ -171,6 +181,7 @@ class GrowConfig:
     paper: PaperConfig
     model: ModelConfig
     tradingagents: TradingAgentsConfig
+    data: DataConfig
     source_path: str
 
     def assert_safe(self) -> None:
@@ -185,6 +196,17 @@ class GrowConfig:
             raise GrowConfigError("Milestone 1 cash book forbids shorts. allow_short must be false.")
         if self.risk.concentration_basis != "cost_notional":
             raise GrowConfigError("Milestone 1 concentration_basis must be cost_notional until MTM exists.")
+        if self.data.provider != "fixture":
+            raise GrowConfigError(
+                "Milestone 2A data.provider must be 'fixture' until a licensed feed is reviewed."
+            )
+        if self.data.allow_live_feed:
+            raise GrowConfigError("Live market feeds are not attached. allow_live_feed must be false.")
+        if self.data.allow_options_chain:
+            raise GrowConfigError("Options chains are not part of 2A cash data.")
+        allowed_tf = {"D1", "M15", "M5"}
+        if not self.data.timeframes or any(tf not in allowed_tf for tf in self.data.timeframes):
+            raise GrowConfigError("2A timeframes must be a non-empty subset of D1, M15, M5.")
 
 
 def _overlay_env(raw: dict[str, Any], environ: dict[str, str]) -> dict[str, Any]:
@@ -194,6 +216,7 @@ def _overlay_env(raw: dict[str, Any], environ: dict[str, str]) -> dict[str, Any]
     paper = grow.setdefault("paper", {})
     model = grow.setdefault("model", {})
     ta = grow.setdefault("tradingagents", {})
+    data = grow.setdefault("data", {})
 
     if "GROW_EXECUTION_MODE" in environ and environ["GROW_EXECUTION_MODE"].strip():
         execution["mode"] = environ["GROW_EXECUTION_MODE"]
@@ -213,6 +236,10 @@ def _overlay_env(raw: dict[str, Any], environ: dict[str, str]) -> dict[str, Any]
         ta["enabled"] = _parse_scalar(environ["GROW_TRADINGAGENTS_ENABLED"])
     if environ.get("GROW_MAX_DEBATE_ROUNDS"):
         ta["max_debate_rounds"] = _parse_scalar(environ["GROW_MAX_DEBATE_ROUNDS"])
+    if environ.get("GROW_DATA_PROVIDER"):
+        data["provider"] = environ["GROW_DATA_PROVIDER"]
+    if environ.get("GROW_ALLOW_LIVE_FEED"):
+        data["allow_live_feed"] = _parse_scalar(environ["GROW_ALLOW_LIVE_FEED"])
     return raw
 
 
@@ -226,9 +253,14 @@ def _build(raw: dict[str, Any], source_path: str) -> GrowConfig:
     paper = g.get("paper") or {}
     model = g.get("model") or {}
     ta = g.get("tradingagents") or {}
+    data = g.get("data") or {}
     universe = market.get("universe") or []
     if not isinstance(universe, list) or not universe:
         raise GrowConfigError("grow.market.universe must be a non-empty list")
+
+    timeframes = data.get("timeframes") or ["D1", "M15", "M5"]
+    if not isinstance(timeframes, list):
+        raise GrowConfigError("grow.data.timeframes must be a list")
 
     config = GrowConfig(
         version=str(g.get("version", "0.1.0")),
@@ -272,6 +304,14 @@ def _build(raw: dict[str, Any], source_path: str) -> GrowConfig:
             enabled=_as_bool(ta.get("enabled", True), "tradingagents.enabled"),
             max_debate_rounds=_as_int(ta.get("max_debate_rounds", 1), "max_debate_rounds"),
             max_risk_discuss_rounds=_as_int(ta.get("max_risk_discuss_rounds", 1), "max_risk_discuss_rounds"),
+        ),
+        data=DataConfig(
+            provider=str(data.get("provider", "fixture")).lower(),
+            allow_live_feed=_as_bool(data.get("allow_live_feed", False), "data.allow_live_feed"),
+            allow_options_chain=_as_bool(data.get("allow_options_chain", False), "data.allow_options_chain"),
+            timeframes=tuple(str(tf).strip().upper() for tf in timeframes),
+            stale_after_seconds=_as_int(data.get("stale_after_seconds", 900), "data.stale_after_seconds"),
+            history_sessions=_as_int(data.get("history_sessions", 20), "data.history_sessions"),
         ),
         source_path=source_path,
     )

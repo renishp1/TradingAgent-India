@@ -42,11 +42,11 @@ Market research + research graph
        Paper ledger     (GROW_PAPER, no shorts, own fill invariants)
 ```
 
-## Milestone 2 (not started here)
+## Milestone 2 (started: 2A design only)
 
-Phase 2A — data layer (OHLCV / indices / later options fields), broker still disconnected.  
-Do not attach a live feed until the holiday calendar is the official circular.  
-Phase 2B — quantitative `StrategySignal` book.  
+Phase 2A — data layer types + fixture OHLCV. Broker still disconnected.
+**No live feed is attached.** See [`milestone-2a.md`](milestone-2a.md).
+Phase 2B — quantitative `StrategySignal` book.
 Phase 2C — LLM research over **signals**, not LLM-as-trader.
 
 Broker execution is after that, under a dedicated review that would have to

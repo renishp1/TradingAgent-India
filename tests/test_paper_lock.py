@@ -65,7 +65,16 @@ class PaperLockTests(unittest.TestCase):
 
 class TreeHygieneTests(unittest.TestCase):
     def test_no_broker_sdk_imports(self) -> None:
-        forbidden = ("kiteconnect", "upstox", "dhanhq", "smartapi", "zerodha", "angelone")
+        forbidden = (
+            "kiteconnect",
+            "upstox",
+            "dhanhq",
+            "smartapi",
+            "zerodha",
+            "angelone",
+            "yfinance",
+            "nsepython",
+        )
         hits: list[str] = []
         for path in (ROOT / "grow").rglob("*.py"):
             text = path.read_text(encoding="utf-8").lower()

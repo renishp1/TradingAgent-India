@@ -27,6 +27,9 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.market.product, "CASH")
         self.assertFalse(config.risk.allow_short)
         self.assertEqual(config.risk.concentration_basis, "cost_notional")
+        self.assertEqual(config.data.provider, "fixture")
+        self.assertFalse(config.data.allow_live_feed)
+
 
     def test_live_yaml_value_cannot_pass_through_env_truth(self) -> None:
         with self.assertRaises(GrowLiveTradingDisabled):

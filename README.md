@@ -24,8 +24,9 @@ still a constrained paper-trading foundation, not a desk.
 10. Architecture docs: [`docs/architecture.md`](docs/architecture.md), [`docs/safety.md`](docs/safety.md), [`docs/milestone-1.md`](docs/milestone-1.md).
 
 Options, live data, brokers, and LangGraph remain **out of scope**.
-Milestone 2 is licensed market data + research — not broker APIs.
-See [`docs/review-1.md`](docs/review-1.md).
+Milestone 2A is fixture market data + the snapshot contract —
+see [`docs/milestone-2a.md`](docs/milestone-2a.md). Do not attach a vendor
+feed until that design is reviewed. Broker APIs stay out.
 
 
 ## Layout
@@ -41,7 +42,7 @@ TradingAgent-India/
 │   ├── risk/
 │   ├── execution/          # lock + live refuse
 │   ├── paper/
-│   ├── data/               # interface only
+│   ├── data/               # 2A fixture OHLCV (no live feed)
 │   ├── learning/           # interface only
 │   ├── model_gateway/
 │   └── dashboard/          # snapshot schema
@@ -98,3 +99,4 @@ cannot flip it.
 
 See [`docs/review-1.md`](docs/review-1.md). Next work is Milestone 2A
 (data layer), not brokers.
+

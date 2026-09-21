@@ -5,6 +5,7 @@ It is not a fork of TradingAgents, and it is not a live broker.
 
 This document is the contract. Code that disagrees with this file is a bug.
 Review #1 findings live in [`docs/review-1.md`](review-1.md).
+Milestone 2A (data plane, fixture only) lives in [`docs/milestone-2a.md`](milestone-2a.md).
 
 ## Product split
 
@@ -24,7 +25,7 @@ or talk to a broker.
 ```
                   Market Research          TradingAgents graph
                          │                         │
-                         └──────────┬──────────────
+                         └──────────┬──────────────┘
                                     ▼
                                    CEO
                          (TradeProposal, cash long-only)
@@ -53,7 +54,7 @@ Illegal arrows, all tested:
 Milestone 1 product is `CASH`. `allow_short` must be false.
 
 | Intent | Side | Meaning |
-|---|---|
+|---|---|---|
 | OPEN | BUY | Open / add long |
 | OPEN | SELL | **Rejected** — that is a short |
 | CLOSE / REDUCE / SQUARE_OFF | SELL | Flatten or reduce a long |
@@ -87,10 +88,24 @@ SHA-256 of that JSON, then HMAC-SHA256. Changing SL/TP/notional after the
 gate mints a stamp makes verify fail. The ledger additionally checks fill
 invariants so a stamp is never the only check.
 
+## Data plane (Milestone 2A)
+
+Accepted control plane is unchanged. 2A adds a **fixture** data plane that is
+not yet wired into `GrowRuntime`:
+
+```
+Raw fixture OHLCV  →  Normalizer  →  MarketSnapshot  →  ResearchView
+                                              ↓
+                                    (2B) StrategySignal
+```
+
+LLM research must not receive raw candles. Licensed feeds, scrapes, and
+broker quotes are refuse-closed until a named vendor is reviewed.
+
 ## Modules
 
-| Path | Milestone 1 status | Responsibility |
-|---|---|
+| Path | Status | Responsibility |
+|---|---|---|
 | `grow/execution/lock.py` | **implemented** | Compile-time + env + runtime paper lock |
 | `grow/execution/live.py` | **implemented (refuse)** | Live broker surface that only raises |
 | `grow/config.py` | **implemented** | YAML + env overlay, fail-closed |
@@ -101,11 +116,12 @@ invariants so a stamp is never the only check.
 | `grow/paper/` | **implemented** | In-memory long-only ledger |
 | `grow/cycle.py` | **implemented** | The one legal orchestration path |
 | `tradingagents/` | **foundation / stub intelligence** | Roles, default_config, sequential graph |
+| `grow/data/` | **2A fixture** | OHLCV snapshot, quality, universe. No live feed |
+| `grow/strategies/` | **2B type only** | `StrategySignal` frozen; book raises |
 | `grow/options/` | interface only | F&O later |
-| `grow/strategies/` | interface only | Strategy book later (quant signals first) |
-| `grow/data/` | interface only | Licensed feeds — Milestone 2A |
-| `grow/learning/` | interface only | Memory/reflection later |
+| `grow/learning/` | interface only | `DecisionRecord` type; store deferred |
 | `grow/dashboard/` | snapshot schema | Web console later |
+
 
 ## Why the guard is not an LLM
 
@@ -143,7 +159,8 @@ No model is allowed to:
 
 ## Deferred on purpose
 
-Milestone 2 is **data + research**, not live trading: licensed OHLCV, then a
-quantitative `StrategySignal` book, then LLM debate over those signals.
-Options chains, scraping, broker adapters, LangGraph, persistence, and a
-production dashboard stay out until those reviews.
+Milestone 2A is **fixture market data**. Milestone 2B is quantitative
+`StrategySignal`. Milestone 2C is LLM research over **signals**, not
+LLM-as-trader. Options chains, scraping, broker adapters, LangGraph,
+persistence, and a production dashboard stay out until those reviews.
+

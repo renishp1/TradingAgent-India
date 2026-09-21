@@ -52,3 +52,14 @@ grow:
     enabled: true
     max_debate_rounds: 1
     max_risk_discuss_rounds: 1
+
+  data:
+    provider: fixture
+    allow_live_feed: false
+    allow_options_chain: false
+    stale_after_seconds: 900
+    history_sessions: 20
+    timeframes:
+      - D1
+      - M15
+      - M5
