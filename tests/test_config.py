@@ -36,6 +36,7 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(config.options.allow_same_day)
         self.assertEqual(config.options.preferred_expiry_class, "weekly")
         self.assertEqual(config.options.max_distance_from_atm, 2)
+        self.assertEqual(config.options.max_quote_age_minutes, 5)
 
 
     def test_live_yaml_value_cannot_pass_through_env_truth(self) -> None:

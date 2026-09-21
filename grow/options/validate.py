@@ -6,8 +6,9 @@ from datetime import datetime
 
 from grow.clock import IST
 from grow.config import OptionsConfig
-from grow.options.models import OptionChainSnapshot, OptionContract, OptionType, RejectedContract
+from grow.options.models import FieldSource, OptionChainSnapshot, OptionContract, OptionType, RejectedContract
 
+_VALID_SOURCE = frozenset({FieldSource.PROVIDER, FieldSource.COMPUTED})
 _INDEX = frozenset({"NIFTY", "BANKNIFTY"})
 _FORBIDDEN_UNDERLYING = frozenset({"RELIANCE", "TCS", "FUT", "FUTURES"})
 
@@ -105,6 +106,9 @@ def _contract_reason(
         return "TIMEZONE"
     if contract.timestamp > as_of:
         return "FUTURE_QUOTE"
+    quote_age_min = (as_of - contract.timestamp).total_seconds() / 60.0
+    if quote_age_min > config.max_quote_age_minutes:
+        return "STALE_QUOTE"
     if contract.expiry < as_of.astimezone(IST).date():
         return "EXPIRED"
     if contract.strike <= 0:
@@ -123,10 +127,13 @@ def _contract_reason(
     if contract.option_type not in (OptionType.CE, OptionType.PE):
         return "INVALID_TYPE"
     if contract.implied_volatility is not None:
+        if contract.iv_source not in _VALID_SOURCE:
+            return "IV_SOURCE_MISSING"
         if not (config.iv_min <= contract.implied_volatility <= config.iv_max):
             return "IV_OUT_OF_BOUNDS"
-        if contract.iv_source is None:
-            return "IV_SOURCE_MISSING"
+    greeks = (contract.delta, contract.gamma, contract.theta, contract.vega)
+    if any(value is not None for value in greeks) and contract.greek_source not in _VALID_SOURCE:
+        return "GREEK_SOURCE_MISSING"
     px = premium(contract)
     if px is None or px <= 0:
         return "NO_PREMIUM"

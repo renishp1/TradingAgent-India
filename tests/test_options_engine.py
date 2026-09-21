@@ -21,6 +21,7 @@ from grow.options.models import (
     OptionExpiry,
     OptionType,
 )
+from grow.options.score import WEIGHTS, rank_key
 from grow.options.select import atm_strike, choose_expiry, strike_step, strike_window
 from grow.options.source import OptionChainSource
 from grow.options.validate import intrinsic
@@ -295,6 +296,113 @@ class OptionsEngineTests(unittest.TestCase):
     def test_open_option_source(self) -> None:
         src = open_option_source()
         self.assertIsInstance(src, FixtureOptionChain)
+
+    def test_chain_spot_mismatch(self) -> None:
+        chain = replace(self.chain, spot=self.spot + 25)
+        decision = self.engine.evaluate(_signal("NIFTY", "BULLISH", self.as_of), self.snap, chain)
+        self.assertEqual(decision.status, DecisionStatus.NO_TRADE)
+        self.assertIn("CHAIN_SPOT_MISMATCH", decision.diagnostics)
+
+    def test_stale_quote(self) -> None:
+        stale = replace(self.chain.contracts[0], timestamp=self.as_of - timedelta(minutes=20))
+        chain = replace(self.chain, contracts=(stale,) + self.chain.contracts[1:])
+        decision = self.engine.evaluate(_signal("NIFTY", "BULLISH", self.as_of), self.snap, chain)
+        self.assertTrue(any(r.reason == "STALE_QUOTE" for r in decision.rejected))
+
+    def test_duplicate_contract(self) -> None:
+        first = self.chain.contracts[0]
+        chain = replace(self.chain, contracts=(first, first) + self.chain.contracts[1:])
+        decision = self.engine.evaluate(_signal("NIFTY", "BULLISH", self.as_of), self.snap, chain)
+        self.assertTrue(any(r.reason == "DUPLICATE_CONTRACT" for r in decision.rejected))
+
+    def test_negative_bid_and_ask(self) -> None:
+        bad_bid = replace(self.chain.contracts[0], bid=-1.0, ask=10.0, last_price=5.0)
+        chain = replace(self.chain, contracts=(bad_bid,) + self.chain.contracts[1:])
+        decision = self.engine.evaluate(_signal("NIFTY", "BULLISH", self.as_of), self.snap, chain)
+        self.assertTrue(any(r.reason == "NEGATIVE_BID" for r in decision.rejected))
+        bad_ask = replace(self.chain.contracts[1], bid=1.0, ask=-2.0, last_price=5.0)
+        chain = replace(self.chain, contracts=(bad_ask,) + self.chain.contracts[1:])
+        decision = self.engine.evaluate(_signal("NIFTY", "BULLISH", self.as_of), self.snap, chain)
+        self.assertTrue(any(r.reason == "NEGATIVE_ASK" for r in decision.rejected))
+
+    def test_invalid_strike(self) -> None:
+        bad = replace(self.chain.contracts[0], strike=0)
+        chain = replace(self.chain, contracts=(bad,) + self.chain.contracts[1:])
+        decision = self.engine.evaluate(_signal("NIFTY", "BULLISH", self.as_of), self.snap, chain)
+        self.assertTrue(any(r.reason == "INVALID_STRIKE" for r in decision.rejected))
+
+    def test_missing_premium(self) -> None:
+        bad = replace(self.chain.contracts[0], bid=None, ask=None, last_price=None)
+        chain = replace(self.chain, contracts=(bad,) + self.chain.contracts[1:])
+        decision = self.engine.evaluate(_signal("NIFTY", "BULLISH", self.as_of), self.snap, chain)
+        self.assertTrue(any(r.reason == "NO_PREMIUM" for r in decision.rejected))
+
+    def test_iv_out_of_range_and_source_missing(self) -> None:
+        high = replace(self.chain.contracts[0], implied_volatility=3.5, iv_source=FieldSource.PROVIDER)
+        chain = replace(self.chain, contracts=(high,) + self.chain.contracts[1:])
+        decision = self.engine.evaluate(_signal("NIFTY", "BULLISH", self.as_of), self.snap, chain)
+        self.assertTrue(any(r.reason == "IV_OUT_OF_BOUNDS" for r in decision.rejected))
+        orphan = replace(
+            self.chain.contracts[1],
+            implied_volatility=0.2,
+            iv_source=FieldSource.UNAVAILABLE,
+        )
+        chain = replace(self.chain, contracts=(orphan,) + self.chain.contracts[1:])
+        decision = self.engine.evaluate(_signal("NIFTY", "BULLISH", self.as_of), self.snap, chain)
+        self.assertTrue(any(r.reason == "IV_SOURCE_MISSING" for r in decision.rejected))
+        greek = replace(
+            self.chain.contracts[2],
+            delta=0.4,
+            greek_source=FieldSource.UNAVAILABLE,
+        )
+        chain = replace(self.chain, contracts=(greek,) + self.chain.contracts[1:])
+        decision = self.engine.evaluate(_signal("NIFTY", "BULLISH", self.as_of), self.snap, chain)
+        self.assertTrue(any(r.reason == "GREEK_SOURCE_MISSING" for r in decision.rejected))
+
+    def test_no_permitted_strike(self) -> None:
+        only_pe = tuple(c for c in self.chain.contracts if c.option_type is OptionType.PE)
+        chain = replace(self.chain, contracts=only_pe)
+        decision = self.engine.evaluate(_signal("NIFTY", "BULLISH", self.as_of), self.snap, chain)
+        self.assertEqual(decision.status, DecisionStatus.NO_TRADE)
+        self.assertTrue(any("NO_PERMITTED_STRIKE" in d for d in decision.diagnostics))
+
+    def test_no_liquid_contract(self) -> None:
+        dry = tuple(replace(c, volume=1, open_interest=1) for c in self.chain.contracts)
+        chain = replace(self.chain, contracts=dry)
+        decision = self.engine.evaluate(_signal("NIFTY", "BULLISH", self.as_of), self.snap, chain)
+        self.assertEqual(decision.status, DecisionStatus.NO_TRADE)
+        self.assertTrue(any("NO_LIQUID_CONTRACT" in d for d in decision.diagnostics))
+
+    def test_score_bounds_and_weight_sum(self) -> None:
+        self.assertAlmostEqual(sum(WEIGHTS.values()), 1.0, places=9)
+        decision = self.engine.evaluate(_signal("NIFTY", "BULLISH", self.as_of), self.snap, self.chain)
+        assert decision.candidate is not None
+        for name, value in decision.candidate.score.components.items():
+            self.assertGreaterEqual(value, 0.0, name)
+            self.assertLessEqual(value, 1.0, name)
+        self.assertAlmostEqual(sum(decision.candidate.score.weights.values()), 1.0, places=9)
+
+    def test_equal_score_tie_break(self) -> None:
+        ident_lo = ("NIFTY", "2026-09-22", 25000.0, "CE")
+        ident_hi = ("NIFTY", "2026-09-22", 25050.0, "CE")
+        equal = [
+            rank_key(0.50, 1000, 500, 0.02, ident_hi),
+            rank_key(0.50, 1000, 500, 0.02, ident_lo),
+        ]
+        equal.sort()
+        self.assertEqual(equal[0][-1], ident_lo)
+        by_oi = [
+            rank_key(0.50, 1000, 500, 0.02, ident_lo),
+            rank_key(0.50, 2000, 500, 0.02, ident_hi),
+        ]
+        by_oi.sort()
+        self.assertEqual(by_oi[0][-1], ident_hi)
+        by_spread = [
+            rank_key(0.50, 1000, 500, 0.04, ident_lo),
+            rank_key(0.50, 1000, 500, 0.01, ident_hi),
+        ]
+        by_spread.sort()
+        self.assertEqual(by_spread[0][-1], ident_hi)
 
 
 if __name__ == "__main__":

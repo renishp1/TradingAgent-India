@@ -84,6 +84,8 @@ class IndexOptionsEngine:
             return empty(("SNAPSHOT_ID_MISMATCH",))
         if abs((signal.as_of - underlying_snapshot.as_of).total_seconds()) > 1:
             return empty(("SIGNAL_ASOF_MISMATCH",))
+        if abs(option_chain.spot - underlying_snapshot.last_price) > 0.01:
+            return empty(("CHAIN_SPOT_MISMATCH",))
         if abs((option_chain.as_of - as_of).total_seconds()) > cfg.max_chain_age_minutes * 60:
             if option_chain.as_of > as_of:
                 return empty(("CHAIN_FROM_FUTURE",))
@@ -103,8 +105,12 @@ class IndexOptionsEngine:
         if strike_step(strikes) is None:
             return empty(("NO_STRIKE_STEP", *notes), rejected)
         window = strike_window(spot, strikes, cfg.max_distance_from_atm)
+        rejected_list = list(rejected)
+        for contract in kept:
+            if contract.option_type is not wanted and contract.expiry == expiry.day:
+                rejected_list.append(RejectedContract(contract.identity(), f"DIRECTION_GATE:{wanted.value}"))
         if not window:
-            return empty(("NO_PERMITTED_STRIKE", *notes), rejected)
+            return empty(("NO_PERMITTED_STRIKE", *notes), tuple(rejected_list))
         universe = filter_universe(
             kept,
             expiry=expiry,
@@ -113,11 +119,8 @@ class IndexOptionsEngine:
             window=window,
             allowed_moneyness=cfg.allowed_moneyness,
         )
-        rejected_list = list(rejected)
-        for contract in kept:
-            if contract.option_type is not wanted:
-                if contract.expiry == expiry.day:
-                    rejected_list.append(RejectedContract(contract.identity(), f"DIRECTION_GATE:{wanted.value}"))
+        if not universe:
+            return empty(("NO_PERMITTED_STRIKE", expiry_why, *notes), tuple(rejected_list))
         scored: list[tuple[tuple, OptionCandidate]] = []
         atm = atm_strike(spot, window)
         if atm is None:
@@ -196,7 +199,7 @@ class IndexOptionsEngine:
             scored.append((key, cand))
         if not scored:
             return empty(("NO_LIQUID_CONTRACT", expiry_why, *notes), tuple(rejected_list))
-        scored.sort(key=lambda row: row[0], reverse=True)
+        scored.sort(key=lambda row: row[0])
         winner = scored[0][1]
         return OptionsDecision(
             status=DecisionStatus.CANDIDATE,

@@ -193,6 +193,7 @@ class OptionsConfig:
     provider: str
     allow_live_chain: bool
     max_chain_age_minutes: int
+    max_quote_age_minutes: int
     allow_same_day: bool
     preferred_expiry_class: str
     max_distance_from_atm: int
@@ -332,6 +333,7 @@ def _options_config(raw: dict[str, Any]) -> OptionsConfig:
         provider=str(raw.get("provider", "fixture")).lower(),
         allow_live_chain=_as_bool(raw.get("allow_live_chain", False), "options.allow_live_chain"),
         max_chain_age_minutes=_as_int(fresh.get("max_chain_age_minutes", 5), "options.freshness.max_chain_age_minutes"),
+        max_quote_age_minutes=_as_int(fresh.get("max_quote_age_minutes", 5), "options.freshness.max_quote_age_minutes"),
         allow_same_day=_as_bool(expiry.get("allow_same_day", False), "options.expiry.allow_same_day"),
         preferred_expiry_class=str(expiry.get("preferred_expiry_class", "weekly")).lower(),
         max_distance_from_atm=_as_int(strikes.get("max_distance_from_atm", 2), "options.strikes.max_distance_from_atm"),

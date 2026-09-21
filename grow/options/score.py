@@ -94,6 +94,6 @@ def score_contract(
 
 
 def rank_key(total: float, oi: int, volume: int, spread_pct: float | None, identity: tuple) -> tuple:
-    """Higher is better until the identity tie-break (ascending, stable)."""
-    tightness = 0.0 if spread_pct is None else -spread_pct
-    return (total, oi, volume, tightness, identity)
+    """Ascending sort key: score DESC, OI DESC, volume DESC, spread ASC, identity ASC."""
+    spread_asc = float("inf") if spread_pct is None else spread_pct
+    return (-total, -oi, -volume, spread_asc, identity)

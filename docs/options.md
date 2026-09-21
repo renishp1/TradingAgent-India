@@ -50,9 +50,17 @@ A BEARISH result is not a short sale of the index.
 Timestamps are timezone-aware `Asia/Kolkata`. Quotes with `timestamp > as_of`
 are future data and are rejected. Chains older than
 `options.freshness.max_chain_age_minutes` (default 5) are `NO_TRADE`.
+Individual quotes older than `options.freshness.max_quote_age_minutes`
+(default 5) are rejected as `STALE_QUOTE`. Chain-level and quote-level
+freshness both apply.
+
+`OptionChainSnapshot.spot` must match `MarketSnapshot.last_price` (within
+₹0.01). Mismatch is `CHAIN_SPOT_MISMATCH` / `NO_TRADE`. The engine never
+uses a future underlying price.
 
 Duplicate identity `(underlying, expiry, strike, type)` is rejected.
-Bid/ask cannot be negative; ask < bid is a crossed quote.
+Bid/ask cannot be negative; ask < bid is a crossed quote. Strike must be
+`> 0`. A contract with no usable premium (no mid and no LTP) is `NO_PREMIUM`.
 
 ## Expiry & strikes
 
@@ -87,12 +95,38 @@ total = Σ weight_i * component_i   # weights sum to 1, each component in [0, 1]
 | time_to_expiry | 1–10 days preferred; same-day impossible |
 | data_freshness | age vs max_chain_age |
 
-Tie-break: total, then OI, then volume, then tighter spread, then stable
-`(underlying, expiry, strike, type)` ordering.
+Tie-break (stable, no dict/set iteration):
+
+```
+score DESC
+OI DESC
+volume DESC
+spread ASC
+identity ASC  # (underlying, expiry, strike, option_type)
+```
+
+Weights sum to 1.0. Every component is clamped to `[0, 1]`.
+
+## IV and Greeks
+
+2C **never** calculates or fabricates IV or Greeks. If the field is missing it
+stays missing and that score component is 0.
+
+If IV is present, `iv_source` must be `PROVIDER` or `COMPUTED` and the value
+must lie in `[options.iv.min, options.iv.max]`. Otherwise `IV_SOURCE_MISSING`
+or `IV_OUT_OF_BOUNDS`.
+
+If any of delta/gamma/theta/vega is present, `greek_source` must be
+`PROVIDER` or `COMPUTED`. Otherwise `GREEK_SOURCE_MISSING`.
+
+Fixture v1 is synthetic and **partial**: ATM-near contracts may include
+provider IV and delta; gamma/theta/vega are typically unavailable; far
+strikes often have no IV/Greeks at all. That is expected, not a feed.
 
 ## NO TRADE
 
-First-class. Typical diagnostics: `STALE_CHAIN`, `NO_ELIGIBLE_EXPIRY`,
+First-class. Typical diagnostics: `STALE_CHAIN`, `STALE_QUOTE`,
+`CHAIN_SPOT_MISMATCH`, `NO_ELIGIBLE_EXPIRY`, `NO_PERMITTED_STRIKE`,
 `NO_LIQUID_CONTRACT`, `DIRECTION_GATE`, `UNSUPPORTED_UNDERLYING`,
 `CHAIN_FROM_FUTURE`, `EXECUTION_LANGUAGE`.
 

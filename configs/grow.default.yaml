@@ -107,6 +107,7 @@ grow:
     selection_version: options.select.v1
     freshness:
       max_chain_age_minutes: 5
+      max_quote_age_minutes: 5
     expiry:
       allow_same_day: false
       preferred_expiry_class: weekly
