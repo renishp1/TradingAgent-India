@@ -36,6 +36,16 @@ class OptionExpiry:
     day: date
     klass: ExpiryClass
 
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, OptionExpiry):
+            return self.day == other.day and self.klass == other.klass
+        if type(other) is date:
+            return self.day == other
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash((self.day, self.klass))
+
     def to_dict(self) -> dict[str, str]:
         return {"date": self.day.isoformat(), "class": self.klass.value}
 

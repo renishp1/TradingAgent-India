@@ -141,13 +141,16 @@ class OptionsEngineTests(unittest.TestCase):
     def test_bullish_pe_rejected(self) -> None:
         decision = self.engine.evaluate(_signal("NIFTY", "BULLISH", self.as_of), self.snap, self.chain)
         assert decision.candidate is not None
-        self.assertNotEqual(decision.candidate.option_type, "PE")
-        self.assertTrue(any("DIRECTION_GATE:CE" in r.reason for r in decision.rejected))
+        self.assertEqual(decision.candidate.option_type, "CE")
+        self.assertTrue(any(r.reason == "DIRECTION_GATE:CE" for r in decision.rejected))
+        self.assertTrue(any(r.identity[3] == "PE" and r.reason == "DIRECTION_GATE:CE" for r in decision.rejected))
 
     def test_bearish_ce_rejected(self) -> None:
         decision = self.engine.evaluate(_signal("NIFTY", "BEARISH", self.as_of), self.snap, self.chain)
         assert decision.candidate is not None
-        self.assertNotEqual(decision.candidate.option_type, "CE")
+        self.assertEqual(decision.candidate.option_type, "PE")
+        self.assertTrue(any(r.reason == "DIRECTION_GATE:PE" for r in decision.rejected))
+        self.assertTrue(any(r.identity[3] == "CE" and r.reason == "DIRECTION_GATE:PE" for r in decision.rejected))
 
     def test_selling_intent_rejected(self) -> None:
         for side in ("SHORT", "SELL", "OPTION_SELL", "LONG", "BUY"):
@@ -403,6 +406,69 @@ class OptionsEngineTests(unittest.TestCase):
         ]
         by_spread.sort()
         self.assertEqual(by_spread[0][-1], ident_hi)
+
+    def test_engine_tie_break_identity_asc(self) -> None:
+        weekly = _next_weekly(self.as_of.date())
+        strikes = (24900.0, 24950.0, 25000.0, 25050.0, 25100.0)
+        contracts = []
+        for strike in strikes:
+            contracts.append(
+                _liquid_contract("NIFTY", weekly, strike, OptionType.PE, self.as_of)
+            )
+        contracts.append(_liquid_contract("NIFTY", weekly, 25100.0, OptionType.CE, self.as_of))
+        contracts.append(_liquid_contract("NIFTY", weekly, 25050.0, OptionType.CE, self.as_of))
+        chain = OptionChainSnapshot(
+            snapshot_id="tie-1",
+            underlying="NIFTY",
+            as_of=self.as_of,
+            spot=self.spot,
+            expiries=(OptionExpiry(weekly, ExpiryClass.WEEKLY),),
+            contracts=tuple(contracts),
+            source_id="grow.options.fixture.v1",
+            is_fixture=True,
+            provider_metadata={},
+        )
+        decision = self.engine.evaluate(_signal("NIFTY", "BULLISH", self.as_of), self.snap, chain)
+        self.assertEqual(decision.status, DecisionStatus.CANDIDATE)
+        assert decision.candidate is not None
+        self.assertEqual(decision.candidate.option_type, "CE")
+        self.assertEqual(decision.candidate.strike, 25050.0)
+        self.assertEqual(decision.candidate.volume, 2500)
+        self.assertEqual(decision.candidate.open_interest, 8000)
+
+
+def _next_weekly(day):
+    from datetime import timedelta as _td
+
+    probe = day + _td(days=1)
+    while probe.weekday() != 1:
+        probe += _td(days=1)
+    return probe
+
+
+def _liquid_contract(underlying, expiry, strike, option_type, as_of) -> OptionContract:
+    return OptionContract(
+        underlying=underlying,
+        expiry=expiry,
+        expiry_class=ExpiryClass.WEEKLY,
+        strike=strike,
+        option_type=option_type,
+        bid=10.0,
+        ask=10.40,
+        last_price=10.20,
+        volume=2500,
+        open_interest=8000,
+        previous_open_interest=None,
+        implied_volatility=None,
+        delta=None,
+        gamma=None,
+        theta=None,
+        vega=None,
+        timestamp=as_of,
+        provider_contract_id=f"{underlying}-{expiry}-{strike}-{option_type.value}",
+        iv_source=FieldSource.UNAVAILABLE,
+        greek_source=FieldSource.UNAVAILABLE,
+    )
 
 
 if __name__ == "__main__":

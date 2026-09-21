@@ -107,7 +107,7 @@ class IndexOptionsEngine:
         window = strike_window(spot, strikes, cfg.max_distance_from_atm)
         rejected_list = list(rejected)
         for contract in kept:
-            if contract.option_type is not wanted and contract.expiry == expiry.day:
+            if contract.option_type is not wanted and contract.expiry == expiry:
                 rejected_list.append(RejectedContract(contract.identity(), f"DIRECTION_GATE:{wanted.value}"))
         if not window:
             return empty(("NO_PERMITTED_STRIKE", *notes), tuple(rejected_list))
