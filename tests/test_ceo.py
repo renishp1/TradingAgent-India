@@ -7,10 +7,10 @@ from datetime import datetime
 from grow.ceo.ceo import CEO
 from grow.clock import FrozenClock, IST
 from grow.config import load_config
-from grow.cycle import GrowRuntime
 from grow.market.research import MarketResearch
 from grow.model_gateway.gateway import ModelGateway
-from grow.types import Venue
+from grow.types import Side, Venue
+from tests.helpers import make_runtime
 
 
 class CEOTests(unittest.TestCase):
@@ -25,6 +25,9 @@ class CEOTests(unittest.TestCase):
         self.assertIs(proposal.venue, Venue.PAPER)
         self.assertGreater(proposal.quantity, 0)
         self.assertIsNotNone(proposal.stop_loss)
+        self.assertIs(proposal.side, Side.BUY)
+        self.assertEqual(proposal.extras.get("position_policy"), "cash_long_only")
+        self.assertEqual(proposal.extras.get("stop_source"), "probe_placeholder")
 
     def test_ceo_has_no_execution_methods(self) -> None:
         names = {name for name, _ in inspect.getmembers(CEO, predicate=inspect.isfunction)}
@@ -33,7 +36,7 @@ class CEOTests(unittest.TestCase):
 
     def test_cycle_does_not_fill_when_guard_rejects(self) -> None:
         night = FrozenClock(datetime(2026, 9, 21, 22, 0, tzinfo=IST))
-        runtime = GrowRuntime(self.config, clock=night)
+        runtime = make_runtime(self.config, clock=night)
         report = runtime.run("INFY")
         self.assertFalse(report.verdict.approved)
         self.assertIsNone(report.fill)

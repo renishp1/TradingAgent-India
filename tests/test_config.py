@@ -24,6 +24,9 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.market.square_off, "15:15")
         self.assertEqual(config.market.session_close, "15:30")
         self.assertEqual(config.timezone, "Asia/Kolkata")
+        self.assertEqual(config.market.product, "CASH")
+        self.assertFalse(config.risk.allow_short)
+        self.assertEqual(config.risk.concentration_basis, "cost_notional")
 
     def test_live_yaml_value_cannot_pass_through_env_truth(self) -> None:
         with self.assertRaises(GrowLiveTradingDisabled):

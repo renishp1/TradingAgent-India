@@ -5,15 +5,16 @@ from datetime import datetime
 
 from grow.clock import FrozenClock, IST
 from grow.config import load_config
-from grow.cycle import GrowRuntime
 from grow.dashboard import snapshot
+from tests.helpers import make_runtime
 
 
 class CycleTests(unittest.TestCase):
     def test_in_session_probe_fills_paper_book(self) -> None:
         clock = FrozenClock(datetime(2026, 9, 21, 11, 30, tzinfo=IST))
-        runtime = GrowRuntime(load_config(), clock=clock)
+        runtime = make_runtime(load_config(), clock=clock)
         report = runtime.run("HDFCBANK")
+        self.assertEqual(report.book["valuation"]["method"], "cost_notional")
         # HIGH_VOLATILITY stub regime can still reject — that's valid.
         if report.brief.regime.value == "HIGH_VOLATILITY":
             self.assertIsNone(report.fill)
@@ -28,6 +29,6 @@ class CycleTests(unittest.TestCase):
 
     def test_weekend_does_not_open(self) -> None:
         saturday = FrozenClock(datetime(2026, 9, 19, 11, 30, tzinfo=IST))
-        report = GrowRuntime(load_config(), clock=saturday).run("ITC")
+        report = make_runtime(load_config(), clock=saturday).run("ITC")
         self.assertFalse(report.verdict.approved)
         self.assertIsNone(report.fill)
