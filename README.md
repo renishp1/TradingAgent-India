@@ -28,6 +28,7 @@ Milestone 2A is fixture market data ([`docs/milestone-2a.md`](docs/milestone-2a.
 Milestone 2B is the quantitative strategy engine ([`docs/strategy.md`](docs/strategy.md)).
 Milestone 2C is the index-options research engine ([`docs/options.md`](docs/options.md)).
 Milestone 2D is AI research / CEODecision ([`docs/research.md`](docs/research.md)).
+Milestone 2E is fixture backtest + walk-forward ([`docs/backtest.md`](docs/backtest.md)).
 Do not attach a vendor feed, live option chain, or broker.
 
 
@@ -39,6 +40,7 @@ TradingAgent-India/
 ├── grow/
 │   ├── ceo/                # cash CEO (M1 probe)
 │   ├── research/           # 2D fixture AI research / CEODecision
+│   ├── backtest/           # 2E fixture replay + walk-forward
 │   ├── market/
 │   ├── options/            # 2C fixture chain; BUY CE/PE research only
 │   ├── strategies/         # 2B quant engine (signals only)

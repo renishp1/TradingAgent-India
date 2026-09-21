@@ -150,3 +150,22 @@ grow:
       allow_broker: false
       allow_live_trading: false
       allow_ai_execution: false
+
+  backtest:
+    enabled: true
+    provider: fixture
+    fill_model: ask_plus_slippage
+    slippage_bps: 10
+    strict: true
+    quantity: 1
+    max_open_positions: 1
+    starting_cash: 1000000
+    cost_model_version: costs.india.fn_o.v1
+    slippage_model_version: slip.ask.v1
+    walk_forward:
+      train_sessions: 6
+      validate_sessions: 2
+      test_sessions: 2
+      step_sessions: 2
+      embargo_sessions: 1
+      calibrate_on_test: false

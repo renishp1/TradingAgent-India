@@ -40,6 +40,9 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.ai.provider, "fixture")
         self.assertFalse(config.ai.allow_ai_execution)
         self.assertFalse(config.ai.allow_broker)
+        self.assertEqual(config.backtest.provider, "fixture")
+        self.assertEqual(config.backtest.fill_model, "ask_plus_slippage")
+        self.assertFalse(config.backtest.calibrate_on_test)
 
 
     def test_live_yaml_value_cannot_pass_through_env_truth(self) -> None:

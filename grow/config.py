@@ -225,6 +225,26 @@ class AIConfig:
 
 
 @dataclass(frozen=True)
+class BacktestConfig:
+    enabled: bool
+    provider: str
+    fill_model: str
+    slippage_bps: float
+    strict: bool
+    quantity: int
+    max_open_positions: int
+    starting_cash: float
+    cost_model_version: str
+    slippage_model_version: str
+    train_sessions: int
+    validate_sessions: int
+    test_sessions: int
+    step_sessions: int
+    embargo_sessions: int
+    calibrate_on_test: bool
+
+
+@dataclass(frozen=True)
 class GrowConfig:
     version: str
     timezone: str
@@ -238,6 +258,7 @@ class GrowConfig:
     strategies: StrategiesConfig
     options: OptionsConfig
     ai: AIConfig
+    backtest: BacktestConfig
     source_path: str
 
     def assert_safe(self) -> None:
@@ -284,6 +305,17 @@ class GrowConfig:
             raise GrowConfigError("2D ai.provider must be 'fixture'.")
         if self.ai.allow_broker or self.ai.allow_live_trading or self.ai.allow_ai_execution:
             raise GrowConfigError("2D AI may not enable broker, live trading, or execution.")
+        if self.backtest.provider != "fixture":
+            raise GrowConfigError("2E backtest.provider must be 'fixture'.")
+        if self.backtest.fill_model != "ask_plus_slippage":
+            raise GrowConfigError("2E fill_model must be ask_plus_slippage.")
+        if self.backtest.max_open_positions != 1:
+            raise GrowConfigError("2E v1 allows one open position.")
+        if self.backtest.calibrate_on_test:
+            raise GrowConfigError("2E must not calibrate on the test window.")
+        if self.backtest.quantity < 1:
+            raise GrowConfigError("2E quantity must be >= 1")
+
 
 
 _DEFAULT_STRATEGY_SPECS: tuple[tuple[str, dict[str, Any]], ...] = (
@@ -399,6 +431,30 @@ def _ai_config(raw: dict[str, Any]) -> AIConfig:
         allow_broker=_as_bool(safety.get("allow_broker", False), "ai.safety.allow_broker"),
         allow_live_trading=_as_bool(safety.get("allow_live_trading", False), "ai.safety.allow_live_trading"),
         allow_ai_execution=_as_bool(safety.get("allow_ai_execution", False), "ai.safety.allow_ai_execution"),
+    )
+
+
+def _backtest_config(raw: dict[str, Any]) -> BacktestConfig:
+    if not isinstance(raw, dict):
+        raise GrowConfigError("grow.backtest must be a mapping")
+    wf = raw.get("walk_forward") or {}
+    return BacktestConfig(
+        enabled=_as_bool(raw.get("enabled", True), "backtest.enabled"),
+        provider=str(raw.get("provider", "fixture")).lower(),
+        fill_model=str(raw.get("fill_model", "ask_plus_slippage")).lower(),
+        slippage_bps=_as_float(raw.get("slippage_bps", 10), "backtest.slippage_bps"),
+        strict=_as_bool(raw.get("strict", True), "backtest.strict"),
+        quantity=_as_int(raw.get("quantity", 1), "backtest.quantity"),
+        max_open_positions=_as_int(raw.get("max_open_positions", 1), "backtest.max_open_positions"),
+        starting_cash=_as_float(raw.get("starting_cash", 1_000_000), "backtest.starting_cash"),
+        cost_model_version=str(raw.get("cost_model_version", "costs.india.fn_o.v1")),
+        slippage_model_version=str(raw.get("slippage_model_version", "slip.ask.v1")),
+        train_sessions=_as_int(wf.get("train_sessions", 6), "backtest.walk_forward.train_sessions"),
+        validate_sessions=_as_int(wf.get("validate_sessions", 2), "backtest.walk_forward.validate_sessions"),
+        test_sessions=_as_int(wf.get("test_sessions", 2), "backtest.walk_forward.test_sessions"),
+        step_sessions=_as_int(wf.get("step_sessions", 2), "backtest.walk_forward.step_sessions"),
+        embargo_sessions=_as_int(wf.get("embargo_sessions", 1), "backtest.walk_forward.embargo_sessions"),
+        calibrate_on_test=_as_bool(wf.get("calibrate_on_test", False), "backtest.walk_forward.calibrate_on_test"),
     )
 
 
@@ -524,6 +580,7 @@ def _build(raw: dict[str, Any], source_path: str) -> GrowConfig:
         ),
         options=_options_config(g.get("options") or {}),
         ai=_ai_config(g.get("ai") or {}),
+        backtest=_backtest_config(g.get("backtest") or {}),
         source_path=source_path,
     )
     config.assert_safe()

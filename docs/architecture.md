@@ -160,6 +160,17 @@ Fixture AI only. CEO may approve the **2C winner** or reject it. Never
 invent a contract, never call Risk Guard, never write the ledger.
 See [`research.md`](research.md).
 
+## Backtest plane (Milestone 2E)
+
+```
+Historical fixture snapshots → 2B → 2C → 2D → ask+slippage fill
+→ 15:15 square-off → isolated ledger → walk-forward test windows
+======== STOP 2E ========
+No broker. No PaperLedger. No Risk Guard mutation. No live trading.
+```
+
+See [`backtest.md`](backtest.md).
+
 ## Modules
 
 | Path | Status | Responsibility |
@@ -170,6 +181,7 @@ See [`research.md`](research.md).
 | `grow/model_gateway/` | **implemented (mock)** | Provider abstraction; remote = later |
 | `grow/ceo/` | **implemented** | M1 cash TradeProposal; placeholder SL/TP |
 | `grow/research/` | **2D engine** | Fixture agents; TRADE_APPROVE or NO_TRADE |
+| `grow/backtest/` | **2E engine** | Fixture replay, costs, walk-forward; not live |
 | `grow/market/` | **implemented (stub quotes)** | Brief + NSE session/square-off clock |
 | `grow/risk/` | **implemented** | Deterministic guard + HMAC stamp (secret required) |
 | `grow/paper/` | **implemented** | In-memory long-only ledger |
