@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import unittest
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -12,6 +14,7 @@ from grow.market.research import MarketResearch
 from grow.paper.ledger import PaperLedger
 from grow.risk.guard import RiskGuard
 from grow.risk.secret import resolve_risk_secret
+from grow.risk.stamp import STAMP_VERSION, canonical_proposal_json
 from grow.types import Intent, Regime, RiskStamp, Side, Symbol, TradeProposal, Venue
 
 from tests.helpers import TEST_RISK_SECRET, make_guard
@@ -89,7 +92,7 @@ class RiskGuardTests(unittest.TestCase):
     def test_after_hours_open_rejected(self) -> None:
         night = FrozenClock(datetime(2026, 9, 21, 18, 0, tzinfo=IST))
         guard = make_guard(self.config, clock=night)
-        p = _proposal(limit_price=self.brief.last_price, notional=self.brief.last_price * 5)
+        p = _proposal(limit_price=self.brief.last_price, notional=self.brief.last_price * 5, quantity=5)
         verdict = guard.evaluate(
             p, self.brief, cash=1_000_000, gross_notional=0, daily_pnl=0, symbol_notional=0
         )
@@ -99,7 +102,7 @@ class RiskGuardTests(unittest.TestCase):
     def test_square_off_window_blocks_new_entries(self) -> None:
         late = FrozenClock(datetime(2026, 9, 21, 15, 20, tzinfo=IST))
         guard = make_guard(self.config, clock=late)
-        p = _proposal(limit_price=self.brief.last_price, notional=self.brief.last_price)
+        p = _proposal(limit_price=self.brief.last_price, notional=self.brief.last_price, quantity=1)
         verdict = guard.evaluate(
             p, self.brief, cash=1_000_000, gross_notional=0, daily_pnl=0, symbol_notional=0
         )
@@ -114,6 +117,7 @@ class RiskGuardTests(unittest.TestCase):
             side=Side.SELL,
             stop_loss=None,
             limit_price=self.brief.last_price,
+            quantity=1,
             notional=self.brief.last_price,
         )
         verdict = guard.evaluate(
@@ -122,14 +126,14 @@ class RiskGuardTests(unittest.TestCase):
         self.assertTrue(verdict.approved, verdict.reason)
 
     def test_unknown_symbol_rejected(self) -> None:
-        p = _proposal(symbol=Symbol("NOTAREAL"), limit_price=100, notional=100)
+        p = _proposal(symbol=Symbol("NOTAREAL"), limit_price=100, notional=100, quantity=1)
         verdict = self._eval(p)
         self.assertFalse(verdict.approved)
         self.assertIn("universe", verdict.reason)
 
     def test_forged_stamp_rejected_by_ledger(self) -> None:
         ledger = PaperLedger(self.config, self.guard, clock=self.clock)
-        p = _proposal(limit_price=self.brief.last_price, notional=self.brief.last_price)
+        p = _proposal(limit_price=self.brief.last_price, notional=self.brief.last_price, quantity=1)
         fake = RiskStamp(
             proposal_id=p.proposal_id,
             issued_at=self.clock.now(),
@@ -142,7 +146,7 @@ class RiskGuardTests(unittest.TestCase):
             ledger.submit(p, None)
 
     def test_daily_loss_halt(self) -> None:
-        p = _proposal(limit_price=self.brief.last_price, notional=self.brief.last_price)
+        p = _proposal(limit_price=self.brief.last_price, notional=self.brief.last_price, quantity=1)
         verdict = self._eval(p, daily_pnl=-50_000)
         self.assertFalse(verdict.approved)
         self.assertIn("loss.daily", verdict.reason)
@@ -154,15 +158,44 @@ class RiskGuardTests(unittest.TestCase):
             limit_price=self.brief.last_price,
             stop_loss=round(self.brief.last_price * 1.02, 2),
             notional=self.brief.last_price,
+            quantity=1,
         )
         verdict = self._eval(p)
         self.assertFalse(verdict.approved)
         self.assertIn("policy.long_only", verdict.reason)
 
     def test_concentration_reports_cost_notional_basis(self) -> None:
-        verdict = self._eval(_proposal(limit_price=self.brief.last_price, notional=self.brief.last_price))
+        verdict = self._eval(_proposal(limit_price=self.brief.last_price, notional=self.brief.last_price, quantity=1))
         conc = [r for r in verdict.rule_results if r[0] == "concentration.symbol"][0]
         self.assertIn("basis=cost_notional", conc[2])
+
+    def test_stamp_binds_stop_take_and_notional(self) -> None:
+        original = _proposal(limit_price=self.brief.last_price, notional=self.brief.last_price * 10)
+        verdict = self._eval(original)
+        self.assertTrue(verdict.approved, verdict.reason)
+        self.assertTrue(self.guard.verify_stamp(original, verdict.stamp))
+        payload = json.loads(canonical_proposal_json(original, self.config.risk.ruleset))
+        self.assertEqual(payload["v"], STAMP_VERSION)
+        self.assertEqual(payload["stop_loss"], f"{original.stop_loss:.4f}")
+        self.assertEqual(payload["take_profit"], f"{original.take_profit:.4f}")
+        self.assertEqual(payload["notional"], f"{original.notional:.4f}")
+        self.assertFalse(self.guard.verify_stamp(replace(original, stop_loss=1.0), verdict.stamp))
+        self.assertFalse(self.guard.verify_stamp(replace(original, take_profit=9_999.0), verdict.stamp))
+        self.assertFalse(
+            self.guard.verify_stamp(
+                replace(original, notional=round(original.notional + 1, 2)),
+                verdict.stamp,
+            )
+        )
+        self.assertFalse(self.guard.verify_stamp(replace(original, quantity=original.quantity + 1), verdict.stamp))
+        # Commentary is not a fill field; thesis mutation still verifies.
+        self.assertTrue(self.guard.verify_stamp(replace(original, thesis="rewritten"), verdict.stamp))
+
+    def test_notional_mismatch_fails_guard(self) -> None:
+        p = _proposal(limit_price=self.brief.last_price, quantity=10, notional=1.0)
+        verdict = self._eval(p)
+        self.assertFalse(verdict.approved)
+        self.assertIn("notional.matches", verdict.reason)
 
 
 class RiskSecretTests(unittest.TestCase):
@@ -190,7 +223,7 @@ class RiskSecretTests(unittest.TestCase):
         b = RiskGuard(config, clock=clock, secret=other)
         brief = MarketResearch(config, clock=clock).research("RELIANCE")
         object.__setattr__(brief, "regime", Regime.RANGING)
-        p = _proposal(limit_price=brief.last_price, notional=brief.last_price)
+        p = _proposal(limit_price=brief.last_price, notional=brief.last_price, quantity=1)
         verdict = a.evaluate(p, brief, cash=1_000_000, gross_notional=0, daily_pnl=0, symbol_notional=0)
         self.assertTrue(verdict.approved, verdict.reason)
         self.assertFalse(b.verify_stamp(p, verdict.stamp))
