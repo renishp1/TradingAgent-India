@@ -41,14 +41,14 @@ class CycleReport:
 
 
 class GrowRuntime:
-    def __init__(self, config: GrowConfig, clock=None) -> None:
+    def __init__(self, config: GrowConfig, clock=None, *, risk_secret: str | None = None) -> None:
         config.assert_safe()
         self.config = config
         self.clock = clock
         self.gateway = ModelGateway(config)
         self.market = MarketResearch(config, clock=clock)
         self.ceo = CEO(config, self.gateway, clock=clock)
-        self.guard = RiskGuard(config, clock=clock)
+        self.guard = RiskGuard(config, clock=clock, secret=risk_secret)
         self.ledger = PaperLedger(config, self.guard, clock=clock)
         self.graph = ResearchGraph(config) if config.tradingagents.enabled else None
 

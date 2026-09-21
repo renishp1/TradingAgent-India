@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
 
 from grow.config import load_config  # noqa: E402
 from grow.cycle import GrowRuntime  # noqa: E402
+from grow.errors import GrowConfigError  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -22,8 +23,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", default=None)
     args = parser.parse_args(argv)
 
-    config = load_config(args.config)
-    runtime = GrowRuntime(config)
+    try:
+        config = load_config(args.config)
+        runtime = GrowRuntime(config)
+    except GrowConfigError as exc:
+        print(exc, file=sys.stderr)
+        return 1
     report = runtime.run(args.symbol)
     print(json.dumps(report.to_dict(), indent=2, default=str))
     if report.fill is None:

@@ -15,6 +15,7 @@ grow:
     session_open: "09:15"
     session_close: "15:30"
     square_off: "15:15"
+    product: CASH
     universe:
       - RELIANCE
       - TCS
@@ -34,6 +35,8 @@ grow:
     require_stop_loss: true
     max_symbol_concentration: 0.35
     ruleset: "grow.risk.v1"
+    allow_short: false
+    concentration_basis: cost_notional
 
   paper:
     starting_cash: 1000000
