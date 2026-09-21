@@ -1,7 +1,8 @@
 """Deterministic synthetic OHLCV. This is not a market feed.
 
-Prices are a hash of ticker+session date, same philosophy as the milestone 1
-stub quote. Volume is synthetic. `SourceMeta.is_live` is always false.
+Prices are a hash of `(ticker, bar.start)`, not a session-day close.
+That keeps an 11:00 D1 from seeing post-11:00 information. Volume is
+synthetic. `SourceMeta.is_live` is always false.
 """
 
 from __future__ import annotations
