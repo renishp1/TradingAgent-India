@@ -97,7 +97,7 @@ NSE cash `09:15`–`15:30` IST.
 |---|---|---|
 | M15 | 25 (last start 15:15) | 7 complete |
 | M5 | 75 (last start 15:25) | 21 complete |
-| D1 | 1 per session | forming daily bar + 19 closed sessions (20 total) |
+| D1 | 1 per session (forming 09:15→as_of until 15:30) | forming 09:15→11:00 from complete M5 |
 
 A bar is complete when `start + duration <= as_of`.
 

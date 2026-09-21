@@ -99,8 +99,22 @@ Raw fixture OHLCV  →  Normalizer  →  MarketSnapshot  →  ResearchView
                                     (2B) StrategySignal
 ```
 
-LLM research must not receive raw candles. Licensed feeds, scrapes, and
-broker quotes are refuse-closed until a named vendor is reviewed.
+`DataHub` depends on the `MarketDataSource` protocol. `FixtureSource` is the
+only implementation. Licensed feeds, scrapes, and broker quotes are
+refuse-closed until a named vendor is reviewed.
+
+D1 look-ahead: at an intraday `as_of`, today's daily bar is a **forming**
+candle from 09:15 IST to `as_of`, aggregated from complete M5 bars. It is
+complete only at/after 15:30 IST. LLM research must not receive raw candles;
+`assert_research_payload` walks nested mappings and sequences.
+
+`DataHub.snapshot` retains the `BarSeries` returned by the corporate-action
+adjuster. `Bar` timestamps must be timezone-aware `Asia/Kolkata` and sit on
+the M5/M15 grid (D1 starts at cash open). `BarSeries` requires one symbol,
+one timeframe, chronological unique starts.
+
+`RiskGuard.verify_stamp` requires `stamp.ruleset == config.risk.ruleset` in
+addition to HMAC verify.
 
 ## Modules
 

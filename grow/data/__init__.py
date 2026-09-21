@@ -7,6 +7,7 @@ broker quotes are refuse-closed. This package does not emit trades.
 from grow.data.boundary import assert_research_payload, research_view
 from grow.data.hub import DataHub
 from grow.data.licensed import LicensedFeed
+from grow.data.source import MarketDataSource
 from grow.data.schema import (
     FIXTURE_SOURCE,
     Bar,
@@ -24,6 +25,7 @@ __all__ = [
     "BarSeries",
     "DataHub",
     "LicensedFeed",
+    "MarketDataSource",
     "MarketSnapshot",
     "NIFTY50_EQUITIES",
     "NIFTY_INDICES",

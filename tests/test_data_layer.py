@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime
+from dataclasses import replace
+from datetime import datetime, time, timezone
 from pathlib import Path
 
 from grow.clock import FrozenClock, IST
 from grow.config import load_config
 from grow.data import (
+    Bar,
+    BarSeries,
     DataHub,
     LicensedFeed,
+    MarketDataSource,
     NIFTY50_EQUITIES,
     NIFTY_INDICES,
     Timeframe,
@@ -17,9 +21,9 @@ from grow.data import (
 )
 from grow.data.actions import CorporateAction, IdentityAdjuster, LicensedActions
 from grow.data.boundary import research_view
-from grow.data.fixture import expected_full_session_count
+from grow.data.fixture import FixtureSource, expected_full_session_count
 from grow.data.normalizer import normalize_bar
-from grow.data.schedule import complete_starts, expected_starts
+from grow.data.schedule import complete_starts
 from grow.data.universe import SELECTED_NSE_STOCKS, is_in_data_universe
 from grow.errors import GrowConfigError, GrowInterfaceNotImplemented, GrowSafetyError
 from grow.strategies import StrategyBook, StrategySignal
@@ -54,7 +58,7 @@ class ScheduleTests(unittest.TestCase):
 
     def test_complete_bars_at_1100(self) -> None:
         as_of = datetime(2026, 9, 21, 11, 0, tzinfo=IST)
-        from datetime import date, time
+        from datetime import date
 
         m15 = complete_starts(
             date(2026, 9, 21),
@@ -93,6 +97,27 @@ class FixtureHubTests(unittest.TestCase):
         self.assertEqual(len(snap.series[Timeframe.D1].bars), self.config.data.history_sessions)
         self.assertGreater(snap.last_price, 0)
 
+    def test_d1_forming_at_1100_has_no_look_ahead(self) -> None:
+        snap = self.hub.snapshot("RELIANCE")
+        d1 = snap.series[Timeframe.D1].bars[-1]
+        m5 = snap.series[Timeframe.M5]
+        as_of = datetime(2026, 9, 21, 11, 0, tzinfo=IST)
+        self.assertEqual(d1.start, datetime(2026, 9, 21, 9, 15, tzinfo=IST))
+        self.assertEqual(d1.end, as_of)
+        self.assertEqual(d1.close, m5.bars[-1].close)
+        self.assertEqual(d1.open, m5.bars[0].open)
+        self.assertLess(d1.end, datetime(2026, 9, 21, 15, 30, tzinfo=IST))
+        self.assertFalse(snap.quality.complete)
+
+    def test_d1_complete_at_1530(self) -> None:
+        clock = FrozenClock(datetime(2026, 9, 21, 15, 30, tzinfo=IST))
+        hub = DataHub(self.config, clock=clock)
+        snap = hub.snapshot("RELIANCE")
+        d1 = snap.series[Timeframe.D1].bars[-1]
+        self.assertEqual(d1.start, datetime(2026, 9, 21, 9, 15, tzinfo=IST))
+        self.assertEqual(d1.end, datetime(2026, 9, 21, 15, 30, tzinfo=IST))
+        self.assertTrue(any("D1 complete" in note for note in snap.quality.notes))
+
     def test_full_session_after_close(self) -> None:
         clock = FrozenClock(datetime(2026, 9, 21, 15, 30, tzinfo=IST))
         hub = DataHub(self.config, clock=clock)
@@ -105,13 +130,13 @@ class FixtureHubTests(unittest.TestCase):
 
         snap = self.hub.snapshot("INFY")
         series = snap.series[Timeframe.M15]
-        truncated = type(series)(symbol=series.symbol, timeframe=series.timeframe, bars=series.bars[1:])
+        truncated = BarSeries(symbol=series.symbol, timeframe=series.timeframe, bars=series.bars[1:])
         quality = assess_series(
             truncated,
             session_day=datetime(2026, 9, 21).date(),
             as_of=self.clock.now(),
-            session_open=self.hub.source.calendar.open_time,
-            session_close=self.hub.source.calendar.close_time,
+            session_open=time(9, 15),
+            session_close=time(15, 30),
             stale_after_seconds=900,
         )
         self.assertGreater(quality.missing_count, 0)
@@ -126,6 +151,15 @@ class FixtureHubTests(unittest.TestCase):
         self.assertNotIn("series", payload)
         with self.assertRaises(GrowSafetyError):
             assert_research_payload({"symbol": "TCS", "bars": [1, 2, 3]})
+
+    def test_research_payload_rejects_nested_dict_and_list(self) -> None:
+        with self.assertRaises(GrowSafetyError):
+            assert_research_payload({"ok": True, "nested": {"ohlcv": [1, 2]}})
+        with self.assertRaises(GrowSafetyError):
+            assert_research_payload({"items": [{"close": 12.0}]})
+        with self.assertRaises(GrowSafetyError):
+            assert_research_payload(({"meta": {"series": {}}},))
+        assert_research_payload({"symbol": "TCS", "notes": ["no candles"], "bar_counts": {"M5": 21}})
 
     def test_hub_does_not_emit_trades(self) -> None:
         self.assertFalse(hasattr(self.hub, "propose"))
@@ -161,6 +195,131 @@ class FixtureHubTests(unittest.TestCase):
         with self.assertRaises(GrowInterfaceNotImplemented):
             LicensedActions().load()
 
+    def test_adjuster_series_reaches_snapshot(self) -> None:
+        class ScaleAdjuster:
+            def apply(self, series: BarSeries, actions: tuple) -> BarSeries:
+                scaled = []
+                for bar in series.bars:
+                    close = round(bar.close * 2, 2)
+                    high = max(bar.high * 2, close, bar.open * 2)
+                    low = min(bar.low * 2, close, bar.open * 2)
+                    scaled.append(
+                        replace(
+                            bar,
+                            open=round(bar.open * 2, 2),
+                            high=round(high, 2),
+                            low=round(low, 2),
+                            close=close,
+                        )
+                    )
+                return BarSeries(symbol=series.symbol, timeframe=series.timeframe, bars=tuple(scaled))
+
+        raw = FixtureSource(self.config, clock=self.clock).snapshot("RELIANCE")
+        hub = DataHub(self.config, clock=self.clock, adjuster=ScaleAdjuster())
+        adjusted = hub.snapshot("RELIANCE")
+        self.assertEqual(
+            adjusted.series[Timeframe.M5].bars[-1].close,
+            round(raw.series[Timeframe.M5].bars[-1].close * 2, 2),
+        )
+        self.assertNotEqual(adjusted.series[Timeframe.M5].bars[-1].close, raw.series[Timeframe.M5].bars[-1].close)
+
+    def test_source_is_market_data_protocol(self) -> None:
+        self.assertIsInstance(self.hub.source, MarketDataSource)
+        self.assertIsInstance(FixtureSource(self.config, clock=self.clock), MarketDataSource)
+
+    def test_timestamp_and_grid_validation(self) -> None:
+        symbol = Symbol("RELIANCE")
+        start = datetime(2026, 9, 21, 9, 15, tzinfo=IST)
+        good = Bar(
+            symbol=symbol,
+            timeframe=Timeframe.M5,
+            start=start,
+            end=datetime(2026, 9, 21, 9, 20, tzinfo=IST),
+            open=100,
+            high=101,
+            low=99,
+            close=100.5,
+            volume=10,
+        )
+        self.assertEqual(good.start.tzinfo.key, "Asia/Kolkata")
+        with self.assertRaises(ValueError):
+            Bar(
+                symbol=symbol,
+                timeframe=Timeframe.M5,
+                start=datetime(2026, 9, 21, 9, 15),
+                end=datetime(2026, 9, 21, 9, 20),
+                open=100,
+                high=101,
+                low=99,
+                close=100.5,
+                volume=10,
+            )
+        with self.assertRaises(ValueError):
+            Bar(
+                symbol=symbol,
+                timeframe=Timeframe.M5,
+                start=datetime(2026, 9, 21, 9, 15, tzinfo=timezone.utc),
+                end=datetime(2026, 9, 21, 9, 20, tzinfo=timezone.utc),
+                open=100,
+                high=101,
+                low=99,
+                close=100.5,
+                volume=10,
+            )
+        with self.assertRaises(ValueError):
+            Bar(
+                symbol=symbol,
+                timeframe=Timeframe.M5,
+                start=datetime(2026, 9, 21, 9, 17, tzinfo=IST),
+                end=datetime(2026, 9, 21, 9, 22, tzinfo=IST),
+                open=100,
+                high=101,
+                low=99,
+                close=100.5,
+                volume=10,
+            )
+        with self.assertRaises(ValueError):
+            Bar(
+                symbol=symbol,
+                timeframe=Timeframe.M15,
+                start=datetime(2026, 9, 21, 9, 20, tzinfo=IST),
+                end=datetime(2026, 9, 21, 9, 35, tzinfo=IST),
+                open=100,
+                high=101,
+                low=99,
+                close=100.5,
+                volume=10,
+            )
+
+    def test_bar_series_invariants(self) -> None:
+        symbol = Symbol("RELIANCE")
+        a = Bar(
+            symbol=symbol,
+            timeframe=Timeframe.M5,
+            start=datetime(2026, 9, 21, 9, 15, tzinfo=IST),
+            end=datetime(2026, 9, 21, 9, 20, tzinfo=IST),
+            open=100,
+            high=101,
+            low=99,
+            close=100.5,
+            volume=10,
+        )
+        b = replace(
+            a,
+            start=datetime(2026, 9, 21, 9, 20, tzinfo=IST),
+            end=datetime(2026, 9, 21, 9, 25, tzinfo=IST),
+        )
+        BarSeries(symbol=symbol, timeframe=Timeframe.M5, bars=(a, b))
+        with self.assertRaises(ValueError):
+            BarSeries(symbol=symbol, timeframe=Timeframe.M5, bars=(b, a))
+        with self.assertRaises(ValueError):
+            BarSeries(symbol=symbol, timeframe=Timeframe.M5, bars=(a, a))
+        other = replace(b, symbol=Symbol("TCS"))
+        with self.assertRaises(ValueError):
+            BarSeries(symbol=symbol, timeframe=Timeframe.M5, bars=(a, other))
+        with self.assertRaises(ValueError):
+            BarSeries(symbol=symbol, timeframe=Timeframe.M15, bars=(a,))
+
     def test_strategy_book_not_wired(self) -> None:
         with self.assertRaises(GrowInterfaceNotImplemented):
             StrategyBook().run("breakout")
@@ -180,7 +339,6 @@ class FixtureHubTests(unittest.TestCase):
         self.assertEqual(signal.to_dict()["direction"], "LONG")
 
     def test_normalizer_rejects_bad_ohlc(self) -> None:
-        from datetime import time as dtime
         from grow.data.schedule import bar_duration
 
         start = datetime(2026, 9, 21, 9, 15, tzinfo=IST)

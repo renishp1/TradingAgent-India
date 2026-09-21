@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from grow.clock import IST
 from grow.data.schema import BarSeries, SnapshotQuality, Timeframe
-from grow.data.schedule import bar_duration, complete_starts
+from grow.data.schedule import complete_starts
 
 
 def assess_series(
@@ -17,6 +18,26 @@ def assess_series(
     session_close,
     stale_after_seconds: int,
 ) -> SnapshotQuality:
+    as_of = as_of.astimezone(IST)
+    if series.timeframe is Timeframe.D1:
+        last = series.bars[-1] if series.bars else None
+        session_end = datetime.combine(session_day, session_close, tzinfo=IST)
+        forming = last is not None and last.end < session_end
+        last_end = None if last is None else last.end
+        lag = (as_of - last_end).total_seconds() if last_end is not None else 10**9
+        notes = (
+            ("forming D1: only data available up to as_of",)
+            if forming
+            else ("D1 complete through session close",)
+        )
+        return SnapshotQuality(
+            complete=last is not None and not forming,
+            stale=lag > stale_after_seconds,
+            missing_count=0,
+            expected_count=len(series.bars),
+            last_bar_end=last_end,
+            notes=notes,
+        )
     expected = complete_starts(
         session_day,
         series.timeframe,
@@ -24,17 +45,6 @@ def assess_series(
         session_open=session_open,
         session_close=session_close,
     )
-    if series.timeframe is Timeframe.D1:
-        last_end = series.bars[-1].end if series.bars else None
-        lag = (as_of - last_end).total_seconds() if last_end is not None else 10**9
-        return SnapshotQuality(
-            complete=len(series.bars) > 0,
-            stale=lag > stale_after_seconds,
-            missing_count=0,
-            expected_count=len(series.bars),
-            last_bar_end=last_end,
-            notes=("daily bars are session aggregates; current day may still be forming",),
-        )
     have = {bar.start for bar in series.bars}
     missing = tuple(start for start in expected if start not in have)
     last_end = series.bars[-1].end if series.bars else None
@@ -48,8 +58,6 @@ def assess_series(
         stale = lag > stale_after_seconds
         if stale:
             notes.append(f"lag={int(lag)}s")
-        if series.timeframe is Timeframe.D1 and not missing:
-            notes.append("daily series uses completed sessions only")
     return SnapshotQuality(
         complete=len(missing) == 0 and bool(expected),
         stale=stale,
@@ -83,6 +91,3 @@ def combine_quality(parts: tuple[SnapshotQuality, ...]) -> SnapshotQuality:
         notes=tuple(notes),
     )
 
-
-def duration_seconds(timeframe: Timeframe) -> float:
-    return bar_duration(timeframe).total_seconds()

@@ -191,6 +191,14 @@ class RiskGuardTests(unittest.TestCase):
         # Commentary is not a fill field; thesis mutation still verifies.
         self.assertTrue(self.guard.verify_stamp(replace(original, thesis="rewritten"), verdict.stamp))
 
+    def test_verify_requires_config_ruleset(self) -> None:
+        original = _proposal(limit_price=self.brief.last_price, notional=self.brief.last_price * 10)
+        verdict = self._eval(original)
+        self.assertTrue(verdict.approved, verdict.reason)
+        self.assertEqual(verdict.stamp.ruleset, self.config.risk.ruleset)
+        mutated = replace(verdict.stamp, ruleset="grow.risk.forged")
+        self.assertFalse(self.guard.verify_stamp(original, mutated))
+
     def test_notional_mismatch_fails_guard(self) -> None:
         p = _proposal(limit_price=self.brief.last_price, quantity=10, notional=1.0)
         verdict = self._eval(p)

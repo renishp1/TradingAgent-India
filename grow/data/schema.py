@@ -80,6 +80,9 @@ class Bar:
             raise ValueError("OHLC envelope is inconsistent")
         if self.high < self.low:
             raise ValueError("high < low")
+        from grow.data.schedule import assert_bar_alignment
+
+        assert_bar_alignment(self.start, self.end, self.timeframe)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -100,6 +103,21 @@ class BarSeries:
     symbol: Symbol
     timeframe: Timeframe
     bars: tuple[Bar, ...]
+
+    def __post_init__(self) -> None:
+        seen: set[datetime] = set()
+        previous: datetime | None = None
+        for bar in self.bars:
+            if bar.symbol != self.symbol:
+                raise ValueError("BarSeries bars must share the series symbol")
+            if bar.timeframe is not self.timeframe:
+                raise ValueError("BarSeries bars must share the series timeframe")
+            if bar.start in seen:
+                raise ValueError("BarSeries bars must not duplicate start times")
+            if previous is not None and bar.start <= previous:
+                raise ValueError("BarSeries bars must be chronological")
+            seen.add(bar.start)
+            previous = bar.start
 
     def to_dict(self) -> dict[str, Any]:
         return {

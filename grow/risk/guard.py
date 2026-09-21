@@ -50,6 +50,8 @@ class RiskGuard:
     def verify_stamp(self, proposal: TradeProposal, stamp: RiskStamp | None) -> bool:
         if stamp is None:
             return False
+        if stamp.ruleset != self.config.risk.ruleset:
+            return False
         expected = self._stamp(proposal, stamp.issued_at)
         return hmac.compare_digest(expected.token, stamp.token) and stamp.proposal_id == proposal.proposal_id
 

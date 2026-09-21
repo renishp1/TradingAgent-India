@@ -50,12 +50,18 @@ def research_view(snapshot: MarketSnapshot) -> ResearchView:
     )
 
 
-def assert_research_payload(payload: Mapping[str, Any]) -> None:
-    """Fail closed if someone tries to hand raw candles to an LLM."""
-    keys = {str(key).lower() for key in payload}
-    leaked = keys & _FORBIDDEN_RESEARCH_KEYS
-    if leaked:
-        raise GrowSafetyError(f"Research payload contains raw market-data keys: {sorted(leaked)}")
-    nested = payload.get("extras")
-    if isinstance(nested, Mapping):
-        assert_research_payload(nested)
+def assert_research_payload(payload: Any) -> None:
+    """Fail closed if raw candles leak into an LLM payload at any depth."""
+    if isinstance(payload, Mapping):
+        leaked = {str(key).lower() for key in payload} & _FORBIDDEN_RESEARCH_KEYS
+        if leaked:
+            raise GrowSafetyError(
+                f"Research payload contains raw market-data keys: {sorted(leaked)}"
+            )
+        for value in payload.values():
+            assert_research_payload(value)
+        return
+    if isinstance(payload, (list, tuple, set, frozenset)):
+        for item in payload:
+            assert_research_payload(item)
+        return

@@ -20,8 +20,8 @@ setting.
 ## Risk stamp
 
 `PaperLedger.submit` requires a `RiskStamp` minted by `RiskGuard`. Tokens are
-HMAC-SHA256 over SHA-256 of a **canonical JSON** of the security-relevant
-proposal (`grow.risk.stamp.v2`):
+HMAC-SHA256 over the canonical fill-relevant proposal fields
+(`grow.risk.stamp.v2`):
 
 ```
 proposal_id, symbol, exchange, side, intent, quantity,

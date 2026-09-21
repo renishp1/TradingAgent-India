@@ -85,7 +85,7 @@ class FixtureSource:
         if timeframe is Timeframe.D1:
             count = history_sessions if history_sessions is not None else self.config.data.history_sessions
             days = self._completed_session_days(session_day, count, moment)
-            built = [self._daily_bar(symbol, day) for day in days]
+            built = [self._daily_bar(symbol, day, moment) for day in days]
             return BarSeries(symbol=symbol, timeframe=timeframe, bars=tuple(built))
         starts = complete_starts(
             session_day,
@@ -155,12 +155,49 @@ class FixtureSource:
         days.reverse()
         return tuple(days[-count:])
 
-    def _daily_bar(self, symbol: Symbol, session_day: date) -> Bar:
+    def _daily_bar(self, symbol: Symbol, session_day: date, as_of: datetime) -> Bar:
         start = datetime.combine(session_day, self.calendar.open_time, tzinfo=IST)
+        session_end = datetime.combine(session_day, self.calendar.close_time, tzinfo=IST)
+        as_of = as_of.astimezone(IST)
+        forming = session_day == as_of.date() and as_of < session_end
+        if forming:
+            end = as_of
+            intraday = self.bars(
+                symbol.ticker,
+                Timeframe.M5,
+                session_day=session_day,
+                as_of=as_of,
+            )
+            if intraday.bars:
+                high = max(bar.high for bar in intraday.bars)
+                low = min(bar.low for bar in intraday.bars)
+                return Bar(
+                    symbol=symbol,
+                    timeframe=Timeframe.D1,
+                    start=start,
+                    end=end,
+                    open=intraday.bars[0].open,
+                    high=high,
+                    low=low,
+                    close=intraday.bars[-1].close,
+                    volume=sum(bar.volume for bar in intraday.bars),
+                )
+            open_px = round(_daily_close(symbol.ticker, session_day) * 0.999, 2)
+            return Bar(
+                symbol=symbol,
+                timeframe=Timeframe.D1,
+                start=start,
+                end=end,
+                open=open_px,
+                high=open_px,
+                low=open_px,
+                close=open_px,
+                volume=0,
+            )
         close = _daily_close(symbol.ticker, session_day)
         row = _ohlc_from_close(symbol.ticker, start, close)
         row["start"] = start
-        row["end"] = start + bar_duration(Timeframe.D1)
+        row["end"] = session_end
         row["volume"] = _volume(symbol.ticker, start, Timeframe.D1)
         return normalize_bar(row, symbol=symbol, timeframe=Timeframe.D1)
 
