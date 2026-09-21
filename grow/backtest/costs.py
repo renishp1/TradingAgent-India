@@ -15,14 +15,20 @@ class CostModel:
     def __init__(self, *, stress: float = 1.0) -> None:
         self.stress = stress
 
-    def round_trip(self, *, entry: float, exit: float, quantity: int) -> float:
-        buy_notional = entry * quantity
-        sell_notional = exit * quantity
+    def round_trip(self, *, entry: float, exit: float, quantity: int, lot_size: int = 1) -> float:
+        units = quantity * lot_size
+        buy_notional = entry * units
+        sell_notional = exit * units
         brokerage = (self.brokerage_per_order * 2) * self.stress
         stt = sell_notional * self.stt_sell_pct * self.stress
         exchange = (buy_notional + sell_notional) * self.exchange_pct * self.stress
         gst = (brokerage + exchange) * self.gst_pct
         return round(brokerage + stt + exchange + gst, 4)
+
+
+def contract_pnl(*, entry: float, exit: float, lots: int, lot_size: int) -> float:
+    """Monetary P&L: price_delta × lot_size × lots. quantity means lots."""
+    return round((exit - entry) * lot_size * lots, 4)
 
 
 class SlippageModel:

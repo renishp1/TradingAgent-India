@@ -104,6 +104,7 @@ class BacktestTrade:
     entry_reference: float
     entry_fill: float
     quantity: int
+    lot_size: int
     exit_reason: str
     exit_timestamp: datetime
     exit_fill: float
@@ -133,6 +134,8 @@ class BacktestTrade:
             "entry_reference": self.entry_reference,
             "entry_fill": self.entry_fill,
             "quantity": self.quantity,
+            "lots": self.quantity,
+            "lot_size": self.lot_size,
             "exit_reason": self.exit_reason,
             "exit_timestamp": self.exit_timestamp.isoformat(),
             "exit_fill": self.exit_fill,

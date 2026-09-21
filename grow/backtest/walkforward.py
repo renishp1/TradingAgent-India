@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
-from grow.backtest.calendar import weekday_sessions
 from grow.backtest.runner import BacktestResult, BacktestRunner
 from grow.config import GrowConfig, load_config
 from grow.errors import GrowConfigError
@@ -84,7 +83,7 @@ class WalkForwardRunner:
         bt = self.config.backtest
         if (calibrate_on_test if calibrate_on_test is not None else bt.calibrate_on_test):
             raise GrowConfigError("TEST_WINDOW_TUNING")
-        sessions = weekday_sessions(start, end)
+        sessions = self.runner.calendar.sessions(start, end)
         windows = split_windows(
             sessions,
             train=bt.train_sessions,
@@ -115,5 +114,6 @@ class WalkForwardRunner:
                 "embargo_sessions": bt.embargo_sessions,
                 "calibrate_on_test": False,
                 "trainable_parameters": (),
+                "calibration_mode": "NONE",
             },
         )

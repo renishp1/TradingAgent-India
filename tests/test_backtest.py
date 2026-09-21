@@ -5,9 +5,9 @@ import unittest
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 
-from grow.backtest.calendar import weekday_sessions
-from grow.backtest.costs import CostModel, SlippageModel
-from grow.backtest.pipeline import _path_exit
+from grow.backtest.calendar import ExplicitSessionCalendar, WeekdayFixtureCalendar, weekday_sessions
+from grow.backtest.costs import CostModel, SlippageModel, contract_pnl
+from grow.backtest.pipeline import _path_exit, resolve_ceo
 from grow.backtest.runner import BacktestRunner, build_manifest
 from grow.backtest.simulate import ExecutionSimulator
 from grow.backtest.walkforward import WalkForwardRunner
@@ -154,6 +154,11 @@ class BacktestTests(unittest.TestCase):
         self.assertIn("always_no_trade", result.ablations)
         self.assertEqual(result.ablations["always_no_trade"], 0.0)
         self.assertFalse(result.plan["calibrate_on_test"])
+        self.assertEqual(result.plan["calibration_mode"], "NONE")
+        self.assertEqual(result.plan["trainable_parameters"], ())
+        standalone = BacktestRunner().run(start=window.test[0], end=window.test[1], ablation="full")
+        self.assertEqual(result.test_results[0].metrics["net_pnl"], standalone.metrics["net_pnl"])
+        self.assertEqual(result.test_results[0].metrics["trade_count"], standalone.metrics["trade_count"])
 
     def test_manifest_requires_versions(self) -> None:
         config = load_config()
@@ -162,10 +167,40 @@ class BacktestTests(unittest.TestCase):
         self.assertTrue(man.fingerprint)
         self.assertIsNone(man.random_seed)
 
-    def test_costs_scale_with_stress(self) -> None:
-        base = CostModel().round_trip(entry=100, exit=110, quantity=1)
-        hot = CostModel(stress=2.0).round_trip(entry=100, exit=110, quantity=1)
-        self.assertGreater(hot, base)
+    def test_pnl_is_price_delta_times_lot_size_times_lots(self) -> None:
+        self.assertEqual(contract_pnl(entry=100.0, exit=110.0, lots=2, lot_size=75), 1500.0)
+        self.assertEqual(contract_pnl(entry=50.0, exit=40.0, lots=1, lot_size=15), -150.0)
+        cheap = CostModel().round_trip(entry=100, exit=110, quantity=1, lot_size=1)
+        dear = CostModel().round_trip(entry=100, exit=110, quantity=1, lot_size=75)
+        self.assertGreater(dear, cheap)
+
+    def test_recorded_ceo_drives_decision(self) -> None:
+        from grow.research.orchestrator import ResearchOrchestrator
+        from grow.research.validate import no_trade
+        from tests.test_research_ceo import _packet
+
+        packet, _, config = _packet("BULLISH")
+        orch = ResearchOrchestrator(config)
+        live = orch.run(packet)
+        forced = no_trade(packet, reasons=("RECORDED_FORCE_NO_TRADE",), validation_ok=True)
+        replayed = resolve_ceo(packet, orch, {packet.packet_id: forced})
+        self.assertEqual(replayed.decision.value, "NO_TRADE")
+        self.assertIn("RECORDED_FORCE_NO_TRADE", replayed.rejection_reasons)
+        missing = resolve_ceo(packet, orch, {})
+        self.assertIn("MISSING_RECORDED_AI", missing.rejection_reasons)
+        if live.decision.value == "TRADE_APPROVE":
+            self.assertNotEqual(replayed.decision, live.decision)
+
+    def test_explicit_calendar_not_weekdays(self) -> None:
+        fixture = WeekdayFixtureCalendar().sessions(date(2026, 9, 21), date(2026, 9, 22))
+        self.assertEqual(fixture, (date(2026, 9, 21), date(2026, 9, 22)))
+        holiday = ExplicitSessionCalendar((date(2026, 9, 21),))
+        self.assertEqual(holiday.version, "nse.session.explicit.v1")
+        self.assertEqual(holiday.sessions(date(2026, 9, 21), date(2026, 9, 22)), (date(2026, 9, 21),))
+        runner = BacktestRunner(calendar=holiday)
+        result = runner.run(start=date(2026, 9, 21), end=date(2026, 9, 22), underlyings=("NIFTY",))
+        self.assertEqual(result.coverage["sessions"], 1)
+        self.assertEqual(result.manifest.calendar_version, "nse.session.explicit.v1")
 
     def test_no_execution_surface(self) -> None:
         from grow.backtest import runner, pipeline, ledger, simulate

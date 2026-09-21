@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from grow.backtest.calendar import SQUARE_OFF, at_session
-from grow.backtest.costs import CostModel
+from grow.backtest.costs import CostModel, contract_pnl
 from grow.backtest.ledger import BacktestLedger
 from grow.backtest.models import BacktestTrade, DecisionRow, SimulatedFill
 from grow.backtest.simulate import ExecutionSimulator
@@ -15,9 +15,10 @@ from grow.data.schema import Timeframe
 from grow.options.engine import IndexOptionsEngine
 from grow.options.models import DecisionStatus, OptionCandidate, OptionContract
 from grow.options.source import OptionChainSource
+from grow.research.models import CEODecision, CEOVerdict
 from grow.research.orchestrator import ResearchOrchestrator
 from grow.research.packet import build_packet
-from grow.research.models import CEOVerdict
+from grow.research.validate import no_trade
 from grow.strategies.engine import StrategyEngine
 from grow.strategies.signal import StrategySignal
 
@@ -74,7 +75,8 @@ class DecisionPipeline:
         run_id: str,
         ablation: str = "full",
         config_version: str,
-        recorded: dict[str, str] | None = None,
+        recorded: dict[str, CEODecision] | None = None,
+        lot_size: int = 1,
     ) -> None:
         self.hub = hub
         self.strategies = strategies
@@ -88,6 +90,7 @@ class DecisionPipeline:
         self.ablation = ablation
         self.config_version = config_version
         self.recorded = recorded
+        self.lot_size = lot_size
 
     def evaluate(self, ticker: str, as_of: datetime) -> None:
         if self.ablation == "always_no_trade":
@@ -148,14 +151,7 @@ class DecisionPipeline:
                 configuration_version=self.config_version,
             )
             packet_id = packet.packet_id
-            if self.recorded is not None:
-                replay = self.recorded.get(packet_id)
-                if replay is None:
-                    self.ledger.record_decision(
-                        DecisionRow(as_of, ticker, "NO_TRADE", "MISSING_RECORDED_AI", signal.signal_id, candidate.candidate_id, None, self.ablation)
-                    )
-                    return
-            ceo = self.research.run(packet)
+            ceo = resolve_ceo(packet, self.research, self.recorded)
             decision_id = ceo.decision_id
             if ceo.decision is not CEOVerdict.TRADE_APPROVE:
                 why = ceo.rejection_reasons[0] if ceo.rejection_reasons else "CEO_NO_TRADE"
@@ -208,8 +204,9 @@ class DecisionPipeline:
                 DecisionRow(as_of, ticker, "NO_TRADE", filled, signal.signal_id, candidate.candidate_id, decision_id, self.ablation)
             )
             return
-        gross = round((filled.price - entry.price) * entry.quantity, 4)
-        cost = self.costs.round_trip(entry=entry.price, exit=filled.price, quantity=entry.quantity)
+        lots = entry.quantity
+        gross = contract_pnl(entry=entry.price, exit=filled.price, lots=lots, lot_size=self.lot_size)
+        cost = self.costs.round_trip(entry=entry.price, exit=filled.price, quantity=lots, lot_size=self.lot_size)
         net = round(gross - cost, 4)
         trade = BacktestTrade(
             trade_id=f"{self.run_id}:{ticker}:{as_of.isoformat()}:{candidate.candidate_id[:8]}",
@@ -225,7 +222,8 @@ class DecisionPipeline:
             option_type=candidate.option_type,
             entry_reference=entry.reference,
             entry_fill=entry.price,
-            quantity=entry.quantity,
+            quantity=lots,
+            lot_size=self.lot_size,
             exit_reason=reason,
             exit_timestamp=exit_at,
             exit_fill=filled.price,
@@ -242,3 +240,18 @@ class DecisionPipeline:
         self.ledger.record_decision(
             DecisionRow(as_of, ticker, "FILL", reason, signal.signal_id, candidate.candidate_id, decision_id, self.ablation)
         )
+
+
+def resolve_ceo(
+    packet,
+    research: ResearchOrchestrator,
+    recorded: dict[str, CEODecision] | None,
+) -> CEODecision:
+    """Use a recorded CEODecision when supplied. Do not call orchestrator.run then."""
+    if recorded is None:
+        return research.run(packet)
+    replay = recorded.get(packet.packet_id)
+    if replay is None:
+        return no_trade(packet, reasons=("MISSING_RECORDED_AI",), validation_ok=True)
+    reports = tuple(agent.research(packet) for agent in research.agents)
+    return research.validator.validate(packet, replay, reports)

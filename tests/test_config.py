@@ -42,6 +42,7 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(config.ai.allow_broker)
         self.assertEqual(config.backtest.provider, "fixture")
         self.assertEqual(config.backtest.fill_model, "ask_plus_slippage")
+        self.assertEqual(config.backtest.lot_size, 1)
         self.assertFalse(config.backtest.calibrate_on_test)
 
 

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
 
-from grow.backtest.calendar import CALENDAR_VERSION, DECISION_TIME, at_session, weekday_sessions
+from grow.backtest.calendar import CALENDAR_VERSION, DECISION_TIME, SessionCalendar, WeekdayFixtureCalendar, at_session
 from grow.backtest.costs import CostModel, SlippageModel
 from grow.backtest.ledger import BacktestLedger
 from grow.backtest.metrics import calculate, stress_note
@@ -38,12 +38,19 @@ def _commit() -> str:
         return "workspace"
 
 
-def build_manifest(config: GrowConfig, *, start: date, end: date, ablation: str) -> BacktestRunManifest:
+def build_manifest(
+    config: GrowConfig,
+    *,
+    start: date,
+    end: date,
+    ablation: str,
+    calendar_version: str | None = None,
+) -> BacktestRunManifest:
     bt = config.backtest
     required = {
         "dataset_id": DATASET,
         "dataset_version": DATASET,
-        "calendar_version": CALENDAR_VERSION,
+        "calendar_version": calendar_version or CALENDAR_VERSION,
         "code_commit": _commit() or "workspace",
         "config_version": config.version,
         "strategy_version": "strategies.engine.v1",
@@ -97,7 +104,7 @@ class BacktestResult:
 
 
 class BacktestRunner:
-    def __init__(self, config: GrowConfig | None = None) -> None:
+    def __init__(self, config: GrowConfig | None = None, *, calendar: SessionCalendar | None = None) -> None:
         self.config = config or load_config()
         bt = self.config.backtest
         if bt.provider != "fixture":
@@ -108,6 +115,11 @@ class BacktestRunner:
             raise GrowConfigError("2E v1 is one open position.")
         if bt.calibrate_on_test:
             raise GrowConfigError("TEST_WINDOW_TUNING")
+        if calendar is None:
+            if bt.provider != "fixture":
+                raise GrowConfigError("historical runs require ExplicitSessionCalendar")
+            calendar = WeekdayFixtureCalendar()
+        self.calendar = calendar
 
     def run(
         self,
@@ -123,8 +135,10 @@ class BacktestRunner:
         cfg = self.config
         bt = cfg.backtest
         names = underlyings or cfg.strategies.universe
-        sessions = weekday_sessions(start, end)
-        manifest = build_manifest(cfg, start=start, end=end, ablation=ablation)
+        sessions = self.calendar.sessions(start, end)
+        manifest = build_manifest(
+            cfg, start=start, end=end, ablation=ablation, calendar_version=self.calendar.version
+        )
         ledger = BacktestLedger(bt.starting_cash)
         hub = open_data_hub(cfg)
         pipeline = DecisionPipeline(
@@ -143,6 +157,7 @@ class BacktestRunner:
             run_id=manifest.run_id,
             ablation=ablation,
             config_version=cfg.version,
+            lot_size=bt.lot_size,
         )
         expected = 0
         for day in sessions:

@@ -169,7 +169,8 @@ Historical fixture snapshots → 2B → 2C → 2D → ask+slippage fill
 No broker. No PaperLedger. No Risk Guard mutation. No live trading.
 ```
 
-See [`backtest.md`](backtest.md).
+See [`backtest.md`](backtest.md). Fixture framework only — not a profitability claim.
+Real historical PIT datasets are required before performance conclusions.
 
 ## Modules
 
@@ -181,7 +182,7 @@ See [`backtest.md`](backtest.md).
 | `grow/model_gateway/` | **implemented (mock)** | Provider abstraction; remote = later |
 | `grow/ceo/` | **implemented** | M1 cash TradeProposal; placeholder SL/TP |
 | `grow/research/` | **2D engine** | Fixture agents; TRADE_APPROVE or NO_TRADE |
-| `grow/backtest/` | **2E engine** | Fixture replay, costs, walk-forward; not live |
+| `grow/backtest/` | **2E fixture framework** | Replay + costs + walk-forward. Not a profit study |
 | `grow/market/` | **implemented (stub quotes)** | Brief + NSE session/square-off clock |
 | `grow/risk/` | **implemented** | Deterministic guard + HMAC stamp (secret required) |
 | `grow/paper/` | **implemented** | In-memory long-only ledger |

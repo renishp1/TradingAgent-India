@@ -232,6 +232,7 @@ class BacktestConfig:
     slippage_bps: float
     strict: bool
     quantity: int
+    lot_size: int
     max_open_positions: int
     starting_cash: float
     cost_model_version: str
@@ -314,7 +315,9 @@ class GrowConfig:
         if self.backtest.calibrate_on_test:
             raise GrowConfigError("2E must not calibrate on the test window.")
         if self.backtest.quantity < 1:
-            raise GrowConfigError("2E quantity must be >= 1")
+            raise GrowConfigError("2E quantity (lots) must be >= 1")
+        if self.backtest.lot_size < 1:
+            raise GrowConfigError("2E lot_size (contract multiplier) must be >= 1")
 
 
 
@@ -445,6 +448,7 @@ def _backtest_config(raw: dict[str, Any]) -> BacktestConfig:
         slippage_bps=_as_float(raw.get("slippage_bps", 10), "backtest.slippage_bps"),
         strict=_as_bool(raw.get("strict", True), "backtest.strict"),
         quantity=_as_int(raw.get("quantity", 1), "backtest.quantity"),
+        lot_size=_as_int(raw.get("lot_size", 1), "backtest.lot_size"),
         max_open_positions=_as_int(raw.get("max_open_positions", 1), "backtest.max_open_positions"),
         starting_cash=_as_float(raw.get("starting_cash", 1_000_000), "backtest.starting_cash"),
         cost_model_version=str(raw.get("cost_model_version", "costs.india.fn_o.v1")),
