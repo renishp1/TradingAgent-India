@@ -8,7 +8,6 @@ Rule evaluation is ordered and fail-closed: the first failing rule rejects.
 
 from __future__ import annotations
 
-import hashlib
 import hmac
 from datetime import datetime
 
@@ -18,6 +17,7 @@ from grow.errors import GrowSafetyError
 from grow.execution.lock import assert_paper_runtime
 from grow.market.session import SessionCalendar
 from grow.risk.secret import resolve_risk_secret
+from grow.risk.stamp import stamp_token
 from grow.types import Intent, MarketBrief, RiskStamp, RiskVerdict, Side, TradeProposal, Venue
 
 
@@ -35,21 +35,11 @@ class RiskGuard:
         self._secret = resolve_risk_secret(secret)
 
     def _stamp(self, proposal: TradeProposal, issued_at: datetime) -> RiskStamp:
-        payload = (
-            f"{proposal.proposal_id}|{proposal.symbol.qualified()}|{proposal.side.value}|"
-            f"{proposal.intent.value}|{proposal.quantity}|{proposal.limit_price:.4f}|"
-            f"{proposal.venue.value}|{self.config.risk.ruleset}"
-        )
-        token = hmac.new(
-            self._secret.encode("utf-8"),
-            payload.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
         return RiskStamp(
             proposal_id=proposal.proposal_id,
             issued_at=issued_at,
             ruleset=self.config.risk.ruleset,
-            token=token,
+            token=stamp_token(proposal, self.config.risk.ruleset, self._secret),
         )
 
     def verify_stamp(self, proposal: TradeProposal, stamp: RiskStamp | None) -> bool:
@@ -100,6 +90,13 @@ class RiskGuard:
             f"limit={proposal.limit_price} last={brief.last_price}",
         )
 
+        expected_notional = round(proposal.quantity * proposal.limit_price, 2)
+        rule(
+            "notional.matches",
+            abs(proposal.notional - expected_notional) <= 1e-6,
+            f"notional={proposal.notional:.2f} expected={expected_notional:.2f}",
+        )
+
         opening_short = proposal.intent is Intent.OPEN and proposal.side is Side.SELL
         rule(
             "policy.long_only",
@@ -133,10 +130,12 @@ class RiskGuard:
             proposal.intent is not Intent.OPEN or proposal.notional <= cash,
             f"cash={cash:.2f} need={proposal.notional:.2f}",
         )
+        # `daily_pnl` is currently lifetime realized-at-cost of the in-memory
+        # book, not a trading-day accumulator. See docs/safety.md.
         rule(
             "loss.daily",
             daily_pnl >= -abs(self.config.risk.max_daily_loss),
-            f"daily_pnl={daily_pnl:.2f} floor={-abs(self.config.risk.max_daily_loss):.2f}",
+            f"daily_pnl={daily_pnl:.2f} floor={-abs(self.config.risk.max_daily_loss):.2f} (lifetime realized-at-cost until daily accumulator)",
         )
 
         # Review #1: this is cost-notional, not mark-to-market equity.
