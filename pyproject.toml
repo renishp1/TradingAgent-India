@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "grow-tradingagent-india"
+version = "0.1.0"
+description = "Grow: Indian-market multi-agent trading system. Paper-trading only."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Grow / TradingAgent-India contributors" }]
+keywords = ["india", "nse", "paper-trading", "multi-agent", "research"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial :: Investment",
+    "Private :: Do Not Upload",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+grow-paper-cycle = "scripts.run_paper_cycle:main"
+
+[tool.setuptools.packages.find]
+include = ["grow*", "tradingagents*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+pythonpath = ["."]
+markers = [
+    "unit: fast isolated unit tests",
+    "safety: paper-trading lock and risk-gate tests",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

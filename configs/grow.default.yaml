@@ -1,0 +1,51 @@
+# Grow default configuration — milestone 1.
+# Execution mode is paper. Any other mode is a boot-time error.
+
+grow:
+  version: "0.1.0"
+  timezone: "Asia/Kolkata"
+
+  execution:
+    mode: paper
+    live_trading_enabled: false
+
+  market:
+    exchange: NSE
+    currency: INR
+    session_open: "09:15"
+    session_close: "15:30"
+    square_off: "15:15"
+    universe:
+      - RELIANCE
+      - TCS
+      - HDFCBANK
+      - INFY
+      - ICICIBANK
+      - SBIN
+      - BHARTIARTL
+      - ITC
+      - LT
+      - HINDUNILVR
+
+  risk:
+    max_position_notional: 100000
+    max_gross_notional: 300000
+    max_daily_loss: 15000
+    require_stop_loss: true
+    max_symbol_concentration: 0.35
+    ruleset: "grow.risk.v1"
+
+  paper:
+    starting_cash: 1000000
+    venue_id: GROW_PAPER
+
+  model:
+    provider: mock
+    deep_model: mock-deep
+    fast_model: mock-fast
+    max_output_tokens: 1024
+
+  tradingagents:
+    enabled: true
+    max_debate_rounds: 1
+    max_risk_discuss_rounds: 1
