@@ -3,6 +3,11 @@
 The guard is code, not an LLM. It is the only component allowed to mint a
 RiskStamp. The paper ledger will not accept an unstamped or forged proposal.
 
+HMAC construction does **not** live here. `_stamp()` calls
+`grow.risk.stamp.stamp_token` (`grow.risk.stamp.v2`: canonical JSON → SHA-256
+→ HMAC-SHA256). The secret comes from `grow.risk.secret.resolve_risk_secret`.
+There is no in-module HMAC payload and no published default.
+
 Rule evaluation is ordered and fail-closed: the first failing rule rejects.
 """
 
