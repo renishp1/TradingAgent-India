@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from typing import Any, Mapping
+
 from grow.data.schema import MarketSnapshot
+from grow.strategies.confidence import clamp
 from grow.strategies.models import Direction, StrategyContext, signal_fingerprint
 from grow.strategies.signal import StrategySignal
 
@@ -18,6 +21,7 @@ def research_signal(
     target: float,
     confidence: float,
     reason: str,
+    extras: Mapping[str, Any] | None = None,
 ) -> StrategySignal | None:
     if direction not in (Direction.BULLISH, Direction.BEARISH):
         return None
@@ -30,6 +34,7 @@ def research_signal(
     if risk <= 0 or reward <= 0:
         return None
     version = str(context.params.get("version", "v1"))
+    bounded = round(clamp(confidence), 4)
     return StrategySignal(
         symbol=snapshot.symbol,
         strategy=name,
@@ -37,7 +42,7 @@ def research_signal(
         entry=round(entry, 2),
         stop=round(stop, 2),
         target=round(target, 2),
-        confidence=round(min(0.85, max(0.0, confidence)), 2),
+        confidence=bounded,
         timeframe=context.timeframe,
         reason=reason,
         as_of=snapshot.as_of,
@@ -54,6 +59,7 @@ def research_signal(
         strategy_version=version,
         regime=context.regime.label.value,
         risk_reward=round(reward / risk, 2),
+        extras=extras,
     )
 
 

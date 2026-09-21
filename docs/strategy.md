@@ -109,8 +109,31 @@ Changing logic requires `v1 → v2`. Do not silently retune v1.
 `symbol, strategy, timeframe, as_of, snapshot_id, strategy_version, direction`
 (first 16 hex). Duplicates of that identity in one evaluation are dropped.
 
-Confidence is a bounded count of confirming factors, documented in code,
-not an LLM score.
+Confidence is **not** a fixed number and **not** an LLM score.
+
+```
+confidence = clamp(
+    (trend_alignment
+     + indicator_strength
+     + structure_confirmation
+     + regime_alignment) / 4,
+    0, 1)
+```
+
+Each term is in `[0, 1]`. Magnitudes use `abs()`, so BULLISH and BEARISH
+with mirrored evidence receive the same score. Missing inputs score 0.
+The four parts are stored on `StrategySignal.extras["confidence_parts"]`
+and appended to `reason`.
+
+| Term | Typical evidence |
+|---|---|
+| trend_alignment | EMA fast−slow gap, price vs EMA, breakout body vs ATR |
+| indicator_strength | \|EMA slope\|, \|RSI−50\|, extension beyond the break level |
+| structure_confirmation | distance from EMA, body/range, RSI extreme |
+| regime_alignment | aligned trend=1.0; opposite=0; RANGE high only for mean reversion |
+
+See `grow/strategies/confidence.py` for the exact scale constants and
+regime tables. Changing the formula is a `v1 → v2` event.
 
 Entry / stop / target are **underlying** prices. Risk and reward must be
 `> 0` or the signal is rejected (`INVALID_SIGNAL`).
