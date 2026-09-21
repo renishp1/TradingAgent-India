@@ -29,6 +29,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.risk.concentration_basis, "cost_notional")
         self.assertEqual(config.data.provider, "fixture")
         self.assertFalse(config.data.allow_live_feed)
+        self.assertEqual(config.strategies.universe, ("NIFTY", "BANKNIFTY"))
+        self.assertEqual(config.strategies.primary_timeframe, "M15")
 
 
     def test_live_yaml_value_cannot_pass_through_env_truth(self) -> None:

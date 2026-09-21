@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from grow.errors import GrowConfigError, GrowLiveTradingDisabled
 from grow.execution.lock import inspect_environment, normalize_execution_mode
@@ -172,6 +172,21 @@ class DataConfig:
 
 
 @dataclass(frozen=True)
+class StrategySpec:
+    name: str
+    enabled: bool
+    version: str
+    params: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class StrategiesConfig:
+    universe: tuple[str, ...]
+    primary_timeframe: str
+    specs: tuple[StrategySpec, ...]
+
+
+@dataclass(frozen=True)
 class GrowConfig:
     version: str
     timezone: str
@@ -182,6 +197,7 @@ class GrowConfig:
     model: ModelConfig
     tradingagents: TradingAgentsConfig
     data: DataConfig
+    strategies: StrategiesConfig
     source_path: str
 
     def assert_safe(self) -> None:
@@ -207,6 +223,60 @@ class GrowConfig:
         allowed_tf = {"D1", "M15", "M5"}
         if not self.data.timeframes or any(tf not in allowed_tf for tf in self.data.timeframes):
             raise GrowConfigError("2A timeframes must be a non-empty subset of D1, M15, M5.")
+        allowed_idx = {"NIFTY", "BANKNIFTY"}
+        if not self.strategies.universe or any(s not in allowed_idx for s in self.strategies.universe):
+            raise GrowConfigError("2B strategy universe must be a non-empty subset of NIFTY, BANKNIFTY.")
+        if self.strategies.primary_timeframe not in allowed_tf:
+            raise GrowConfigError("2B primary_timeframe must be D1, M15, or M5.")
+
+
+_DEFAULT_STRATEGY_SPECS: tuple[tuple[str, dict[str, Any]], ...] = (
+    ("ema_trend", {"enabled": True, "version": "v1", "fast_period": 20, "slow_period": 50, "atr_period": 14}),
+    (
+        "momentum",
+        {
+            "enabled": True,
+            "version": "v1",
+            "rsi_period": 14,
+            "rsi_threshold": 55,
+            "roc_period": 10,
+            "atr_period": 14,
+        },
+    ),
+    ("breakout", {"enabled": True, "version": "v1", "lookback": 20, "atr_period": 14}),
+    (
+        "mean_reversion",
+        {
+            "enabled": True,
+            "version": "v1",
+            "rsi_period": 14,
+            "rsi_oversold": 30,
+            "deviation": 0.01,
+            "atr_period": 14,
+        },
+    ),
+)
+
+
+def _strategy_specs(raw: dict[str, Any]) -> tuple[StrategySpec, ...]:
+    reserved = {"universe", "primary_timeframe"}
+    found = {k: v for k, v in raw.items() if k not in reserved}
+    if not found:
+        found = {name: body for name, body in _DEFAULT_STRATEGY_SPECS}
+    specs: list[StrategySpec] = []
+    for name, body in found.items():
+        if not isinstance(body, dict):
+            raise GrowConfigError(f"grow.strategies.{name} must be a mapping")
+        params = {k: v for k, v in body.items() if k not in {"enabled", "version"}}
+        specs.append(
+            StrategySpec(
+                name=str(name),
+                enabled=_as_bool(body.get("enabled", True), f"strategies.{name}.enabled"),
+                version=str(body.get("version", "v1")),
+                params=params,
+            )
+        )
+    return tuple(specs)
 
 
 def _overlay_env(raw: dict[str, Any], environ: dict[str, str]) -> dict[str, Any]:
@@ -254,6 +324,7 @@ def _build(raw: dict[str, Any], source_path: str) -> GrowConfig:
     model = g.get("model") or {}
     ta = g.get("tradingagents") or {}
     data = g.get("data") or {}
+    raw_strategies = g.get("strategies") or {}
     universe = market.get("universe") or []
     if not isinstance(universe, list) or not universe:
         raise GrowConfigError("grow.market.universe must be a non-empty list")
@@ -261,6 +332,12 @@ def _build(raw: dict[str, Any], source_path: str) -> GrowConfig:
     timeframes = data.get("timeframes") or ["D1", "M15", "M5"]
     if not isinstance(timeframes, list):
         raise GrowConfigError("grow.data.timeframes must be a list")
+    if not isinstance(raw_strategies, dict):
+        raise GrowConfigError("grow.strategies must be a mapping")
+    strategy_universe = raw_strategies.get("universe") or ["NIFTY", "BANKNIFTY"]
+    if not isinstance(strategy_universe, list) or not strategy_universe:
+        raise GrowConfigError("grow.strategies.universe must be a non-empty list")
+    specs = _strategy_specs(raw_strategies)
 
     config = GrowConfig(
         version=str(g.get("version", "0.1.0")),
@@ -312,6 +389,11 @@ def _build(raw: dict[str, Any], source_path: str) -> GrowConfig:
             timeframes=tuple(str(tf).strip().upper() for tf in timeframes),
             stale_after_seconds=_as_int(data.get("stale_after_seconds", 900), "data.stale_after_seconds"),
             history_sessions=_as_int(data.get("history_sessions", 20), "data.history_sessions"),
+        ),
+        strategies=StrategiesConfig(
+            universe=tuple(str(s).strip().upper() for s in strategy_universe),
+            primary_timeframe=str(raw_strategies.get("primary_timeframe", "M15")).upper(),
+            specs=specs,
         ),
         source_path=source_path,
     )

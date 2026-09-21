@@ -120,6 +120,18 @@ one timeframe, chronological unique starts.
 `RiskGuard.verify_stamp` requires `stamp.ruleset == config.risk.ruleset` in
 addition to HMAC verify.
 
+## Strategy plane (Milestone 2B)
+
+```
+MarketSnapshot → indicators → regime → registered strategies → StrategyResult
+```
+
+`StrategyEngine` consumes 2A snapshots only. Output is `StrategySignal`
+(LONG underlying research). No option legs, no broker, no LLM, no fills.
+See [`strategy.md`](strategy.md).
+
+`StrategyBook.run` remains a hard error so strategies cannot execute.
+
 ## Modules
 
 | Path | Status | Responsibility |
@@ -135,7 +147,7 @@ addition to HMAC verify.
 | `grow/cycle.py` | **implemented** | The one legal orchestration path |
 | `tradingagents/` | **foundation / stub intelligence** | Roles, default_config, sequential graph |
 | `grow/data/` | **2A fixture** | OHLCV snapshot, quality, universe. No live feed |
-| `grow/strategies/` | **2B type only** | `StrategySignal` frozen; book raises |
+| `grow/strategies/` | **2B engine** | Indicators, regime, four v1 strategies, `StrategyResult` |
 | `grow/options/` | interface only | F&O later |
 | `grow/learning/` | interface only | `DecisionRecord` type; store deferred |
 | `grow/dashboard/` | snapshot schema | Web console later |
@@ -178,7 +190,7 @@ No model is allowed to:
 ## Deferred on purpose
 
 Milestone 2A is **fixture market data**. Milestone 2B is quantitative
-`StrategySignal`. Milestone 2C is LLM research over **signals**, not
-LLM-as-trader. Options chains, scraping, broker adapters, LangGraph,
-persistence, and a production dashboard stay out until those reviews.
+`StrategySignal` (this commit). Milestone 2C is index options (BUY CE /
+BUY PE mapping). Milestone 2D is LLM research / CEO over **signals**.
+Scraping, broker adapters, and live trading stay out.
 

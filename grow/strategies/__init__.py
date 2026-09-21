@@ -1,19 +1,34 @@
-"""Strategy library.
+"""Quantitative strategy engine (Milestone 2B).
 
-Milestone 2A freezes the StrategySignal type. The book itself is 2B —
-quant calculations over MarketSnapshot, not LLM-as-trader.
+Deterministic StrategySignal generation from MarketSnapshot.
+No options, no broker, no LLM, no execution.
 """
 
 from grow.errors import GrowInterfaceNotImplemented
+from grow.strategies.engine import StrategyEngine
+from grow.strategies.models import StrategyContext, StrategyResult
+from grow.strategies.registry import StrategyRegistry, default_registry
 from grow.strategies.signal import StrategySignal
 
 
 class StrategyBook:
+    """Compatibility stub. Execution is forbidden. Use StrategyEngine.evaluate."""
+
     def list_strategies(self) -> list[str]:
-        return []
+        return list(default_registry().names())
 
     def run(self, name: str, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
-        raise GrowInterfaceNotImplemented("grow.strategies", "milestone 2B")
+        raise GrowInterfaceNotImplemented(
+            "grow.strategies.book.run",
+            "StrategyEngine.evaluate — 2B does not execute",
+        )
 
 
-__all__ = ["StrategyBook", "StrategySignal"]
+__all__ = [
+    "StrategyBook",
+    "StrategyContext",
+    "StrategyEngine",
+    "StrategyRegistry",
+    "StrategyResult",
+    "StrategySignal",
+]

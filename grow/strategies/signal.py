@@ -1,8 +1,4 @@
-"""StrategySignal — Milestone 2B contract, not produced in 2A.
-
-Quant calculations over MarketSnapshot emit this object. The LLM debates
-the signal; it does not invent one from raw candles.
-"""
+"""StrategySignal — Milestone 2B output. Not an order. Not an option."""
 
 from __future__ import annotations
 
@@ -27,22 +23,29 @@ class StrategySignal:
     reason: str
     as_of: datetime
     snapshot_id: str
+    signal_id: str = ""
+    strategy_version: str = "v1"
+    regime: str = "UNKNOWN"
+    risk_reward: float | None = None
     extras: Mapping[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         if self.direction != "LONG":
-            # Cash book is long-only; 2B must not emit SHORT.
-            raise ValueError("2A/2B cash signals are LONG only")
+            raise ValueError("2B underlying signals are LONG only. No SHORT, no option legs.")
         return {
             "symbol": self.symbol.qualified(),
             "strategy": self.strategy,
+            "strategy_version": self.strategy_version,
             "direction": self.direction,
             "entry": self.entry,
             "stop": self.stop,
             "target": self.target,
             "confidence": self.confidence,
+            "risk_reward": self.risk_reward,
             "timeframe": self.timeframe.value,
             "reason": self.reason,
             "as_of": self.as_of.isoformat(),
             "snapshot_id": self.snapshot_id,
+            "signal_id": self.signal_id,
+            "regime": self.regime,
         }

@@ -63,3 +63,34 @@ grow:
       - D1
       - M15
       - M5
+
+  strategies:
+    universe:
+      - NIFTY
+      - BANKNIFTY
+    primary_timeframe: M15
+    ema_trend:
+      enabled: true
+      version: v1
+      fast_period: 20
+      slow_period: 50
+      atr_period: 14
+    momentum:
+      enabled: true
+      version: v1
+      rsi_period: 14
+      rsi_threshold: 55
+      roc_period: 10
+      atr_period: 14
+    breakout:
+      enabled: true
+      version: v1
+      lookback: 20
+      atr_period: 14
+    mean_reversion:
+      enabled: true
+      version: v1
+      rsi_period: 14
+      rsi_oversold: 30
+      deviation: 0.01
+      atr_period: 14

@@ -24,9 +24,9 @@ still a constrained paper-trading foundation, not a desk.
 10. Architecture docs: [`docs/architecture.md`](docs/architecture.md), [`docs/safety.md`](docs/safety.md), [`docs/milestone-1.md`](docs/milestone-1.md).
 
 Options, live data, brokers, and LangGraph remain **out of scope**.
-Milestone 2A is fixture market data + the snapshot contract —
-see [`docs/milestone-2a.md`](docs/milestone-2a.md). Do not attach a vendor
-feed until that design is reviewed. Broker APIs stay out.
+Milestone 2A is fixture market data ([`docs/milestone-2a.md`](docs/milestone-2a.md)).
+Milestone 2B is the quantitative strategy engine ([`docs/strategy.md`](docs/strategy.md)).
+Do not attach a vendor feed, option chain, or broker.
 
 
 ## Layout
@@ -38,7 +38,7 @@ TradingAgent-India/
 │   ├── ceo/
 │   ├── market/
 │   ├── options/            # interface only
-│   ├── strategies/         # interface only
+│   ├── strategies/         # 2B quant engine (signals only)
 │   ├── risk/
 │   ├── execution/          # lock + live refuse
 │   ├── paper/
