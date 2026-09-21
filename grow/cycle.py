@@ -66,6 +66,9 @@ class GrowRuntime:
             brief,
             cash=book.cash,
             gross_notional=book.gross_notional,
+            # Known limitation: this is lifetime realized-at-cost of the
+            # in-memory book, not a trading-day P&L accumulator. True daily
+            # P&L waits for the Milestone 2A valuation layer.
             daily_pnl=book.realized_pnl,
             symbol_notional=book.symbol_notional(proposal.symbol.ticker),
         )
