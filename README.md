@@ -6,6 +6,7 @@ This repository is the source of truth for Grow. Milestone 1 passed
 **Architecture Review #1** ([`docs/review-1.md`](docs/review-1.md)). It is
 still a constrained paper-trading foundation, not a desk.
 
+
 > Not financial advice. Not a broker. Not SEBI-registered. Live execution is
 > not compiled into this software.
 
@@ -25,6 +26,7 @@ still a constrained paper-trading foundation, not a desk.
 Options, live data, brokers, and LangGraph remain **out of scope**.
 Milestone 2 is licensed market data + research — not broker APIs.
 See [`docs/review-1.md`](docs/review-1.md).
+
 
 ## Layout
 
@@ -63,6 +65,7 @@ Copy `.env.example` only if you need env overlays. Leave live flags false.
 `GROW_RISK_SECRET` is required for any process that mints a RiskStamp.
 Tests inject their own secret and do not read a default.
 
+
 ## Safety
 
 | Attempt | Result |
@@ -71,6 +74,8 @@ Tests inject their own secret and do not read a default.
 | `GROW_LIVE_TRADING=true` | `GrowLiveTradingDisabled` |
 | `LiveBroker()` | `GrowLiveTradingDisabled` |
 | Paper fill without RiskStamp | `GrowSafetyError` |
+| Mutated SL/TP after stamp | verify fails |
+| Flatten qty > position | `GrowSafetyError` |
 | `OPEN+SELL` (short) | Risk Guard `policy.long_only` |
 | New entries after 15:15 IST | Risk Guard reject |
 | Missing `GROW_RISK_SECRET` | `GrowConfigError` |

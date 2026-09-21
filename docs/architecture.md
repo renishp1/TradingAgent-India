@@ -24,7 +24,7 @@ or talk to a broker.
 ```
                   Market Research          TradingAgents graph
                          │                         │
-                         └──────────┬──────────────┘
+                         └──────────┬──────────────
                                     ▼
                                    CEO
                          (TradeProposal, cash long-only)
@@ -53,14 +53,16 @@ Illegal arrows, all tested:
 Milestone 1 product is `CASH`. `allow_short` must be false.
 
 | Intent | Side | Meaning |
-|---|---|---|
+|---|---|
 | OPEN | BUY | Open / add long |
 | OPEN | SELL | **Rejected** — that is a short |
 | CLOSE / REDUCE / SQUARE_OFF | SELL | Flatten or reduce a long |
 | CLOSE / REDUCE / SQUARE_OFF | BUY | Illegal on a long-only book (no short to cover) |
 
 The CEO emits only `BUY+OPEN` probes. Risk Guard still rejects `OPEN+SELL`.
-The ledger refuses negative quantity even if a stamp were forged.
+The stamp binds the whole fill-relevant proposal. The ledger refuses
+negative quantity, notional mismatches, and flatten qty that exceeds the
+open long even if a stamp were presented.
 
 ## Valuation (honest)
 
@@ -69,10 +71,26 @@ Paper book reports `valuation.method = cost_notional`. `unrealized_pnl` is
 `basis=cost_notional`. Do not treat this as strategy performance. MTM equity
 and drawdown wait for licensed quotes.
 
+`loss.daily` is **not a true daily P&L** yet. Runtime feeds the Risk Guard
+`book.realized_pnl` (lifetime realized-at-cost of the in-memory book). The
+snapshot field `pnl.true_daily_pnl` is `null` until a session-day
+accumulator exists. Documented in [`safety.md`](safety.md).
+
+## RiskStamp (exact proposal)
+
+The HMAC payload is canonical JSON (`grow.risk.stamp.v2`) of:
+
+`proposal_id, symbol, exchange, side, intent, quantity, limit_price,
+stop_loss, take_profit, notional, venue, ruleset`
+
+SHA-256 of that JSON, then HMAC-SHA256. Changing SL/TP/notional after the
+gate mints a stamp makes verify fail. The ledger additionally checks fill
+invariants so a stamp is never the only check.
+
 ## Modules
 
 | Path | Milestone 1 status | Responsibility |
-|---|---|---|
+|---|---|
 | `grow/execution/lock.py` | **implemented** | Compile-time + env + runtime paper lock |
 | `grow/execution/live.py` | **implemented (refuse)** | Live broker surface that only raises |
 | `grow/config.py` | **implemented** | YAML + env overlay, fail-closed |
@@ -94,9 +112,9 @@ and drawdown wait for licensed quotes.
 LLM risk committees are useful as commentary. They are not a gate.
 Grow's Risk Guard is pure functions over numbers, session, universe, and
 position policy. It does not call the model gateway. The CEO *may* be an LLM
-(today: mock). The stamp is HMAC over proposal fields so the ledger cannot
-be talked into a fill. The HMAC secret is required; there is no published
-default.
+(today: mock). The stamp is HMAC over the canonical proposal JSON so the
+ledger cannot be talked into a fill of a *different* ticket. The HMAC secret
+is required; there is no published default.
 
 ## Indian market assumptions (explicit, provisional)
 
