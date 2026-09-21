@@ -31,11 +31,13 @@ def _digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _daily_close(ticker: str, session_day: date) -> float:
-    digest = _digest(f"{ticker}:{session_day.isoformat()}")
+def _price_at(ticker: str, start: datetime) -> float:
+    """Price seed for this bar start only. Must not use a session-day EOD hash."""
+    digest = _digest(f"{ticker}:{start.isoformat()}")
     basis = 400 + (int(digest[:6], 16) % 3600)
     noise = (int(digest[6:10], 16) % 100) / 100.0
     return round(basis + noise, 2)
+
 
 
 def _volume(ticker: str, start: datetime, timeframe: Timeframe) -> int:
@@ -118,8 +120,8 @@ class FixtureSource:
                     stale_after_seconds=self.config.data.stale_after_seconds,
                 )
             )
-        last = series[Timeframe.D1].bars[-1].close if series[Timeframe.D1].bars else _daily_close(
-            symbol.ticker, session_day
+        last = series[Timeframe.D1].bars[-1].close if series[Timeframe.D1].bars else _price_at(
+            symbol.ticker, datetime.combine(session_day, self.calendar.open_time, tzinfo=IST)
         )
         # Prefer last complete intraday close when it exists.
         if Timeframe.M5 in series and series[Timeframe.M5].bars:
@@ -160,46 +162,39 @@ class FixtureSource:
         session_end = datetime.combine(session_day, self.calendar.close_time, tzinfo=IST)
         as_of = as_of.astimezone(IST)
         forming = session_day == as_of.date() and as_of < session_end
-        if forming:
-            end = as_of
-            intraday = self.bars(
-                symbol.ticker,
-                Timeframe.M5,
-                session_day=session_day,
-                as_of=as_of,
-            )
-            if intraday.bars:
-                high = max(bar.high for bar in intraday.bars)
-                low = min(bar.low for bar in intraday.bars)
-                return Bar(
-                    symbol=symbol,
-                    timeframe=Timeframe.D1,
-                    start=start,
-                    end=end,
-                    open=intraday.bars[0].open,
-                    high=high,
-                    low=low,
-                    close=intraday.bars[-1].close,
-                    volume=sum(bar.volume for bar in intraday.bars),
-                )
-            open_px = round(_daily_close(symbol.ticker, session_day) * 0.999, 2)
+        end = as_of if forming else session_end
+        intraday = self.bars(
+            symbol.ticker,
+            Timeframe.M5,
+            session_day=session_day,
+            as_of=end,
+        )
+        if not intraday.bars:
+            px = _price_at(symbol.ticker, start)
             return Bar(
                 symbol=symbol,
                 timeframe=Timeframe.D1,
                 start=start,
                 end=end,
-                open=open_px,
-                high=open_px,
-                low=open_px,
-                close=open_px,
+                open=px,
+                high=px,
+                low=px,
+                close=px,
                 volume=0,
             )
-        close = _daily_close(symbol.ticker, session_day)
-        row = _ohlc_from_close(symbol.ticker, start, close)
-        row["start"] = start
-        row["end"] = session_end
-        row["volume"] = _volume(symbol.ticker, start, Timeframe.D1)
-        return normalize_bar(row, symbol=symbol, timeframe=Timeframe.D1)
+        high = max(bar.high for bar in intraday.bars)
+        low = min(bar.low for bar in intraday.bars)
+        return Bar(
+            symbol=symbol,
+            timeframe=Timeframe.D1,
+            start=start,
+            end=end,
+            open=intraday.bars[0].open,
+            high=high,
+            low=low,
+            close=intraday.bars[-1].close,
+            volume=sum(bar.volume for bar in intraday.bars),
+        )
 
     def _intraday_bar(
         self,
@@ -208,11 +203,8 @@ class FixtureSource:
         start: datetime,
         session_day: date,
     ) -> Bar:
-        close = _daily_close(symbol.ticker, session_day)
-        # Path around the daily close so bars are not identical.
-        digest = _digest(f"path:{symbol.ticker}:{start.isoformat()}")
-        step = ((int(digest[:4], 16) % 61) - 30) / 10_000
-        px = round(close * (1 + step), 2)
+        del session_day
+        px = _price_at(symbol.ticker, start)
         row = _ohlc_from_close(symbol.ticker, start, px)
         row["start"] = start
         row["end"] = start + bar_duration(timeframe)

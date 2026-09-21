@@ -39,13 +39,13 @@ class MarketTests(unittest.TestCase):
         self.assertEqual(cal.state(), SessionState.HOLIDAY)
 
     def test_deferred_desks_raise(self) -> None:
-        from grow.data import DataHub, LicensedFeed
+        from grow.data import LicensedFeed, open_data_hub
         from grow.learning import LearningStore
         from grow.options import OptionsDesk
         from grow.strategies import StrategyBook
 
         clock = FrozenClock(datetime(2026, 9, 21, 11, 0, tzinfo=IST))
-        hub = DataHub(load_config(), clock=clock)
+        hub = open_data_hub(load_config(), clock=clock)
         self.assertGreater(hub.quote("RELIANCE"), 0)
         with self.assertRaises(GrowInterfaceNotImplemented):
             hub.option_chain("NIFTY")

@@ -99,13 +99,17 @@ Raw fixture OHLCV  →  Normalizer  →  MarketSnapshot  →  ResearchView
                                     (2B) StrategySignal
 ```
 
-`DataHub` depends on the `MarketDataSource` protocol. `FixtureSource` is the
-only implementation. Licensed feeds, scrapes, and broker quotes are
-refuse-closed until a named vendor is reviewed.
+`DataHub` depends on the `MarketDataSource` protocol and does not import
+`FixtureSource`. Default wiring is `open_data_hub()`, which is the only
+place that constructs the fixture. Licensed feeds, scrapes, and broker
+quotes are refuse-closed until a named vendor is reviewed.
 
-D1 look-ahead: at an intraday `as_of`, today's daily bar is a **forming**
-candle from 09:15 IST to `as_of`, aggregated from complete M5 bars. It is
-complete only at/after 15:30 IST. LLM research must not receive raw candles;
+D1 look-ahead: intraday bars are seeded from `(ticker, bar.start)` only,
+never a session-day close. At an intraday `as_of`, today's daily bar is a
+**forming** candle from 09:15 IST to `as_of`, aggregated from complete M5
+bars available at that time. It is complete only at/after 15:30 IST, when
+duration is the full 09:15–15:30 session. A 11:00 D1 is a prefix of the
+15:30 D1, not the EOD candle. LLM research must not receive raw candles;
 `assert_research_payload` walks nested mappings and sequences.
 
 `DataHub.snapshot` retains the `BarSeries` returned by the corporate-action

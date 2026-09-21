@@ -5,6 +5,7 @@ broker quotes are refuse-closed. This package does not emit trades.
 """
 
 from grow.data.boundary import assert_research_payload, research_view
+from grow.data.factory import open_data_hub
 from grow.data.hub import DataHub
 from grow.data.licensed import LicensedFeed
 from grow.data.source import MarketDataSource
@@ -34,5 +35,6 @@ __all__ = [
     "Timeframe",
     "assert_research_payload",
     "data_universe",
+    "open_data_hub",
     "research_view",
 ]

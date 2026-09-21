@@ -1,7 +1,6 @@
-"""DataHub — fixture snapshots only in Milestone 2A.
+"""DataHub — depends on MarketDataSource, not a concrete feed.
 
-Depends on MarketDataSource, not a concrete vendor. Default construction
-still uses FixtureSource. Not wired into GrowRuntime. Not a broker.
+Default fixture wiring lives in grow.data.factory.open_data_hub.
 """
 
 from __future__ import annotations
@@ -10,10 +9,9 @@ from dataclasses import replace
 from datetime import datetime
 
 from grow.clock import Clock, SystemClock
-from grow.config import GrowConfig, load_config
+from grow.config import GrowConfig
 from grow.data.actions import IdentityAdjuster
 from grow.data.boundary import research_view
-from grow.data.fixture import FixtureSource
 from grow.data.schema import BarSeries, MarketSnapshot, ResearchView, Timeframe
 from grow.data.source import MarketDataSource
 from grow.errors import GrowConfigError, GrowInterfaceNotImplemented
@@ -22,24 +20,19 @@ from grow.errors import GrowConfigError, GrowInterfaceNotImplemented
 class DataHub:
     def __init__(
         self,
-        config: GrowConfig | None = None,
+        config: GrowConfig,
         clock: Clock | None = None,
         *,
-        source: MarketDataSource | None = None,
+        source: MarketDataSource,
         adjuster: IdentityAdjuster | None = None,
     ) -> None:
-        self.config = config or load_config()
+        self.config = config
         if self.config.data.allow_live_feed:
             raise GrowConfigError("Live feeds are not attached.")
-        self.clock = clock or SystemClock()
-        if source is None:
-            if self.config.data.provider != "fixture":
-                raise GrowConfigError("2A DataHub only constructs the fixture source.")
-            self.source: MarketDataSource = FixtureSource(self.config, clock=self.clock)
-        else:
-            self.source = source
-        if self.source.meta().is_live:
+        if source.meta().is_live:
             raise GrowConfigError("Live feeds are not attached.")
+        self.clock = clock or SystemClock()
+        self.source = source
         self.adjuster = adjuster or IdentityAdjuster()
 
     def quote(self, ticker: str, as_of: datetime | None = None) -> float:
@@ -47,10 +40,7 @@ class DataHub:
 
     def snapshot(self, ticker: str, as_of: datetime | None = None) -> MarketSnapshot:
         snap = self.source.snapshot(ticker, as_of=as_of)
-        series = {
-            tf: self.adjuster.apply(bars, ())
-            for tf, bars in snap.series.items()
-        }
+        series = {tf: self.adjuster.apply(bars, ()) for tf, bars in snap.series.items()}
         return replace(snap, series=series)
 
     def bars(

@@ -18,6 +18,7 @@ from grow.data import (
     Timeframe,
     assert_research_payload,
     data_universe,
+    open_data_hub,
 )
 from grow.data.actions import CorporateAction, IdentityAdjuster, LicensedActions
 from grow.data.boundary import research_view
@@ -82,7 +83,7 @@ class FixtureHubTests(unittest.TestCase):
     def setUp(self) -> None:
         self.clock = FrozenClock(datetime(2026, 9, 21, 11, 0, tzinfo=IST))
         self.config = load_config()
-        self.hub = DataHub(self.config, clock=self.clock)
+        self.hub = open_data_hub(self.config, clock=self.clock)
 
     def test_snapshot_has_volume_and_source_metadata(self) -> None:
         snap = self.hub.snapshot("RELIANCE")
@@ -93,6 +94,10 @@ class FixtureHubTests(unittest.TestCase):
         m15 = snap.series[Timeframe.M15]
         self.assertEqual(len(m15.bars), 7)
         self.assertTrue(all(bar.volume > 0 for bar in m15.bars))
+        self.assertTrue(all((bar.end - bar.start).total_seconds() == 15 * 60 for bar in m15.bars))
+        self.assertTrue(
+            all((bar.end - bar.start).total_seconds() == 5 * 60 for bar in snap.series[Timeframe.M5].bars)
+        )
         self.assertEqual(len(snap.series[Timeframe.M5].bars), 21)
         self.assertEqual(len(snap.series[Timeframe.D1].bars), self.config.data.history_sessions)
         self.assertGreater(snap.last_price, 0)
@@ -111,16 +116,41 @@ class FixtureHubTests(unittest.TestCase):
 
     def test_d1_complete_at_1530(self) -> None:
         clock = FrozenClock(datetime(2026, 9, 21, 15, 30, tzinfo=IST))
-        hub = DataHub(self.config, clock=clock)
+        hub = open_data_hub(self.config, clock=clock)
         snap = hub.snapshot("RELIANCE")
         d1 = snap.series[Timeframe.D1].bars[-1]
         self.assertEqual(d1.start, datetime(2026, 9, 21, 9, 15, tzinfo=IST))
         self.assertEqual(d1.end, datetime(2026, 9, 21, 15, 30, tzinfo=IST))
+        from datetime import timedelta
+
+        self.assertEqual(d1.end - d1.start, timedelta(hours=6, minutes=15))
         self.assertTrue(any("D1 complete" in note for note in snap.quality.notes))
+        m5 = snap.series[Timeframe.M5]
+        self.assertEqual(d1.close, m5.bars[-1].close)
+        self.assertEqual(d1.open, m5.bars[0].open)
+
+    def test_d1_1100_is_prefix_of_1530_not_eod_look_ahead(self) -> None:
+        morning = self.hub.snapshot("RELIANCE")
+        close_hub = open_data_hub(
+            self.config, clock=FrozenClock(datetime(2026, 9, 21, 15, 30, tzinfo=IST))
+        )
+        close = close_hub.snapshot("RELIANCE")
+        am = morning.series[Timeframe.D1].bars[-1]
+        pm = close.series[Timeframe.D1].bars[-1]
+        self.assertEqual(am.start, pm.start)
+        self.assertEqual(am.end, datetime(2026, 9, 21, 11, 0, tzinfo=IST))
+        self.assertEqual(pm.end, datetime(2026, 9, 21, 15, 30, tzinfo=IST))
+        self.assertEqual(am.close, morning.series[Timeframe.M5].bars[-1].close)
+        self.assertEqual(pm.close, close.series[Timeframe.M5].bars[-1].close)
+        self.assertNotEqual(am.close, pm.close)
+        self.assertLessEqual(am.high, pm.high)
+        self.assertGreaterEqual(am.low, pm.low)
+        self.assertEqual(len(morning.series[Timeframe.M5].bars), 21)
+        self.assertEqual(len(close.series[Timeframe.M5].bars), 75)
 
     def test_full_session_after_close(self) -> None:
         clock = FrozenClock(datetime(2026, 9, 21, 15, 30, tzinfo=IST))
-        hub = DataHub(self.config, clock=clock)
+        hub = open_data_hub(self.config, clock=clock)
         snap = hub.snapshot("NIFTY")
         self.assertEqual(len(snap.series[Timeframe.M15].bars), 25)
         self.assertEqual(len(snap.series[Timeframe.M5].bars), 75)
@@ -215,7 +245,7 @@ class FixtureHubTests(unittest.TestCase):
                 return BarSeries(symbol=series.symbol, timeframe=series.timeframe, bars=tuple(scaled))
 
         raw = FixtureSource(self.config, clock=self.clock).snapshot("RELIANCE")
-        hub = DataHub(self.config, clock=self.clock, adjuster=ScaleAdjuster())
+        hub = open_data_hub(self.config, clock=self.clock, adjuster=ScaleAdjuster())
         adjusted = hub.snapshot("RELIANCE")
         self.assertEqual(
             adjusted.series[Timeframe.M5].bars[-1].close,
@@ -393,6 +423,12 @@ class DataHygieneTests(unittest.TestCase):
         self.assertFalse(config.data.allow_live_feed)
         self.assertFalse(config.data.allow_options_chain)
         self.assertEqual(config.data.timeframes, ("D1", "M15", "M5"))
+
+    def test_hub_does_not_import_fixture_source(self) -> None:
+        text = (ROOT / "grow" / "data" / "hub.py").read_text(encoding="utf-8")
+        self.assertNotIn("from grow.data.fixture", text)
+        self.assertNotIn("import grow.data.fixture", text)
+        self.assertIn("MarketDataSource", text)
 
 
 if __name__ == "__main__":

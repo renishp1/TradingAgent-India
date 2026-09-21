@@ -72,7 +72,13 @@ Cash market only.
 
 ## Legal source
 
-The only constructed source is `FixtureSource`.
+The only constructed source is `FixtureSource`, wired through
+`open_data_hub()`. `DataHub` takes a `MarketDataSource` and does not import
+the fixture.
+
+Intraday prices are a hash of `(ticker, bar.start)`. They must not use a
+session-day EOD seed. Forming D1 at 11:00 is the M5 prefix 09:15→11:00;
+complete D1 at 15:30 is the full-session M5 aggregate.
 
 `data.provider` must be `fixture`. `data.allow_live_feed` must be false.
 `LicensedFeed()` raises. Setting `GROW_DATA_PROVIDER` to anything else
