@@ -6,6 +6,9 @@ against the current Risk Guard. No network, no broker, no persistence yet.
 Architecture Review #1: cash book is long-only. Negative quantity is a
 safety error, not a short inventory. P&L is realized-at-cost; mark-to-market
 is deferred until licensed quotes exist.
+
+A stamp is necessary, not sufficient. The ledger validates fill invariants
+itself and will not blindly trust a caller merely because HMAC verified.
 """
 
 from __future__ import annotations
@@ -19,6 +22,12 @@ from grow.errors import GrowSafetyError
 from grow.execution.lock import assert_paper_runtime
 from grow.risk.guard import RiskGuard
 from grow.types import Fill, Intent, RiskStamp, Side, Symbol, TradeProposal, Venue
+
+_FLATTEN = {Intent.CLOSE, Intent.REDUCE, Intent.SQUARE_OFF}
+
+
+def expected_notional(quantity: int, limit_price: float) -> float:
+    return round(quantity * limit_price, 2)
 
 
 @dataclass
@@ -63,6 +72,19 @@ class PaperBook:
                 "unrealized_pnl": None,
                 "note": "MTM / drawdown deferred until licensed quotes. Do not treat realized_pnl as strategy performance.",
             },
+            "pnl": {
+                "realized_at_cost": self.realized_pnl,
+                "fed_to_risk_guard_as": "lifetime_realized_pnl",
+                "true_daily_pnl": None,
+                "daily_realized_pnl": None,
+                "daily_unrealized_pnl": None,
+                "note": (
+                    "Risk Guard loss.daily currently receives lifetime realized-at-cost "
+                    "of this in-memory book, not a session-day accumulator. "
+                    "True daily P&L (realized + unrealized + fees + slippage) waits for "
+                    "the valuation layer in Milestone 2A."
+                ),
+            },
             "positions": {
                 key: {
                     "ticker": pos.symbol.ticker,
@@ -89,11 +111,9 @@ class PaperLedger:
             self.config.execution.live_trading_enabled,
             self.config.paper.venue_id,
         )
-        if proposal.venue is not Venue.PAPER:
-            raise GrowSafetyError("Paper ledger received a non-paper venue.")
-        if proposal.intent is Intent.OPEN and proposal.side is Side.SELL and not self.config.risk.allow_short:
-            raise GrowSafetyError("Cash book refuses to open a short.")
+        self._assert_structural(proposal)
         self.guard.require_stamp(proposal, stamp)
+        self._assert_position(proposal)
 
         fill = Fill(
             fill_id=uuid4().hex[:12],
@@ -108,6 +128,32 @@ class PaperLedger:
         )
         self._apply(fill, proposal.intent)
         return fill
+
+    def _assert_structural(self, proposal: TradeProposal) -> None:
+        if proposal.venue is not Venue.PAPER:
+            raise GrowSafetyError("Paper ledger received a non-paper venue.")
+        if proposal.quantity <= 0:
+            raise GrowSafetyError("Fill quantity must be positive.")
+        if proposal.limit_price <= 0:
+            raise GrowSafetyError("Fill price must be positive.")
+        expected = expected_notional(proposal.quantity, proposal.limit_price)
+        if abs(proposal.notional - expected) > 1e-6:
+            raise GrowSafetyError(
+                f"Notional {proposal.notional} does not equal quantity\u00d7price {expected}."
+            )
+        if proposal.intent is Intent.OPEN and proposal.side is Side.SELL and not self.config.risk.allow_short:
+            raise GrowSafetyError("Cash book refuses to open a short.")
+        if proposal.intent in _FLATTEN and proposal.side is Side.BUY and not self.config.risk.allow_short:
+            raise GrowSafetyError("Cash book has no short to cover.")
+
+    def _assert_position(self, proposal: TradeProposal) -> None:
+        if proposal.intent not in _FLATTEN:
+            return
+        pos = self.book.positions.get(proposal.symbol.ticker)
+        if pos is None or pos.quantity <= 0:
+            raise GrowSafetyError("Flatten of unknown or empty position.")
+        if proposal.quantity > pos.quantity:
+            raise GrowSafetyError("Flatten quantity exceeds open position.")
 
     def _apply(self, fill: Fill, intent: Intent) -> None:
         key = fill.symbol.ticker
@@ -165,5 +211,5 @@ class PaperLedger:
             confidence=1.0,
             venue=Venue.PAPER,
             created_at=self.clock.now(),
-            notional=round(qty * last_price, 2),
+            notional=expected_notional(qty, last_price),
         )
