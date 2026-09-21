@@ -148,6 +148,18 @@ See [`options.md`](options.md).
 `OptionsDesk.chain` still raises (vendor door). `DataHub.option_chain`
 still raises (cash hub).
 
+## Research / CEO plane (Milestone 2D)
+
+```
+ResearchPacket → Bull/Bear/Quant/Risk-context → CEODecision
+TRADE_APPROVE | NO_TRADE
+======== STOP 2D ========
+```
+
+Fixture AI only. CEO may approve the **2C winner** or reject it. Never
+invent a contract, never call Risk Guard, never write the ledger.
+See [`research.md`](research.md).
+
 ## Modules
 
 | Path | Status | Responsibility |
@@ -156,7 +168,8 @@ still raises (cash hub).
 | `grow/execution/live.py` | **implemented (refuse)** | Live broker surface that only raises |
 | `grow/config.py` | **implemented** | YAML + env overlay, fail-closed |
 | `grow/model_gateway/` | **implemented (mock)** | Provider abstraction; remote = later |
-| `grow/ceo/` | **implemented** | Proposal only; placeholder SL/TP |
+| `grow/ceo/` | **implemented** | M1 cash TradeProposal; placeholder SL/TP |
+| `grow/research/` | **2D engine** | Fixture agents; TRADE_APPROVE or NO_TRADE |
 | `grow/market/` | **implemented (stub quotes)** | Brief + NSE session/square-off clock |
 | `grow/risk/` | **implemented** | Deterministic guard + HMAC stamp (secret required) |
 | `grow/paper/` | **implemented** | In-memory long-only ledger |

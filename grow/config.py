@@ -210,6 +210,21 @@ class OptionsConfig:
 
 
 @dataclass(frozen=True)
+class AIConfig:
+    enabled: bool
+    provider: str
+    deterministic_mode: bool
+    max_retries: int
+    timeout_seconds: int
+    confidence_enabled: bool
+    min_ceo_confidence: float
+    prompt_versions: Mapping[str, str]
+    allow_broker: bool
+    allow_live_trading: bool
+    allow_ai_execution: bool
+
+
+@dataclass(frozen=True)
 class GrowConfig:
     version: str
     timezone: str
@@ -222,6 +237,7 @@ class GrowConfig:
     data: DataConfig
     strategies: StrategiesConfig
     options: OptionsConfig
+    ai: AIConfig
     source_path: str
 
     def assert_safe(self) -> None:
@@ -264,6 +280,10 @@ class GrowConfig:
             raise GrowConfigError("2C forbids same-day expiry.")
         if self.options.max_distance_from_atm < 0:
             raise GrowConfigError("max_distance_from_atm must be >= 0")
+        if self.ai.provider != "fixture":
+            raise GrowConfigError("2D ai.provider must be 'fixture'.")
+        if self.ai.allow_broker or self.ai.allow_live_trading or self.ai.allow_ai_execution:
+            raise GrowConfigError("2D AI may not enable broker, live trading, or execution.")
 
 
 _DEFAULT_STRATEGY_SPECS: tuple[tuple[str, dict[str, Any]], ...] = (
@@ -349,6 +369,36 @@ def _options_config(raw: dict[str, Any]) -> OptionsConfig:
             safety.get("reject_invalid_quotes", True), "options.safety.reject_invalid_quotes"
         ),
         selection_version=str(raw.get("selection_version", "options.select.v1")),
+    )
+
+
+def _ai_config(raw: dict[str, Any]) -> AIConfig:
+    if not isinstance(raw, dict):
+        raise GrowConfigError("grow.ai must be a mapping")
+    confidence = raw.get("confidence") or {}
+    prompts = raw.get("prompt_versions") or {}
+    safety = raw.get("safety") or {}
+    if not isinstance(prompts, dict):
+        raise GrowConfigError("ai.prompt_versions must be a mapping")
+    versions = {
+        "bull": str(prompts.get("bull", "v1")),
+        "bear": str(prompts.get("bear", "v1")),
+        "quant": str(prompts.get("quant", "v1")),
+        "risk_context": str(prompts.get("risk_context", "v1")),
+        "ceo": str(prompts.get("ceo", "v1")),
+    }
+    return AIConfig(
+        enabled=_as_bool(raw.get("enabled", True), "ai.enabled"),
+        provider=str(raw.get("provider", "fixture")).lower(),
+        deterministic_mode=_as_bool(raw.get("deterministic_mode", True), "ai.deterministic_mode"),
+        max_retries=_as_int(raw.get("max_retries", 0), "ai.max_retries"),
+        timeout_seconds=_as_int(raw.get("timeout_seconds", 30), "ai.timeout_seconds"),
+        confidence_enabled=_as_bool(confidence.get("enabled", False), "ai.confidence.enabled"),
+        min_ceo_confidence=_as_float(confidence.get("min_ceo_confidence", 0.0), "ai.confidence.min_ceo_confidence"),
+        prompt_versions=versions,
+        allow_broker=_as_bool(safety.get("allow_broker", False), "ai.safety.allow_broker"),
+        allow_live_trading=_as_bool(safety.get("allow_live_trading", False), "ai.safety.allow_live_trading"),
+        allow_ai_execution=_as_bool(safety.get("allow_ai_execution", False), "ai.safety.allow_ai_execution"),
     )
 
 
@@ -473,6 +523,7 @@ def _build(raw: dict[str, Any], source_path: str) -> GrowConfig:
             specs=specs,
         ),
         options=_options_config(g.get("options") or {}),
+        ai=_ai_config(g.get("ai") or {}),
         source_path=source_path,
     )
     config.assert_safe()

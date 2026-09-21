@@ -129,3 +129,24 @@ grow:
     safety:
       reject_stale_chain: true
       reject_invalid_quotes: true
+
+  ai:
+    enabled: true
+    provider: fixture
+    deterministic_mode: true
+    max_retries: 0
+    timeout_seconds: 30
+    confidence:
+      enabled: false
+      min_ceo_confidence: 0.0
+    prompt_versions:
+      bull: v1
+      bear: v1
+      quant: v1
+      risk_context: v1
+      ceo: v1
+    safety:
+      paper_only: true
+      allow_broker: false
+      allow_live_trading: false
+      allow_ai_execution: false
