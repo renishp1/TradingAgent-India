@@ -351,6 +351,77 @@ class ResearchCEOTests(unittest.TestCase):
         self.assertEqual(decision.decision, CEOVerdict.NO_TRADE)
         self.assertIn("DECISION_SCHEMA", decision.rejection_reasons)
 
+    def test_approve_requires_bullish_ce_or_bearish_pe(self) -> None:
+        packet, _, config = _packet("BULLISH")
+        orch = ResearchOrchestrator(config)
+        reports = tuple(a.research(packet) for a in orch.agents)
+        raw = orch.ceo.synthesize(packet, reports)
+        missing = dict(packet.option_candidate or {})
+        missing["option_type"] = None
+        decision = orch.validator.validate(replace(packet, option_candidate=missing), raw, reports)
+        self.assertEqual(decision.decision, CEOVerdict.NO_TRADE)
+        self.assertIn("BULLISH_NOT_CE", decision.rejection_reasons)
+        decision = orch.validator.validate(packet, replace(raw, direction="SIDEWAYS"), reports)
+        self.assertEqual(decision.decision, CEOVerdict.NO_TRADE)
+        self.assertTrue(any("INVALID_DIRECTION" in r for r in decision.rejection_reasons))
+
+        bear, _, config = _packet("BEARISH")
+        orch = ResearchOrchestrator(config)
+        reports = tuple(a.research(bear) for a in orch.agents)
+        raw = orch.ceo.synthesize(bear, reports)
+        self.assertEqual(raw.decision, CEOVerdict.TRADE_APPROVE)
+        missing = dict(bear.option_candidate or {})
+        missing["option_type"] = None
+        decision = orch.validator.validate(replace(bear, option_candidate=missing), raw, reports)
+        self.assertEqual(decision.decision, CEOVerdict.NO_TRADE)
+        self.assertIn("BEARISH_NOT_PE", decision.rejection_reasons)
+        ce = dict(bear.option_candidate or {})
+        ce["option_type"] = "CE"
+        decision = orch.validator.validate(replace(bear, option_candidate=ce), raw, reports)
+        self.assertEqual(decision.decision, CEOVerdict.NO_TRADE)
+        self.assertIn("BEARISH_NOT_PE", decision.rejection_reasons)
+        self.assertIn("BEARISH_CE", decision.rejection_reasons)
+
+    def test_report_asof_mismatch(self) -> None:
+        packet, _, config = _packet("BULLISH")
+        orch = ResearchOrchestrator(config)
+        reports = tuple(a.research(packet) for a in orch.agents)
+        shifted = packet.as_of + timedelta(minutes=5)
+        reports = tuple(
+            replace(r, as_of=shifted) if r.agent_id == "quant" else r for r in reports
+        )
+        raw = orch.ceo.synthesize(packet, reports)
+        decision = orch.validator.validate(packet, raw, reports)
+        self.assertEqual(decision.decision, CEOVerdict.NO_TRADE)
+        self.assertIn("REPORT_ASOF_MISMATCH:quant", decision.rejection_reasons)
+        self.assertFalse(decision.validation_ok)
+
+    def test_validation_ok_false_on_rewrite_true_on_policy_no_trade(self) -> None:
+        packet, _, config = _packet("BULLISH")
+        orch = ResearchOrchestrator(config)
+        reports = tuple(a.research(packet) for a in orch.agents)
+        raw = orch.ceo.synthesize(packet, reports)
+        rewritten = orch.validator.validate(packet, replace(raw, selected_candidate_id="nope"), reports)
+        self.assertEqual(rewritten.decision, CEOVerdict.NO_TRADE)
+        self.assertFalse(rewritten.validation_ok)
+        self.assertTrue(rewritten.validation_failures)
+        policy_packet = replace(packet, options_status="NO_TRADE", option_candidate=None, option_candidate_id=None)
+        policy = ResearchOrchestrator(config).run(policy_packet)
+        self.assertEqual(policy.decision, CEOVerdict.NO_TRADE)
+        self.assertTrue(policy.validation_ok)
+        self.assertEqual(policy.validation_failures, ())
+
+    def test_ceo_confidence_bounds(self) -> None:
+        packet, _, config = _packet("BULLISH")
+        orch = ResearchOrchestrator(config)
+        reports = tuple(a.research(packet) for a in orch.agents)
+        raw = orch.ceo.synthesize(packet, reports)
+        for value in (-0.01, 1.01, float("nan")):
+            decision = orch.validator.validate(packet, replace(raw, confidence=value), reports)
+            self.assertEqual(decision.decision, CEOVerdict.NO_TRADE, value)
+            self.assertIn("CEO_CONFIDENCE_INVALID", decision.rejection_reasons)
+            self.assertFalse(decision.validation_ok)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -33,6 +33,35 @@ _PROHIBITED = frozenset(
     }
 )
 _REQUIRED_AGENTS = ("bull", "bear", "quant", "risk_context")
+_INTEGRITY = (
+    "PACKET_SCHEMA",
+    "DECISION_SCHEMA",
+    "PACKET_ID_MISMATCH",
+    "ASOF_MISMATCH",
+    "SNAPSHOT_INCONSISTENT",
+    "PROHIBITED_FIELD",
+    "EXECUTION_LANGUAGE",
+    "NO_CANDIDATE",
+    "MISSING_CANDIDATE_ID",
+    "UNKNOWN_CANDIDATE",
+    "CANDIDATE_SNAPSHOT_MISMATCH",
+    "NEUTRAL_WITH_CANDIDATE",
+    "BULLISH_PE",
+    "BEARISH_CE",
+    "BULLISH_NOT_CE",
+    "BEARISH_NOT_PE",
+    "NON_BUY_INTENT",
+    "CANDIDATE_MUTATION",
+    "MISSING_REPORT",
+    "REPORT_PACKET_MISMATCH",
+    "REPORT_ASOF_MISMATCH",
+    "CEO_CONFIDENCE_INVALID",
+    "INVALID_DIRECTION",
+)
+
+
+def _is_integrity(reason: str) -> bool:
+    return any(reason == prefix or reason.startswith(prefix + ":") for prefix in _INTEGRITY)
 
 
 def asof_failures(packet: ResearchPacket) -> tuple[str, ...]:
@@ -69,6 +98,7 @@ def no_trade(
     provider: str = "fixture",
     model: str = "grow.research.fixture.v1",
     extra_failures: tuple[str, ...] = (),
+    validation_ok: bool = True,
 ) -> CEODecision:
     decision = CEOVerdict.NO_TRADE
     return CEODecision(
@@ -95,7 +125,7 @@ def no_trade(
         decision_schema_version=DECISION_SCHEMA,
         as_of=packet.as_of,
         created_at=packet.as_of,
-        validation_ok=True,
+        validation_ok=validation_ok,
         validation_failures=extra_failures,
     )
 
@@ -131,6 +161,14 @@ class DecisionValidator:
         failures.extend(prohibited)
         if decision.direction in {"SELL", "SHORT", "BUY", "LONG", "OPTION_SELL"}:
             failures.append(f"EXECUTION_LANGUAGE:{decision.direction}")
+        try:
+            confidence = float(decision.confidence)
+        except (TypeError, ValueError):
+            confidence = float("nan")
+            failures.append("CEO_CONFIDENCE_INVALID")
+        else:
+            if not (0.0 <= confidence <= 1.0):
+                failures.append("CEO_CONFIDENCE_INVALID")
         if decision.decision is CEOVerdict.TRADE_APPROVE:
             if packet.options_status != "CANDIDATE" or packet.option_candidate is None:
                 failures.append("NO_CANDIDATE")
@@ -141,18 +179,23 @@ class DecisionValidator:
             cand = packet.option_candidate or {}
             if cand.get("underlying_snapshot_id") and cand.get("underlying_snapshot_id") != ids.get("market"):
                 failures.append("CANDIDATE_SNAPSHOT_MISMATCH")
+            if decision.direction not in {"BULLISH", "BEARISH"}:
+                failures.append(f"INVALID_DIRECTION:{decision.direction}")
             if decision.direction == "NEUTRAL":
                 failures.append("NEUTRAL_WITH_CANDIDATE")
-            if decision.direction == "BULLISH" and cand.get("option_type") == "PE":
-                failures.append("BULLISH_PE")
-            if decision.direction == "BEARISH" and cand.get("option_type") == "CE":
-                failures.append("BEARISH_CE")
-            if decision.direction == "BULLISH" and cand.get("option_type") not in {None, "CE"}:
+            option_type = cand.get("option_type")
+            if decision.direction == "BULLISH" and option_type != "CE":
                 failures.append("BULLISH_NOT_CE")
+            if decision.direction == "BEARISH" and option_type != "PE":
+                failures.append("BEARISH_NOT_PE")
+            if decision.direction == "BULLISH" and option_type == "PE":
+                failures.append("BULLISH_PE")
+            if decision.direction == "BEARISH" and option_type == "CE":
+                failures.append("BEARISH_CE")
             if cand.get("intent") not in {None, "BUY"}:
                 failures.append("NON_BUY_INTENT")
             for key in ("strike", "expiry", "premium_reference", "option_type"):
-                if raw and key in raw and cand and raw[key] != cand.get(key) and raw[key] != cand.get(key):
+                if raw and key in raw and cand and raw[key] != cand.get(key):
                     failures.append(f"CANDIDATE_MUTATION:{key}")
         by_id = {r.agent_id: r for r in reports}
         for name in _REQUIRED_AGENTS:
@@ -164,6 +207,8 @@ class DecisionValidator:
                 failures.append(f"INSUFFICIENT_DATA:{name}")
             if report.packet_id != packet.packet_id:
                 failures.append(f"REPORT_PACKET_MISMATCH:{name}")
+            if report.as_of != packet.as_of:
+                failures.append(f"REPORT_ASOF_MISMATCH:{name}")
         quant = by_id.get("quant")
         risk = by_id.get("risk_context")
         if quant is not None and quant.recommendation is Recommendation.OPPOSE:
@@ -181,7 +226,8 @@ class DecisionValidator:
         ):
             failures.append("CEO_CONFIDENCE")
         unique = tuple(dict.fromkeys(failures))
-        if unique:
+        integrity = tuple(item for item in unique if _is_integrity(item))
+        if integrity or (unique and decision.decision is CEOVerdict.TRADE_APPROVE):
             return no_trade(
                 packet,
                 reasons=unique,
@@ -190,6 +236,30 @@ class DecisionValidator:
                 provider=decision.model_provider,
                 model=decision.model_name,
                 extra_failures=unique,
+                validation_ok=False,
+            )
+        if unique:
+            return CEODecision(
+                decision_id=decision.decision_id,
+                packet_id=decision.packet_id,
+                decision=CEOVerdict.NO_TRADE,
+                selected_candidate_id=None,
+                direction=decision.direction if decision.decision is CEOVerdict.NO_TRADE else "NEUTRAL",
+                rationale_summary=decision.rationale_summary,
+                supporting_report_ids=decision.supporting_report_ids,
+                conflicting_report_ids=decision.conflicting_report_ids,
+                confidence=decision.confidence,
+                uncertainty_flags=decision.uncertainty_flags,
+                rejection_reasons=decision.rejection_reasons or unique,
+                approval_basis=(),
+                model_provider=decision.model_provider,
+                model_name=decision.model_name,
+                prompt_version=decision.prompt_version,
+                decision_schema_version=DECISION_SCHEMA,
+                as_of=decision.as_of,
+                created_at=decision.created_at,
+                validation_ok=True,
+                validation_failures=(),
             )
         return CEODecision(
             decision_id=decision.decision_id,

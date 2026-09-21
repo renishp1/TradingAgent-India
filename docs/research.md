@@ -65,11 +65,18 @@ mapping + no material disagreement / insufficient data → approve.
 
 ## Validator
 
+TRADE_APPROVE direction is exactly `BULLISH` or `BEARISH`. BULLISH requires
+`option_type == CE`; BEARISH requires `option_type == PE`. Missing/unknown
+type is rejected. Report `as_of` must equal packet `as_of`. CEO confidence
+must be in `[0, 1]`. Validator rewrites set `validation_ok=False`; a clean
+policy `NO_TRADE` stays `validation_ok=True`.
+
 Any failure rewrites the result to `NO_TRADE` with structured reasons.
 Includes: schema (`research.packet.v1` / `research.decision.v1`), snapshot
-consistency, `ASOF_MISMATCH`, unknown candidate, BULLISH+PE, BEARISH+CE,
-NEUTRAL+candidate, prohibited execution keys, candidate mutation, 2C
-NO_TRADE, Quant/Risk OPPOSE, insufficient reports, and (when enabled)
+consistency, `ASOF_MISMATCH`, `REPORT_ASOF_MISMATCH`, unknown candidate,
+BULLISH+PE, BEARISH+CE, missing type, invalid direction, NEUTRAL+candidate,
+prohibited execution keys, candidate mutation, 2C NO_TRADE, Quant/Risk
+OPPOSE, insufficient reports, `CEO_CONFIDENCE_INVALID`, and (when enabled)
 `CEO_CONFIDENCE`.
 
 ## Failure policy
