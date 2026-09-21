@@ -127,8 +127,9 @@ MarketSnapshot → indicators → regime → registered strategies → StrategyR
 ```
 
 `StrategyEngine` consumes 2A snapshots only. Output is `StrategySignal`
-(LONG underlying research). No option legs, no broker, no LLM, no fills.
-See [`strategy.md`](strategy.md).
+with research direction `BULLISH` or `BEARISH` (not BUY/SELL/LONG/SHORT).
+No option legs, no broker, no LLM, no fills. Primary timeframe is locked
+to M15. See [`strategy.md`](strategy.md).
 
 `StrategyBook.run` remains a hard error so strategies cannot execute.
 

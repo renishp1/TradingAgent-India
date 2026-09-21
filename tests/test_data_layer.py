@@ -356,7 +356,7 @@ class FixtureHubTests(unittest.TestCase):
         signal = StrategySignal(
             symbol=Symbol("RELIANCE"),
             strategy="breakout",
-            direction="LONG",
+            direction="BULLISH",
             entry=1420.0,
             stop=1402.0,
             target=1455.0,
@@ -366,7 +366,7 @@ class FixtureHubTests(unittest.TestCase):
             as_of=self.clock.now(),
             snapshot_id="demo",
         )
-        self.assertEqual(signal.to_dict()["direction"], "LONG")
+        self.assertEqual(signal.to_dict()["direction"], "BULLISH")
 
     def test_normalizer_rejects_bad_ohlc(self) -> None:
         from grow.data.schedule import bar_duration

@@ -152,14 +152,15 @@ class StrategyEngineTests(unittest.TestCase):
         self.assertEqual(result.signals, ())
         self.assertTrue(any(s.reason.startswith("SESSION") for s in result.skipped))
 
-    def test_uptrend_emits_long_only_and_is_deterministic(self) -> None:
+    def test_uptrend_emits_bullish_and_is_deterministic(self) -> None:
         snap = self._uptrend()
         a = self.engine.evaluate(snap)
         b = self.engine.evaluate(snap)
         self.assertEqual(a.to_dict(), b.to_dict())
         self.assertTrue(a.signals)
         for sig in a.signals:
-            self.assertEqual(sig.direction, "LONG")
+            self.assertIn(sig.direction, {"BULLISH", "BEARISH"})
+            self.assertNotIn(sig.direction, {"LONG", "SHORT", "SELL", "BUY"})
             self.assertGreater(sig.entry, 0)
             self.assertLess(sig.stop, sig.entry)
             self.assertGreater(sig.target, sig.entry)
@@ -169,6 +170,28 @@ class StrategyEngineTests(unittest.TestCase):
             self.assertNotIn("PE", sig.reason)
         names = {s.strategy for s in a.signals}
         self.assertTrue({"ema_trend", "momentum", "breakout"} & names)
+        self.assertTrue(all(s.direction == "BULLISH" for s in a.signals))
+
+    def test_downtrend_emits_bearish_research(self) -> None:
+        prices = [22000 - i * 8.0 for i in range(80)]
+        m15 = _series(self.symbol, prices, self.start)
+        d1_start = datetime(2026, 6, 1, 9, 15, tzinfo=IST)
+        d1_prices = [23000 - i * 20.0 for i in range(60)]
+        d1_bars = []
+        day = d1_start
+        for px in d1_prices:
+            d1_bars.append(_bar(self.symbol, day, px, Timeframe.D1))
+            day = day + timedelta(days=1)
+            while day.weekday() >= 5:
+                day += timedelta(days=1)
+        d1 = BarSeries(symbol=self.symbol, timeframe=Timeframe.D1, bars=tuple(d1_bars))
+        snap = _snapshot(self.symbol, m15, d1)
+        result = self.engine.evaluate(snap)
+        self.assertTrue(result.signals)
+        self.assertTrue(all(s.direction == "BEARISH" for s in result.signals))
+        for sig in result.signals:
+            self.assertGreater(sig.stop, sig.entry)
+            self.assertLess(sig.target, sig.entry)
 
     def test_insufficient_history(self) -> None:
         prices = [20000.0, 20001.0, 20002.0]

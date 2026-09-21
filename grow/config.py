@@ -183,6 +183,7 @@ class StrategySpec:
 class StrategiesConfig:
     universe: tuple[str, ...]
     primary_timeframe: str
+    supported_timeframes: tuple[str, ...]
     specs: tuple[StrategySpec, ...]
 
 
@@ -226,8 +227,10 @@ class GrowConfig:
         allowed_idx = {"NIFTY", "BANKNIFTY"}
         if not self.strategies.universe or any(s not in allowed_idx for s in self.strategies.universe):
             raise GrowConfigError("2B strategy universe must be a non-empty subset of NIFTY, BANKNIFTY.")
-        if self.strategies.primary_timeframe not in allowed_tf:
-            raise GrowConfigError("2B primary_timeframe must be D1, M15, or M5.")
+        if self.strategies.primary_timeframe != "M15":
+            raise GrowConfigError("2B primary_timeframe is locked to M15. M5/D1 are context only.")
+        if tuple(self.strategies.supported_timeframes) != ("M5", "M15", "D1"):
+            raise GrowConfigError("2B supported_timeframes must be M5, M15, D1.")
 
 
 _DEFAULT_STRATEGY_SPECS: tuple[tuple[str, dict[str, Any]], ...] = (
@@ -259,7 +262,7 @@ _DEFAULT_STRATEGY_SPECS: tuple[tuple[str, dict[str, Any]], ...] = (
 
 
 def _strategy_specs(raw: dict[str, Any]) -> tuple[StrategySpec, ...]:
-    reserved = {"universe", "primary_timeframe"}
+    reserved = {"universe", "primary_timeframe", "supported_timeframes"}
     found = {k: v for k, v in raw.items() if k not in reserved}
     if not found:
         found = {name: body for name, body in _DEFAULT_STRATEGY_SPECS}
@@ -393,6 +396,10 @@ def _build(raw: dict[str, Any], source_path: str) -> GrowConfig:
         strategies=StrategiesConfig(
             universe=tuple(str(s).strip().upper() for s in strategy_universe),
             primary_timeframe=str(raw_strategies.get("primary_timeframe", "M15")).upper(),
+            supported_timeframes=tuple(
+                str(tf).strip().upper()
+                for tf in (raw_strategies.get("supported_timeframes") or ["M5", "M15", "D1"])
+            ),
             specs=specs,
         ),
         source_path=source_path,

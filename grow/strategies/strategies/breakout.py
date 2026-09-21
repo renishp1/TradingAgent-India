@@ -1,9 +1,10 @@
-"""Breakout v1. Rolling high uses previous completed bars only."""
+"""Breakout / breakdown v1. Rolling high/low exclude the current bar."""
 
 from __future__ import annotations
 
 from grow.data.schema import MarketSnapshot
-from grow.strategies.models import Direction, StrategyContext, signal_fingerprint
+from grow.strategies.emit import atr_levels, research_signal
+from grow.strategies.models import Direction, MarketRegime, StrategyContext
 from grow.strategies.signal import StrategySignal
 
 
@@ -13,48 +14,45 @@ class BreakoutStrategy:
 
     def evaluate(self, snapshot: MarketSnapshot, context: StrategyContext) -> StrategySignal | None:
         ind = context.indicators
-        if context.regime.label.value in {"RANGE", "BEAR_TREND"}:
-            return None
         if not ind.ready("rolling_high", "rolling_low", "atr"):
             return None
         assert ind.rolling_high is not None and ind.rolling_low is not None and ind.atr is not None
-        if ind.close <= ind.rolling_high:
-            return None
-        if ind.body is not None and ind.body <= 0:
-            return None
-        entry = ind.close
-        stop = round(min(ind.rolling_low, entry - ind.atr), 2)
-        if stop >= entry:
-            return None
-        risk = entry - stop
-        target = round(entry + 2.0 * risk, 2)
-        reason = (
-            f"close={ind.close:.2f} > prior {context.params.get('lookback', 20)}-bar high "
-            f"{ind.rolling_high:.2f} (current bar excluded), regime={context.regime.label.value}"
-        )
-        version = str(context.params.get("version", self.version))
-        return StrategySignal(
-            symbol=snapshot.symbol,
-            strategy=self.name,
-            direction=Direction.LONG.value,
-            entry=round(entry, 2),
-            stop=stop,
-            target=target,
-            confidence=0.55,
-            timeframe=context.timeframe,
-            reason=reason,
-            as_of=snapshot.as_of,
-            snapshot_id=snapshot.snapshot_id,
-            signal_id=signal_fingerprint(
-                symbol=snapshot.symbol.qualified(),
-                strategy=self.name,
-                timeframe=context.timeframe.value,
-                as_of=snapshot.as_of.isoformat(),
-                snapshot_id=snapshot.snapshot_id,
-                strategy_version=version,
-                direction=Direction.LONG.value,
-            ),
-            strategy_version=version,
-            regime=context.regime.label.value,
-            risk_reward=round(2.0, 2),
-        )
+        lookback = context.params.get("lookback", 20)
+        regime = context.regime.label
+        bull = ind.close > ind.rolling_high and (ind.body or 0) > 0
+        bear = ind.close < ind.rolling_low and (ind.body or 0) < 0
+        if bull and regime not in {MarketRegime.RANGE, MarketRegime.BEAR_TREND}:
+            stop, target = atr_levels(ind.close, ind.atr, Direction.BULLISH)
+            stop = min(stop, ind.rolling_low)
+            return research_signal(
+                snapshot,
+                context,
+                name=self.name,
+                direction=Direction.BULLISH,
+                entry=ind.close,
+                stop=stop,
+                target=target,
+                confidence=0.55,
+                reason=(
+                    f"close={ind.close:.2f} > prior {lookback}-bar high {ind.rolling_high:.2f} "
+                    f"(current bar excluded), regime={regime.value}"
+                ),
+            )
+        if bear and regime not in {MarketRegime.RANGE, MarketRegime.BULL_TREND}:
+            stop, target = atr_levels(ind.close, ind.atr, Direction.BEARISH)
+            stop = max(stop, ind.rolling_high)
+            return research_signal(
+                snapshot,
+                context,
+                name=self.name,
+                direction=Direction.BEARISH,
+                entry=ind.close,
+                stop=stop,
+                target=target,
+                confidence=0.55,
+                reason=(
+                    f"close={ind.close:.2f} < prior {lookback}-bar low {ind.rolling_low:.2f} "
+                    f"(current bar excluded), regime={regime.value}"
+                ),
+            )
+        return None

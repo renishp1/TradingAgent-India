@@ -30,8 +30,11 @@ class StrategySignal:
     extras: Mapping[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        if self.direction != "LONG":
-            raise ValueError("2B underlying signals are LONG only. No SHORT, no option legs.")
+        if self.direction not in {"BULLISH", "BEARISH"}:
+            raise ValueError(
+                "2B research direction is BULLISH or BEARISH. "
+                "Not BUY/SELL/LONG/SHORT execution."
+            )
         return {
             "symbol": self.symbol.qualified(),
             "strategy": self.strategy,

@@ -14,5 +14,5 @@ class Strategy(Protocol):
     version: str
 
     def evaluate(self, snapshot: MarketSnapshot, context: StrategyContext) -> StrategySignal | None:
-        """Return a LONG research signal or None. Never SHORT. Never an order."""
+        """Return a BULLISH or BEARISH research signal, or None. Never an order."""
         ...

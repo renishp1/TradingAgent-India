@@ -40,14 +40,30 @@ It must not:
 ## Universe and session
 
 2B instruments: `NIFTY`, `BANKNIFTY` (config `grow.strategies.universe`).
-Primary timeframe: `M15` (D1 is regime context, M5 is available but not
-the default entry series).
 
-LONG research signals are emitted only while `session == OPEN`.
-`StrategySignal.direction` is `LONG` only. No SHORT, SELL, or OPTION_SELL.
+Timeframes:
 
-A LONG underlying signal is **not** a BUY CE. 2C will map bullish/bearish
-research onto option *buying*. 2B does not perform that mapping.
+| Role | Timeframe |
+|---|---|
+| Primary (signals) | **M15** (locked) |
+| Context | D1 regime, M5 available but not the signal series |
+
+`primary_timeframe` cannot be set to M5 or D1.
+
+Research signals are emitted only while `session == OPEN`.
+
+`StrategySignal.direction` is **research** language:
+
+| Research | Later 2C mapping (not in 2B) |
+|---|---|
+| `BULLISH` | candidate BUY CE |
+| `BEARISH` | candidate BUY PE |
+
+Not `BUY`, `SELL`, `LONG`, `SHORT`, or `OPTION_SELL`. 2B does not execute
+and does not select an option contract.
+
+A `BEARISH` signal is **not** a short sale of the index. The cash book
+remains long-only. 2C will buy puts.
 
 ## Indicators
 
@@ -74,12 +90,15 @@ Informational. Strategies use it as explicit eligibility, not a hidden veto.
 
 ## Strategies (v1)
 
-| Name | Idea | Eligibility |
+| Name | BULLISH | BEARISH |
 |---|---|---|
-| `ema_trend:v1` | EMA fast > slow, positive slope, price above fast | skip BEAR/RANGE |
-| `momentum:v1` | RSI > threshold, ROC > 0, price > EMA | skip BEAR |
-| `breakout:v1` | close > prior N-bar high (current bar excluded) | skip RANGE/BEAR |
-| `mean_reversion:v1` | RSI oversold and price below EMA | RANGE / LOW_VOL / UNKNOWN |
+| `ema_trend:v1` | EMA fast > slow, +slope, price above fast | EMA fast < slow, −slope, price below fast |
+| `momentum:v1` | RSI > threshold, ROC > 0, price > EMA | RSI < 100−threshold, ROC < 0, price < EMA |
+| `breakout:v1` | close > prior N-bar high (current excluded) | close < prior N-bar low (current excluded) |
+| `mean_reversion:v1` | RSI oversold, price below EMA | RSI overbought, price above EMA |
+
+Trend/momentum/breakout skip the opposite trend regime. Mean reversion
+is RANGE / LOW_VOL / UNKNOWN.
 
 Parameters live in `configs/grow.default.yaml` under `grow.strategies.*`.
 Changing logic requires `v1 → v2`. Do not silently retune v1.
@@ -98,10 +117,11 @@ Entry / stop / target are **underlying** prices. Risk and reward must be
 
 ## Engine result
 
-`StrategyResult` keeps every strategy's outcome: emitted LONG signals,
-skipped reasons (`DISABLED`, `NO_SETUP`, `INSUFFICIENT_HISTORY`, …),
-exceptions isolated per strategy (`STRATEGY_ERROR` + diagnostic string).
-A broken strategy does not drop the others.
+`StrategyResult` keeps every strategy's outcome: emitted BULLISH/BEARISH
+research signals, skipped reasons (`DISABLED`, `NO_SETUP`,
+`INSUFFICIENT_HISTORY`, …), exceptions isolated per strategy
+(`STRATEGY_ERROR` + diagnostic string). A broken strategy does not drop
+the others.
 
 Multiple strategies may disagree. 2B does **not** pick a winner.
 

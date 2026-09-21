@@ -23,7 +23,10 @@ class MarketRegime(str, Enum):
 
 
 class Direction(str, Enum):
-    LONG = "LONG"
+    """Research direction. Not an execution side. Not SHORT/SELL."""
+
+    BULLISH = "BULLISH"
+    BEARISH = "BEARISH"
 
 
 @dataclass(frozen=True)

@@ -85,7 +85,9 @@ class StrategyEngine:
         evaluated: list[str] = []
         signals = []
 
-        primary = Timeframe(cfg.primary_timeframe)
+        if cfg.primary_timeframe != "M15":
+            raise GrowConfigError("2B primary_timeframe is locked to M15")
+        primary = Timeframe.M15
         empty_ind = _empty_indicators(primary)
         if snapshot.symbol.ticker not in cfg.universe:
             skipped.append(StrategySkip("*", f"INSTRUMENT_NOT_IN_2B_UNIVERSE:{snapshot.symbol.ticker}"))

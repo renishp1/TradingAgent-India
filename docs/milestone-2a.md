@@ -119,7 +119,7 @@ Raw candles are not a prompt.
 `StrategySignal` is frozen as the 2B contract:
 
 ```
-symbol, strategy, direction=LONG, entry, stop, target,
+symbol, strategy, direction=BULLISH|BEARISH, entry, stop, target,
 confidence, timeframe, reason, as_of, snapshot_id
 ```
 

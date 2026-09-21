@@ -69,6 +69,10 @@ grow:
       - NIFTY
       - BANKNIFTY
     primary_timeframe: M15
+    supported_timeframes:
+      - M5
+      - M15
+      - D1
     ema_trend:
       enabled: true
       version: v1
@@ -92,5 +96,6 @@ grow:
       version: v1
       rsi_period: 14
       rsi_oversold: 30
+      rsi_overbought: 70
       deviation: 0.01
       atr_period: 14
