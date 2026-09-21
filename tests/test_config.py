@@ -32,6 +32,10 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.strategies.universe, ("NIFTY", "BANKNIFTY"))
         self.assertEqual(config.strategies.primary_timeframe, "M15")
         self.assertEqual(config.strategies.supported_timeframes, ("M5", "M15", "D1"))
+        self.assertEqual(config.options.provider, "fixture")
+        self.assertFalse(config.options.allow_same_day)
+        self.assertEqual(config.options.preferred_expiry_class, "weekly")
+        self.assertEqual(config.options.max_distance_from_atm, 2)
 
 
     def test_live_yaml_value_cannot_pass_through_env_truth(self) -> None:

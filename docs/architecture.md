@@ -133,6 +133,21 @@ to M15. See [`strategy.md`](strategy.md).
 
 `StrategyBook.run` remains a hard error so strategies cannot execute.
 
+## Options plane (Milestone 2C)
+
+```
+StrategySignal + MarketSnapshot + OptionChainSnapshot
+      ↓
+IndexOptionsEngine → BUY CE | BUY PE | NO TRADE
+```
+
+Fixture chains only. BULLISH→CE, BEARISH→PE. Same-day expiry forbidden.
+Nearest weekly. ATM ± 2. Missing IV/Greeks score 0. No execution.
+See [`options.md`](options.md).
+
+`OptionsDesk.chain` still raises (vendor door). `DataHub.option_chain`
+still raises (cash hub).
+
 ## Modules
 
 | Path | Status | Responsibility |
@@ -149,7 +164,7 @@ to M15. See [`strategy.md`](strategy.md).
 | `tradingagents/` | **foundation / stub intelligence** | Roles, default_config, sequential graph |
 | `grow/data/` | **2A fixture** | OHLCV snapshot, quality, universe. No live feed |
 | `grow/strategies/` | **2B engine** | Indicators, regime, four v1 strategies, `StrategyResult` |
-| `grow/options/` | interface only | F&O later |
+| `grow/options/` | **2C engine** | Fixture chain, BUY CE/PE candidate or NO TRADE |
 | `grow/learning/` | interface only | `DecisionRecord` type; store deferred |
 | `grow/dashboard/` | snapshot schema | Web console later |
 
@@ -191,7 +206,7 @@ No model is allowed to:
 ## Deferred on purpose
 
 Milestone 2A is **fixture market data**. Milestone 2B is quantitative
-`StrategySignal` (this commit). Milestone 2C is index options (BUY CE /
-BUY PE mapping). Milestone 2D is LLM research / CEO over **signals**.
+`StrategySignal` (this commit). Milestone 2C is index options research (BUY CE / BUY PE candidate).
+Milestone 2D is LLM research / CEO over **candidates**.
 Scraping, broker adapters, and live trading stay out.
 

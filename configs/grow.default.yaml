@@ -99,3 +99,32 @@ grow:
       rsi_overbought: 70
       deviation: 0.01
       atr_period: 14
+
+  options:
+    enabled: true
+    provider: fixture
+    allow_live_chain: false
+    selection_version: options.select.v1
+    freshness:
+      max_chain_age_minutes: 5
+    expiry:
+      allow_same_day: false
+      preferred_expiry_class: weekly
+    strikes:
+      max_distance_from_atm: 2
+      allowed_moneyness:
+        - ATM
+        - ITM
+        - OTM
+    liquidity:
+      min_volume: 100
+      min_open_interest: 500
+      max_spread_pct: 0.08
+    iv:
+      min: 0.05
+      max: 2.0
+    scoring:
+      version: v1
+    safety:
+      reject_stale_chain: true
+      reject_invalid_quotes: true

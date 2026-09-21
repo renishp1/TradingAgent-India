@@ -26,7 +26,8 @@ still a constrained paper-trading foundation, not a desk.
 Options, live data, brokers, and LangGraph remain **out of scope**.
 Milestone 2A is fixture market data ([`docs/milestone-2a.md`](docs/milestone-2a.md)).
 Milestone 2B is the quantitative strategy engine ([`docs/strategy.md`](docs/strategy.md)).
-Do not attach a vendor feed, option chain, or broker.
+Milestone 2C is the index-options research engine ([`docs/options.md`](docs/options.md)).
+Do not attach a vendor feed, live option chain, or broker.
 
 
 ## Layout
@@ -37,7 +38,7 @@ TradingAgent-India/
 ├── grow/
 │   ├── ceo/
 │   ├── market/
-│   ├── options/            # interface only
+│   ├── options/            # 2C fixture chain; BUY CE/PE research only
 │   ├── strategies/         # 2B quant engine (signals only)
 │   ├── risk/
 │   ├── execution/          # lock + live refuse

@@ -188,6 +188,27 @@ class StrategiesConfig:
 
 
 @dataclass(frozen=True)
+class OptionsConfig:
+    enabled: bool
+    provider: str
+    allow_live_chain: bool
+    max_chain_age_minutes: int
+    allow_same_day: bool
+    preferred_expiry_class: str
+    max_distance_from_atm: int
+    allowed_moneyness: tuple[str, ...]
+    min_volume: int
+    min_open_interest: int
+    max_spread_pct: float
+    iv_min: float
+    iv_max: float
+    scoring_version: str
+    safety_reject_stale: bool
+    safety_reject_invalid_quotes: bool
+    selection_version: str
+
+
+@dataclass(frozen=True)
 class GrowConfig:
     version: str
     timezone: str
@@ -199,6 +220,7 @@ class GrowConfig:
     tradingagents: TradingAgentsConfig
     data: DataConfig
     strategies: StrategiesConfig
+    options: OptionsConfig
     source_path: str
 
     def assert_safe(self) -> None:
@@ -231,6 +253,16 @@ class GrowConfig:
             raise GrowConfigError("2B primary_timeframe is locked to M15. M5/D1 are context only.")
         if tuple(self.strategies.supported_timeframes) != ("M5", "M15", "D1"):
             raise GrowConfigError("2B supported_timeframes must be M5, M15, D1.")
+        if self.data.allow_options_chain or self.options.allow_live_chain:
+            raise GrowConfigError("Live option chains are not attached.")
+        if self.options.provider != "fixture":
+            raise GrowConfigError("2C options.provider must be 'fixture'.")
+        if self.options.preferred_expiry_class != "weekly":
+            raise GrowConfigError("2C preferred_expiry_class is weekly.")
+        if self.options.allow_same_day:
+            raise GrowConfigError("2C forbids same-day expiry.")
+        if self.options.max_distance_from_atm < 0:
+            raise GrowConfigError("max_distance_from_atm must be >= 0")
 
 
 _DEFAULT_STRATEGY_SPECS: tuple[tuple[str, dict[str, Any]], ...] = (
@@ -280,6 +312,42 @@ def _strategy_specs(raw: dict[str, Any]) -> tuple[StrategySpec, ...]:
             )
         )
     return tuple(specs)
+
+
+def _options_config(raw: dict[str, Any]) -> OptionsConfig:
+    if not isinstance(raw, dict):
+        raise GrowConfigError("grow.options must be a mapping")
+    fresh = raw.get("freshness") or {}
+    expiry = raw.get("expiry") or {}
+    strikes = raw.get("strikes") or {}
+    liq = raw.get("liquidity") or {}
+    iv = raw.get("iv") or {}
+    scoring = raw.get("scoring") or {}
+    safety = raw.get("safety") or {}
+    moneyness = strikes.get("allowed_moneyness") or ["ATM", "ITM", "OTM"]
+    if not isinstance(moneyness, list):
+        raise GrowConfigError("options.strikes.allowed_moneyness must be a list")
+    return OptionsConfig(
+        enabled=_as_bool(raw.get("enabled", True), "options.enabled"),
+        provider=str(raw.get("provider", "fixture")).lower(),
+        allow_live_chain=_as_bool(raw.get("allow_live_chain", False), "options.allow_live_chain"),
+        max_chain_age_minutes=_as_int(fresh.get("max_chain_age_minutes", 5), "options.freshness.max_chain_age_minutes"),
+        allow_same_day=_as_bool(expiry.get("allow_same_day", False), "options.expiry.allow_same_day"),
+        preferred_expiry_class=str(expiry.get("preferred_expiry_class", "weekly")).lower(),
+        max_distance_from_atm=_as_int(strikes.get("max_distance_from_atm", 2), "options.strikes.max_distance_from_atm"),
+        allowed_moneyness=tuple(str(m).strip().upper() for m in moneyness),
+        min_volume=_as_int(liq.get("min_volume", 100), "options.liquidity.min_volume"),
+        min_open_interest=_as_int(liq.get("min_open_interest", 500), "options.liquidity.min_open_interest"),
+        max_spread_pct=_as_float(liq.get("max_spread_pct", 0.08), "options.liquidity.max_spread_pct"),
+        iv_min=_as_float(iv.get("min", 0.05), "options.iv.min"),
+        iv_max=_as_float(iv.get("max", 2.0), "options.iv.max"),
+        scoring_version=str(scoring.get("version", "v1")),
+        safety_reject_stale=_as_bool(safety.get("reject_stale_chain", True), "options.safety.reject_stale_chain"),
+        safety_reject_invalid_quotes=_as_bool(
+            safety.get("reject_invalid_quotes", True), "options.safety.reject_invalid_quotes"
+        ),
+        selection_version=str(raw.get("selection_version", "options.select.v1")),
+    )
 
 
 def _overlay_env(raw: dict[str, Any], environ: dict[str, str]) -> dict[str, Any]:
@@ -402,6 +470,7 @@ def _build(raw: dict[str, Any], source_path: str) -> GrowConfig:
             ),
             specs=specs,
         ),
+        options=_options_config(g.get("options") or {}),
         source_path=source_path,
     )
     config.assert_safe()
