@@ -35,7 +35,7 @@ class MarketTests(unittest.TestCase):
         self.assertEqual(cal.state(), SessionState.CLOSED)
         cal = SessionCalendar(config.market, clock=FrozenClock(datetime(2026, 9, 19, 12, 0, tzinfo=IST)))
         self.assertEqual(cal.state(), SessionState.WEEKEND)
-        cal = SessionCalendar(config.market, clock=FrozenClock(datetime(2026, 9, 1, 26, 12, 0, tzinfo=IST)))
+        cal = SessionCalendar(config.market, clock=FrozenClock(datetime(2026, 1, 26, 12, 0, tzinfo=IST)))
         self.assertEqual(cal.state(), SessionState.HOLIDAY)
 
     def test_deferred_desks_raise(self) -> None:
