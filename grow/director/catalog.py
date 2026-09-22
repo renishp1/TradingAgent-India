@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from typing import Mapping
 
@@ -212,3 +212,18 @@ def require_approved_for_2e(
     if source.qualification_status != "APPROVED_FOR_2E":
         raise GrowConfigError(f"NOT_APPROVED_FOR_2E:{dataset_id}")
     return source
+
+
+def consume_qualification(source: ApprovedDataSource, record) -> ApprovedDataSource:
+    if source.dataset_id != record.dataset_id:
+        raise GrowConfigError("QUALIFICATION_DATASET_MISMATCH")
+    if source.dataset_version != record.dataset_version:
+        raise GrowConfigError("QUALIFICATION_VERSION_MISMATCH")
+    if source.is_fixture or source.usage_scope == "FRAMEWORK_TEST_ONLY":
+        if record.approved_for_2e or record.qualification_status == "APPROVED_FOR_2E":
+            raise GrowConfigError("FRAMEWORK_TEST_ONLY cannot become APPROVED_FOR_2E")
+    return replace(
+        source,
+        qualification_status=record.qualification_status,
+        quality_warnings=record.quality_warnings,
+    )

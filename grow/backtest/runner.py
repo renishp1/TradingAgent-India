@@ -55,6 +55,25 @@ def build_manifest(
     provider_name: str | None = None,
 ) -> BacktestRunManifest:
     bt = config.backtest
+    fixture_run = (dataset_id or DATASET) == DATASET and (provider_name or "fixture") == "fixture"
+    if fixture_run:
+        mapping = mapping_policy or "EXACT"
+        tolerance = 0 if slot_tolerance_seconds is None else slot_tolerance_seconds
+        fingerprint_value = dataset_fingerprint or ""
+        provider = provider_name or "fixture"
+    else:
+        if not dataset_fingerprint:
+            raise GrowConfigError("MISSING_DATASET_FINGERPRINT")
+        if not provider_name:
+            raise GrowConfigError("MISSING_PROVIDER_NAME")
+        if not mapping_policy:
+            raise GrowConfigError("MISSING_MAPPING_POLICY")
+        if slot_tolerance_seconds is None:
+            raise GrowConfigError("MISSING_SLOT_TOLERANCE")
+        mapping = mapping_policy
+        tolerance = slot_tolerance_seconds
+        fingerprint_value = dataset_fingerprint
+        provider = provider_name
     required = {
         "dataset_id": dataset_id or DATASET,
         "dataset_version": dataset_version or DATASET,
@@ -74,10 +93,10 @@ def build_manifest(
         "strictness_mode": "strict" if bt.strict else "relaxed",
         "fill_model": bt.fill_model,
         "ablation": ablation,
-        "mapping_policy": mapping_policy or "EXACT",
-        "slot_tolerance_seconds": 0 if slot_tolerance_seconds is None else slot_tolerance_seconds,
-        "dataset_fingerprint": dataset_fingerprint or "",
-        "provider_name": provider_name or "fixture",
+        "mapping_policy": mapping,
+        "slot_tolerance_seconds": tolerance,
+        "dataset_fingerprint": fingerprint_value,
+        "provider_name": provider,
     }
     missing = [
         key
@@ -163,10 +182,18 @@ class BacktestRunner:
         sessions = self.calendar.sessions(start, end)
         ds_id = DATASET
         ds_ver = DATASET
+        extra = {}
         if self.market_source is not None:
             ds_id = self.market_source.meta().name
-            ds_ver = getattr(self.market_source, "store", None)
-            ds_ver = ds_ver.meta.version if ds_ver is not None else ds_id
+            store = getattr(self.market_source, "store", None)
+            ds_ver = store.meta.version if store is not None else ds_id
+            if store is not None:
+                extra = {
+                    "dataset_fingerprint": store.meta.fingerprint,
+                    "provider_name": store.meta.provider_name,
+                    "mapping_policy": store.meta.mapping_policy,
+                    "slot_tolerance_seconds": store.meta.slot_tolerance_seconds,
+                }
         manifest = build_manifest(
             cfg,
             start=start,
@@ -175,6 +202,7 @@ class BacktestRunner:
             calendar_version=self.calendar.version,
             dataset_id=ds_id,
             dataset_version=ds_ver,
+            **extra,
         )
         ledger = BacktestLedger(bt.starting_cash)
         hub = open_data_hub(cfg, source=self.market_source)

@@ -14,8 +14,14 @@ from grow.history.models import (
     ALLOWED_OPTION_TYPES,
     ALLOWED_UNDERLYINGS,
     APPROVED_FOR_2E,
+    BID_ASK_GAPS,
     CANDIDATE,
     FRAMEWORK_TEST_ONLY,
+    MISSING_IV,
+    MISSING_OI,
+    MISSING_SESSIONS,
+    MISSING_VOLUME,
+    OPTION_SNAPSHOT_GAPS,
     QUALIFIED,
     QUALIFIED_WITH_WARNINGS,
     REJECTED,
@@ -80,6 +86,7 @@ class ProviderEvaluationResult:
     qualification_status: str
     approved_for_2e: bool
     limitations: tuple[str, ...]
+    quality_warnings: tuple[str, ...] = ()
     schema: str = EVAL_SCHEMA
 
     def to_dict(self) -> dict[str, Any]:
@@ -96,10 +103,64 @@ class ProviderEvaluationResult:
             "qualification_status": self.qualification_status,
             "approved_for_2e": self.approved_for_2e,
             "limitations": list(self.limitations),
+            "quality_warnings": list(self.quality_warnings),
             "schema": self.schema,
             "live": False,
             "profitability_claim": False,
         }
+
+
+QUALIFICATION_SCHEMA = "dataset.qualification.v1"
+
+
+@dataclass(frozen=True)
+class DatasetQualificationRecord:
+    dataset_id: str
+    dataset_version: str
+    fingerprint: str
+    evaluation_schema: str
+    qualification_status: str
+    approved_for_2e: bool
+    limitations: tuple[str, ...]
+    quality_warnings: tuple[str, ...]
+    prior_status: str
+    checks: tuple[str, ...]
+    schema: str = QUALIFICATION_SCHEMA
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "dataset_id": self.dataset_id,
+            "dataset_version": self.dataset_version,
+            "fingerprint": self.fingerprint,
+            "evaluation_schema": self.evaluation_schema,
+            "qualification_status": self.qualification_status,
+            "approved_for_2e": self.approved_for_2e,
+            "limitations": list(self.limitations),
+            "quality_warnings": list(self.quality_warnings),
+            "prior_status": self.prior_status,
+            "checks": list(self.checks),
+            "schema": self.schema,
+            "live": False,
+        }
+
+
+def derive_quality_warnings(store: CanonicalStore) -> tuple[str, ...]:
+    report = store.coverage()
+    meta = store.meta
+    found: list[str] = []
+    if report.missing_sessions:
+        found.append(MISSING_SESSIONS)
+    if report.expected_quotes == 0 or report.quote_completeness < 1.0:
+        found.append(OPTION_SNAPSHOT_GAPS)
+    if meta.bid_ask_available and report.bid_ask_completeness < 1.0:
+        found.append(BID_ASK_GAPS)
+    if meta.oi_available and report.oi_completeness < 1.0:
+        found.append(MISSING_OI)
+    if meta.volume_available and report.volume_completeness < 1.0:
+        found.append(MISSING_VOLUME)
+    if meta.iv_available and report.iv_completeness < 1.0:
+        found.append(MISSING_IV)
+    return tuple(sorted(set(found) | set(meta.quality_warnings)))
 
 
 class ProviderEvaluationRunner:
@@ -118,7 +179,8 @@ class ProviderEvaluationRunner:
         checks.append(_calendar(store))
         checks.append(_provenance(store))
         checks.append(_replay(store))
-        checks.append(_coverage(store, limitations))
+        derived = derive_quality_warnings(store)
+        checks.append(_coverage(store, limitations, derived))
         pit = _pit(store)
         checks.append(pit)
 
@@ -157,7 +219,7 @@ class ProviderEvaluationRunner:
         warning_fail = any(not c.mandatory and c.outcome != "PASS" for c in checks)
         if mandatory_fail:
             status = REJECTED
-        elif warning_fail or meta.quality_warnings:
+        elif warning_fail or derived:
             status = QUALIFIED_WITH_WARNINGS
         else:
             status = QUALIFIED
@@ -186,6 +248,25 @@ class ProviderEvaluationRunner:
             qualification_status=status,
             approved_for_2e=approved,
             limitations=tuple(limitations),
+            quality_warnings=derived,
+        )
+
+    def qualify(self, store: CanonicalStore) -> DatasetQualificationRecord:
+        prior = store.meta.qualification_status or CANDIDATE
+        result = self.evaluate(store)
+        if store.meta.qualification_status != prior:
+            raise RuntimeError("evaluation must not mutate dataset qualification")
+        return DatasetQualificationRecord(
+            dataset_id=result.dataset_id,
+            dataset_version=result.dataset_version,
+            fingerprint=result.fingerprint,
+            evaluation_schema=result.schema,
+            qualification_status=result.qualification_status,
+            approved_for_2e=result.approved_for_2e,
+            limitations=result.limitations,
+            quality_warnings=result.quality_warnings,
+            prior_status=prior,
+            checks=tuple(f"{c.name}:{c.outcome}" for c in result.checks),
         )
 
 
@@ -253,11 +334,13 @@ def _replay(store: CanonicalStore) -> CheckResult:
     return CheckResult("REPLAY", "PASS", store.meta.fingerprint[:12], True)
 
 
-def _coverage(store: CanonicalStore, limitations: list[str]) -> CheckResult:
+def _coverage(store: CanonicalStore, limitations: list[str], derived: tuple[str, ...]) -> CheckResult:
     report = store.coverage()
-    if report.quote_completeness < 1.0:
-        limitations.append("OPTION_SNAPSHOT_GAPS")
-        return CheckResult("COVERAGE", "LIMITATION", f"quote_completeness={report.quote_completeness}", False)
+    for wid in derived:
+        if wid not in limitations:
+            limitations.append(wid)
+    if derived:
+        return CheckResult("COVERAGE", "LIMITATION", ",".join(derived), False)
     return CheckResult("COVERAGE", "PASS", f"quotes={report.observed_quotes}/{report.expected_quotes}", False)
 
 

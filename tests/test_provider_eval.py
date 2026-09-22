@@ -4,13 +4,14 @@ import unittest
 from datetime import date, datetime, time, timedelta
 from dataclasses import replace
 
+from grow.backtest.runner import build_manifest
 from grow.clock import IST
 from grow.config import load_config
-from grow.director.catalog import require_approved_for_2e, default_catalog, ApprovedDataSource
+from grow.director.catalog import ApprovedDataSource, consume_qualification, default_catalog, require_approved_for_2e
 from grow.director.validate import ResearchPlanValidator
 from grow.errors import GrowConfigError
 from grow.history.bridge import HistoricalMarketSource, HistoricalOptionSource
-from grow.history.eval import ProviderEvaluationRunner
+from grow.history.eval import ProviderEvaluationRunner, derive_quality_warnings
 from grow.history.eval_sample import (
     EVAL_ID,
     MONTHLY,
@@ -22,15 +23,20 @@ from grow.history.eval_sample import (
 from grow.history.expiry import select_nearest_weekly_expiry, universe_at
 from grow.history.models import (
     APPROVED_FOR_2E,
+    CANDIDATE,
     FRAMEWORK_TEST_ONLY,
+    OPTION_SNAPSHOT_GAPS,
+    QUALIFIED_WITH_WARNINGS,
     HistoricalOptionContract,
     HistoricalOptionQuote,
 )
 from grow.history.provider import export_vendor_payload, ingest_vendor_payload
 from grow.history.sample import SAMPLE_ID
+from grow.history.store import CanonicalStore
 from grow.options.select import choose_expiry
 from grow.types import SessionState
 from tests.test_director import _valid_plan
+from tests.test_history import _meta, _session
 
 
 def _ts(day: date, hh: int, mm: int) -> datetime:
@@ -212,8 +218,6 @@ class HarnessAndVendorTests(unittest.TestCase):
         self.assertGreater(snap.last_price, 0)
 
     def test_2e_manifest_records_mapping(self) -> None:
-        from grow.backtest.runner import build_manifest
-
         store = build_eval_store()
         man = build_manifest(
             load_config(),
@@ -232,6 +236,135 @@ class HarnessAndVendorTests(unittest.TestCase):
         self.assertEqual(man.slot_tolerance_seconds, 0)
         self.assertEqual(man.dataset_fingerprint, store.meta.fingerprint)
         self.assertEqual(man.provider_name, "grow-eval-sample")
+
+    def test_historical_manifest_requires_fingerprint(self) -> None:
+        with self.assertRaises(GrowConfigError) as ctx:
+            build_manifest(
+                load_config(),
+                start=date(2026, 9, 14),
+                end=date(2026, 9, 18),
+                ablation="full",
+                dataset_id="vendor.nifty.v1",
+                dataset_version="v1",
+                provider_name="vendor",
+                mapping_policy="EXACT",
+                slot_tolerance_seconds=0,
+            )
+        self.assertIn("MISSING_DATASET_FINGERPRINT", str(ctx.exception))
+        fixture = build_manifest(load_config(), start=date(2026, 9, 21), end=date(2026, 9, 21), ablation="full")
+        self.assertEqual(fixture.provider_name, "fixture")
+        self.assertEqual(fixture.dataset_fingerprint, "")
+
+    def test_vendor_quote_fields_roundtrip(self) -> None:
+        store = build_eval_store()
+        before = [q.to_dict() for q in sorted(store.all_quotes(), key=lambda q: (q.contract_id, q.timestamp.isoformat()))]
+        payload = export_vendor_payload(store)
+        loaded = ingest_vendor_payload(payload, meta=replace(store.meta, fingerprint="pending"))
+        after = [q.to_dict() for q in sorted(loaded.all_quotes(), key=lambda q: (q.contract_id, q.timestamp.isoformat()))]
+        self.assertEqual(before, after)
+        self.assertTrue(any(q["previous_open_interest"] is not None for q in after))
+        self.assertTrue(any(q["iv_source"] == "PROVIDER" for q in after))
+        self.assertTrue(all(q["as_of_available_at"] for q in after))
+
+    def test_derived_warnings_ignore_empty_meta_list(self) -> None:
+        store = CanonicalStore(
+            _meta(
+                instrument_scope=("NIFTY", "BANKNIFTY"),
+                snapshot_cadence=("11:00", "15:15"),
+                quality_warnings=(),
+                iv_available=False,
+            )
+        )
+        store.add_session(_session())
+        first = datetime(2026, 9, 21, 9, 15, tzinfo=IST)
+        last = datetime(2026, 9, 22, 15, 30, tzinfo=IST)
+        ts = datetime(2026, 9, 21, 11, 0, tzinfo=IST)
+        for symbol in ("NIFTY", "BANKNIFTY"):
+            for kind in ("CE", "PE"):
+                cid = f"{symbol}-25000-{kind}"
+                store.add_contract(
+                    HistoricalOptionContract(
+                        underlying=symbol,
+                        expiry=date(2026, 9, 22),
+                        strike=25000,
+                        option_type=kind,
+                        contract_id=cid,
+                        provider_contract_id=cid,
+                        lot_size=75,
+                        expiry_class="WEEKLY",
+                        first_seen_at=first,
+                        last_seen_at=last,
+                        listing_status="ACTIVE",
+                        source_id="t",
+                        dataset_version="v1",
+                    )
+                )
+                store.add_quote(
+                    HistoricalOptionQuote(
+                        contract_id=cid,
+                        timestamp=ts,
+                        bid=10,
+                        ask=11,
+                        ltp=10.5,
+                        volume=1,
+                        open_interest=1,
+                        previous_open_interest=None,
+                        implied_volatility=None,
+                        delta=None,
+                        gamma=None,
+                        theta=None,
+                        vega=None,
+                        greek_source=None,
+                        iv_source=None,
+                        source_id="t",
+                        dataset_version="v1",
+                        as_of_available_at=ts,
+                        quality_flags=(),
+                    )
+                )
+        self.assertEqual(store.meta.quality_warnings, ())
+        self.assertIn(OPTION_SNAPSHOT_GAPS, derive_quality_warnings(store))
+        store.publish()
+        result = ProviderEvaluationRunner().evaluate(store)
+        self.assertIn(OPTION_SNAPSHOT_GAPS, result.quality_warnings)
+
+    def test_qualification_record_does_not_mutate_store(self) -> None:
+        store = build_eval_store()
+        self.assertEqual(store.meta.qualification_status, CANDIDATE)
+        record = ProviderEvaluationRunner().qualify(store)
+        self.assertEqual(store.meta.qualification_status, CANDIDATE)
+        self.assertEqual(record.prior_status, CANDIDATE)
+        self.assertFalse(record.approved_for_2e)
+        self.assertNotEqual(record.qualification_status, APPROVED_FOR_2E)
+        fixture_src = default_catalog()[SAMPLE_ID]
+        with self.assertRaises(GrowConfigError):
+            consume_qualification(
+                fixture_src,
+                replace(
+                    record,
+                    dataset_id=SAMPLE_ID,
+                    dataset_version=fixture_src.dataset_version,
+                    approved_for_2e=True,
+                    qualification_status=APPROVED_FOR_2E,
+                ),
+            )
+        updated = consume_qualification(
+            replace(
+                fixture_src,
+                dataset_id=record.dataset_id,
+                dataset_version=record.dataset_version,
+                usage_scope="HISTORICAL_RESEARCH",
+                is_fixture=False,
+                licensing_status="APPROVED",
+                quality_status="APPROVED",
+            ),
+            record,
+        )
+        self.assertEqual(updated.qualification_status, record.qualification_status)
+        self.assertNotEqual(updated.qualification_status, APPROVED_FOR_2E)
+        with self.assertRaises(GrowConfigError) as ctx:
+            require_approved_for_2e({updated.dataset_id: updated}, updated.dataset_id)
+        self.assertIn("NOT_APPROVED_FOR_2E", str(ctx.exception))
 
     def test_2f_rejects_framework_sample_for_2e(self) -> None:
         cat = default_catalog()
