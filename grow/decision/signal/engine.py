@@ -297,7 +297,10 @@ def _parse_int(value: Any) -> int | None:
 
 
 def _candidate_from_agent(row: AgentResult) -> StrategyCandidate | None:
-    """Build a StrategyCandidate from agent metrics. All metric parsing fails closed."""
+    """Build a StrategyCandidate from agent metrics. All metric parsing fails closed.
+
+    Only parser outputs (never raw metric values) are passed into StrategyCandidate.
+    """
     metrics = dict(row.calculated_metrics or {})
     direction = str(metrics.get("direction") or "").strip().upper()
     instrument = (row.candidate_instrument or "").strip()
@@ -309,42 +312,39 @@ def _candidate_from_agent(row: AgentResult) -> StrategyCandidate | None:
 
     if "limit_price" not in metrics or "stop_loss" not in metrics:
         return None
-    limit_price = _parse_float(metrics.get("limit_price"))
-    stop_loss = _parse_float(metrics.get("stop_loss"))
-    if limit_price is None or stop_loss is None:
+    parsed_limit = _parse_float(metrics.get("limit_price"))
+    parsed_stop = _parse_float(metrics.get("stop_loss"))
+    if parsed_limit is None or parsed_stop is None:
         return None
 
     if "quantity" in metrics:
-        quantity = _parse_int(metrics.get("quantity"))
+        parsed_quantity = _parse_int(metrics.get("quantity"))
     elif "lots" in metrics:
-        quantity = _parse_int(metrics.get("lots"))
+        parsed_quantity = _parse_int(metrics.get("lots"))
     else:
         return None
-    if quantity is None or quantity < 1:
+    if parsed_quantity is None or parsed_quantity < 1:
         return None
 
-    strike_raw = metrics.get("strike")
-    if strike_raw is None:
-        strike: float | None = None
+    if metrics.get("strike") is None:
+        parsed_strike: float | None = None
     else:
-        strike = _parse_float(strike_raw)
-        if strike is None:
+        parsed_strike = _parse_float(metrics.get("strike"))
+        if parsed_strike is None:
             return None
 
-    target_raw = metrics.get("target")
-    if target_raw is None:
-        target: float | None = None
+    if metrics.get("target") is None:
+        parsed_target: float | None = None
     else:
-        target = _parse_float(target_raw)
-        if target is None:
+        parsed_target = _parse_float(metrics.get("target"))
+        if parsed_target is None:
             return None
 
-    lot_size_raw = metrics.get("lot_size")
-    if lot_size_raw is None:
-        lot_size: int | None = None
+    if metrics.get("lot_size") is None:
+        parsed_lot_size: int | None = None
     else:
-        lot_size = _parse_int(lot_size_raw)
-        if lot_size is None:
+        parsed_lot_size = _parse_int(metrics.get("lot_size"))
+        if parsed_lot_size is None:
             return None
 
     option_type = metrics.get("option_type")
@@ -354,25 +354,25 @@ def _candidate_from_agent(row: AgentResult) -> StrategyCandidate | None:
             option_type = token
 
     expiry = metrics.get("expiry")
-    confidence = 0.0
-    if row.confidence is not None:
+    if row.confidence is None:
+        parsed_confidence = 0.0
+    else:
         parsed_confidence = _parse_float(row.confidence)
         if parsed_confidence is None:
             return None
-        confidence = parsed_confidence
 
     return StrategyCandidate(
         strategy=str(metrics.get("strategy") or row.agent_name),
         instrument=instrument,
         underlying=underlying,
         direction=direction,
-        limit_price=limit_price,
-        stop_loss=stop_loss,
-        quantity=quantity,
-        confidence=confidence,
+        limit_price=parsed_limit,
+        stop_loss=parsed_stop,
+        quantity=parsed_quantity,
+        confidence=parsed_confidence,
         option_type=None if option_type is None else str(option_type).upper(),
-        strike=strike,
+        strike=parsed_strike,
         expiry=None if expiry is None else str(expiry),
-        target=target,
-        lot_size=lot_size,
+        target=parsed_target,
+        lot_size=parsed_lot_size,
     )
