@@ -15,9 +15,11 @@ from grow.backtest.pipeline import DecisionPipeline
 from grow.backtest.simulate import ExecutionSimulator
 from grow.config import GrowConfig, load_config
 from grow.data.factory import open_data_hub
+from grow.data.source import MarketDataSource
 from grow.errors import GrowConfigError
 from grow.options.engine import IndexOptionsEngine
 from grow.options.fixture import open_option_source
+from grow.options.source import OptionChainSource
 from grow.research.models import DECISION_SCHEMA, PACKET_SCHEMA
 from grow.research.orchestrator import ResearchOrchestrator
 from grow.strategies.engine import StrategyEngine
@@ -45,11 +47,13 @@ def build_manifest(
     end: date,
     ablation: str,
     calendar_version: str | None = None,
+    dataset_id: str | None = None,
+    dataset_version: str | None = None,
 ) -> BacktestRunManifest:
     bt = config.backtest
     required = {
-        "dataset_id": DATASET,
-        "dataset_version": DATASET,
+        "dataset_id": dataset_id or DATASET,
+        "dataset_version": dataset_version or DATASET,
         "calendar_version": calendar_version or CALENDAR_VERSION,
         "code_commit": _commit() or "workspace",
         "config_version": config.version,
@@ -106,7 +110,14 @@ class BacktestResult:
 
 
 class BacktestRunner:
-    def __init__(self, config: GrowConfig | None = None, *, calendar: SessionCalendar | None = None) -> None:
+    def __init__(
+        self,
+        config: GrowConfig | None = None,
+        *,
+        calendar: SessionCalendar | None = None,
+        market_source: MarketDataSource | None = None,
+        option_source: OptionChainSource | None = None,
+    ) -> None:
         self.config = config or load_config()
         bt = self.config.backtest
         if bt.provider != "fixture":
@@ -118,10 +129,10 @@ class BacktestRunner:
         if bt.calibrate_on_test:
             raise GrowConfigError("TEST_WINDOW_TUNING")
         if calendar is None:
-            if bt.provider != "fixture":
-                raise GrowConfigError("historical runs require ExplicitSessionCalendar")
             calendar = WeekdayFixtureCalendar()
         self.calendar = calendar
+        self.market_source = market_source
+        self.option_source = option_source
 
     def run(
         self,
@@ -138,16 +149,28 @@ class BacktestRunner:
         bt = cfg.backtest
         names = underlyings or cfg.strategies.universe
         sessions = self.calendar.sessions(start, end)
+        ds_id = DATASET
+        ds_ver = DATASET
+        if self.market_source is not None:
+            ds_id = self.market_source.meta().name
+            ds_ver = getattr(self.market_source, "store", None)
+            ds_ver = ds_ver.meta.version if ds_ver is not None else ds_id
         manifest = build_manifest(
-            cfg, start=start, end=end, ablation=ablation, calendar_version=self.calendar.version
+            cfg,
+            start=start,
+            end=end,
+            ablation=ablation,
+            calendar_version=self.calendar.version,
+            dataset_id=ds_id,
+            dataset_version=ds_ver,
         )
         ledger = BacktestLedger(bt.starting_cash)
-        hub = open_data_hub(cfg)
+        hub = open_data_hub(cfg, source=self.market_source)
         pipeline = DecisionPipeline(
             hub=hub,
             strategies=StrategyEngine(cfg),
             options=IndexOptionsEngine(cfg),
-            chains=open_option_source(),
+            chains=self.option_source or open_option_source(),
             research=ResearchOrchestrator(cfg),
             simulator=ExecutionSimulator(
                 SlippageModel(bt.slippage_bps, stress=slip_stress),

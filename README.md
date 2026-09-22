@@ -30,6 +30,7 @@ Milestone 2C is the index-options research engine ([`docs/options.md`](docs/opti
 Milestone 2D is AI research / CEODecision ([`docs/research.md`](docs/research.md)).
 Milestone 2E is fixture backtest + walk-forward ([`docs/backtest.md`](docs/backtest.md)).
 Milestone 2F is the research director ([`docs/director.md`](docs/director.md)).
+Milestone 2G is point-in-time historical data ([`docs/history.md`](docs/history.md)).
 Do not attach a vendor feed, live option chain, or broker.
 
 
@@ -43,6 +44,7 @@ TradingAgent-India/
 │   ├── research/           # 2D fixture AI research / CEODecision
 │   ├── backtest/           # 2E fixture replay + walk-forward
 │   ├── director/           # 2F research plan / freeze / review
+│   ├── history/            # 2G point-in-time historical data
 │   ├── market/
 │   ├── options/            # 2C fixture chain; BUY CE/PE research only
 │   ├── strategies/         # 2B quant engine (signals only)

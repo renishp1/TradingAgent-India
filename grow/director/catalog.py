@@ -59,7 +59,7 @@ class ApprovedDataSource:
         }
 
 
-def default_catalog() -> dict[str, ApprovedDataSource]:
+def _base_catalog() -> dict[str, ApprovedDataSource]:
     fixture = ApprovedDataSource(
         dataset_id=FIXTURE_DATASET,
         provider="fixture",
@@ -101,6 +101,34 @@ def default_catalog() -> dict[str, ApprovedDataSource]:
         provenance="rejection-stub",
     )
     return {fixture.dataset_id: fixture, stub.dataset_id: stub}
+
+
+def default_catalog() -> dict[str, ApprovedDataSource]:
+    cat = _base_catalog()
+    from grow.history.registry import default_registry
+
+    for row in default_registry().catalog_rows():
+        cat[row["dataset_id"]] = ApprovedDataSource(
+            dataset_id=row["dataset_id"],
+            provider=row["provider"],
+            instrument_scope=tuple(row["instrument_scope"]),
+            date_coverage=row["date_coverage"],
+            timestamp_granularity=tuple(row["timestamp_granularity"]),
+            timezone=row["timezone"],
+            option_chain_depth=row["option_chain_depth"],
+            bid_ask_available=row["bid_ask_available"],
+            oi_available=row["oi_available"],
+            volume_available=row["volume_available"],
+            iv_available=row["iv_available"],
+            greeks_available=row["greeks_available"],
+            historical_contract_metadata=row["historical_contract_metadata"],
+            session_calendar_version=row["session_calendar_version"],
+            quality_status=row["quality_status"],
+            licensing_status=row["licensing_status"],
+            dataset_version=row["dataset_version"],
+            provenance=row["provenance"],
+        )
+    return cat
 
 
 def require_approved(catalog: Mapping[str, ApprovedDataSource], dataset_id: str) -> ApprovedDataSource:

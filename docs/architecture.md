@@ -182,6 +182,16 @@ HOLD | REJECT | (ACCEPT_FOR_PAPER not issued on fixture)
 
 Governance only. See [`director.md`](director.md).
 
+## Historical data (Milestone 2G)
+
+```
+CanonicalStore → PIT snapshots → 2E / 2F catalog
+======== STOP 2G ========
+```
+
+Provider-neutral. Sample dataset only until a licensed feed is reviewed.
+See [`history.md`](history.md).
+
 ## Modules
 
 | Path | Status | Responsibility |
@@ -194,6 +204,7 @@ Governance only. See [`director.md`](director.md).
 | `grow/research/` | **2D engine** | Fixture agents; TRADE_APPROVE or NO_TRADE |
 | `grow/backtest/` | **2E fixture framework** | Replay + costs + walk-forward. Not a profit study |
 | `grow/director/` | **2F research director** | Plan/freeze/review. Not execution |
+| `grow/history/` | **2G PIT historical data** | Registry, calendar, chain snapshots |
 | `grow/market/` | **implemented (stub quotes)** | Brief + NSE session/square-off clock |
 | `grow/risk/` | **implemented** | Deterministic guard + HMAC stamp (secret required) |
 | `grow/paper/` | **implemented** | In-memory long-only ledger |
