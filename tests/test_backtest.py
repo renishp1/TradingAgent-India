@@ -7,6 +7,9 @@ from datetime import date, datetime, timedelta
 
 from grow.backtest.calendar import ExplicitSessionCalendar, WeekdayFixtureCalendar, weekday_sessions
 from grow.backtest.costs import CostModel, SlippageModel, contract_pnl
+from grow.backtest.ledger import BacktestLedger
+from grow.backtest.metrics import assess_leakage
+from grow.backtest.models import DecisionRow
 from grow.backtest.pipeline import _path_exit, resolve_ceo
 from grow.backtest.runner import BacktestRunner, build_manifest
 from grow.backtest.simulate import ExecutionSimulator
@@ -173,6 +176,18 @@ class BacktestTests(unittest.TestCase):
         cheap = CostModel().round_trip(entry=100, exit=110, quantity=1, lot_size=1)
         dear = CostModel().round_trip(entry=100, exit=110, quantity=1, lot_size=75)
         self.assertGreater(dear, cheap)
+
+    def test_assess_leakage_status(self) -> None:
+        empty = BacktestLedger()
+        self.assertEqual(assess_leakage(empty, complete=False), "UNKNOWN")
+        as_of = datetime(2026, 9, 21, 11, 0, tzinfo=IST)
+        clean = BacktestLedger()
+        clean.record_decision(DecisionRow(as_of, "NIFTY", "NO_TRADE", "NO_SIGNAL", None, None, None, "full"))
+        self.assertEqual(assess_leakage(clean, complete=True), "CLEAN")
+        leak = BacktestLedger()
+        leak.record_decision(DecisionRow(as_of, "NIFTY", "NO_TRADE", "LOOKAHEAD_CHAIN", None, None, None, "full"))
+        self.assertEqual(assess_leakage(leak, complete=True), "LEAKAGE")
+
 
     def test_recorded_ceo_drives_decision(self) -> None:
         from grow.research.orchestrator import ResearchOrchestrator

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
+from grow.clock import IST, Clock
 from grow.config import GrowConfig, load_config
 from grow.director.capabilities import (
     DEFAULT_ACCEPTANCE,
@@ -20,7 +21,6 @@ from grow.director.models import (
     FROZEN,
     HOLD,
     READY,
-    REFINE,
     REJECT,
     DirectorAudit,
     ResearchPlan,
@@ -33,6 +33,21 @@ from grow.errors import GrowConfigError
 
 DIRECTOR_VERSION = "research.director.fixture.v1"
 PROMPT_VERSION = "director.plan.v1"
+LOGICAL_ORIGIN = datetime(2026, 1, 1, 8, 0, tzinfo=IST)
+
+
+class LogicalClock(Clock):
+    """Deterministic fixture clock. Not wall time. Not the research period start."""
+
+    def __init__(self, when: datetime | None = None) -> None:
+        self._when = when or LOGICAL_ORIGIN
+
+    def now(self) -> datetime:
+        return self._when
+
+    def set(self, when: datetime) -> None:
+        self._when = when
+
 
 
 def _windows(start: date, end: date, embargo: int) -> tuple[WindowSpec, WindowSpec, WindowSpec]:
@@ -53,7 +68,7 @@ def _plan_id(plan: ResearchPlan) -> str:
 
 
 class FixtureDirector:
-    def __init__(self, config: GrowConfig | None = None) -> None:
+    def __init__(self, config: GrowConfig | None = None, *, clock: Clock | None = None) -> None:
         self.config = config or load_config()
         rd = self.config.research_director
         if rd.provider != "fixture":
@@ -62,12 +77,19 @@ class FixtureDirector:
             raise GrowConfigError("2F director may not enable broker, live, or paper execution.")
         if rd.allow_ledger_write or rd.allow_risk_config_write:
             raise GrowConfigError("2F director may not write ledger or Risk Guard.")
+        self.clock = clock or LogicalClock()
         self.catalog = default_catalog()
         self.validator = ResearchPlanValidator()
         self.audit: list[DirectorAudit] = []
         self.plans: dict[str, ResearchPlan] = {}
         self.reviews: dict[str, ResearchReview] = {}
         self._test_seen: set[str] = set()
+
+    def _require(self, *, enabled: bool | None = None, flag: bool | None = None, code: str) -> None:
+        if enabled is False or (enabled is None and not self.config.research_director.enabled):
+            raise GrowConfigError("DIRECTOR_DISABLED")
+        if flag is False:
+            raise GrowConfigError(code)
 
     def plan(
         self,
@@ -81,6 +103,8 @@ class FixtureDirector:
         granularity: str = "M15",
         parent_plan_id: str | None = None,
     ) -> ResearchPlan:
+        rd = self.config.research_director
+        self._require(enabled=rd.enabled, flag=rd.allow_plan_creation, code="PLAN_CREATION_DISABLED")
         embargo = self.config.backtest.embargo_sessions
         calendar = self.catalog[dataset_id].session_calendar_version if dataset_id in self.catalog else "unknown"
         try:
@@ -91,6 +115,7 @@ class FixtureDirector:
             validate = WindowSpec(start, start)
             test = WindowSpec(end, end)
             status = DRAFT
+        created = self.clock.now().isoformat()
         draft = ResearchPlan(
             plan_id="pending",
             parent_plan_id=parent_plan_id,
@@ -116,7 +141,7 @@ class FixtureDirector:
             test_freeze_at=None,
             owner_role="CEO_RESEARCH_DIRECTOR",
             plan_schema_version="research.plan.v1",
-            created_at=start.isoformat(),
+            created_at=created,
             status=status,
             freeze_hash=None,
             prompt_version=PROMPT_VERSION,
@@ -129,13 +154,15 @@ class FixtureDirector:
         return plan
 
     def freeze(self, plan: ResearchPlan) -> ResearchPlan:
+        rd = self.config.research_director
+        self._require(enabled=rd.enabled, flag=rd.allow_plan_freeze, code="PLAN_FREEZE_DISABLED")
         if plan.status == FROZEN and plan.freeze_hash:
             raise GrowConfigError("FROZEN_PLAN_IMMUTABLE")
         validated = self.validator.validate(plan, self.catalog)
         frozen = replace(
             validated.plan,
             status=FROZEN,
-            test_freeze_at=validated.plan.historical_period.start.isoformat(),
+            test_freeze_at=self.clock.now().isoformat(),
             freeze_hash=validated.plan.fingerprint(),
         )
         if frozen.plan_id != plan.plan_id:
@@ -145,6 +172,8 @@ class FixtureDirector:
         return frozen
 
     def review(self, plan: ResearchPlan, result: ResearchResult) -> ResearchReview:
+        rd = self.config.research_director
+        self._require(enabled=rd.enabled, flag=rd.allow_result_review, code="RESULT_REVIEW_DISABLED")
         if plan.status != FROZEN:
             raise GrowConfigError("TEST_BLIND_UNTIL_FROZEN")
         if result.plan_id != plan.plan_id or result.freeze_hash != plan.freeze_hash:
@@ -155,10 +184,18 @@ class FixtureDirector:
         failures: list[str] = []
         status = HOLD
         rationale = "Fixture dataset is not historical PIT validation. HOLD pending approved historical data."
-        if result.leakage_status != "CLEAN":
+        if result.leakage_status == "LEAKAGE":
             status = REJECT
             failures.append("LEAKAGE")
             rationale = "Leakage flag present. REJECT."
+        elif result.leakage_status == "UNKNOWN":
+            status = REJECT
+            failures.append("UNKNOWN_LEAKAGE")
+            rationale = "UNKNOWN leakage is not a clean research result. REJECT."
+        elif result.leakage_status != "CLEAN":
+            status = REJECT
+            failures.append(f"LEAKAGE_STATUS:{result.leakage_status}")
+            rationale = "Unrecognized leakage status. REJECT."
         elif not result.coverage_complete:
             status = REJECT
             failures.append("INCOMPLETE_COVERAGE")
@@ -184,7 +221,7 @@ class FixtureDirector:
             rationale=rationale,
             next_research_question="Acquire an approved point-in-time historical option-chain dataset.",
             reviewer_version=DIRECTOR_VERSION,
-            created_at=plan.created_at,
+            created_at=self.clock.now().isoformat(),
         )
         self.reviews[plan.plan_id] = review
         self._audit(plan, "REVIEW", status)
@@ -228,6 +265,6 @@ class FixtureDirector:
                 decision=decision,
                 rationale=rationale,
                 freeze_hash=plan.freeze_hash,
-                created_at=plan.created_at,
+                created_at=self.clock.now().isoformat(),
             )
         )

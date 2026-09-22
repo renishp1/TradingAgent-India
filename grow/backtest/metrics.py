@@ -15,6 +15,15 @@ def _drawdown(equity: list[tuple[str, float]]) -> float:
     return round(max_dd, 4)
 
 
+def assess_leakage(ledger: BacktestLedger, *, complete: bool) -> str:
+    """2E leakage status. Coordinator must not invent CLEAN."""
+    if any(row.reason.startswith("LOOKAHEAD") for row in ledger.decisions):
+        return "LEAKAGE"
+    if not complete or not ledger.decisions:
+        return "UNKNOWN"
+    return "CLEAN"
+
+
 def calculate(ledger: BacktestLedger) -> dict:
     trades = ledger.primary_trades
     decisions = ledger.decisions

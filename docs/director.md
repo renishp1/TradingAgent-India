@@ -35,10 +35,16 @@ next_plan()  new plan_id
 | 2E run | `BacktestCoordinator.run(frozen_plan)` after freeze |
 | Fixture review | **never** `ACCEPT_FOR_PAPER` |
 | Permissions | broker/live/paper/ledger/Risk Guard writes all false |
+| Operation flags | `enabled`, `allow_plan_creation`, `allow_plan_freeze`, `allow_result_review` |
 | Test visibility | blind until freeze |
+| Leakage | from 2E: `CLEAN` / `LEAKAGE` / `UNKNOWN` — coordinator does not invent CLEAN |
+| Timestamps | `created_at` = plan event (injected clock); `test_freeze_at` = freeze event |
 
 `ACCEPT_FOR_PAPER` means “eligible for a later paper-evaluation milestone”,
 not live trading. It is not issued against synthetic fixture data.
+
+Coordinator runs the frozen **test_window** (and records train/validate/embargo/config
+from the plan). It does not substitute global 2E walk-forward defaults.
 
 ## Freeze / blindness
 

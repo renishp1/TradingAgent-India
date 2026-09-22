@@ -9,7 +9,7 @@ from typing import Any
 from grow.backtest.calendar import CALENDAR_VERSION, DECISION_TIME, SessionCalendar, WeekdayFixtureCalendar, at_session
 from grow.backtest.costs import CostModel, SlippageModel
 from grow.backtest.ledger import BacktestLedger
-from grow.backtest.metrics import calculate, stress_note
+from grow.backtest.metrics import assess_leakage, calculate, stress_note
 from grow.backtest.models import EXEC_MODEL, BacktestRunManifest, fingerprint_for
 from grow.backtest.pipeline import DecisionPipeline
 from grow.backtest.simulate import ExecutionSimulator
@@ -89,6 +89,7 @@ class BacktestResult:
     metrics: dict[str, Any]
     stress: tuple[dict, ...]
     coverage: dict[str, Any]
+    leakage_status: str
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -96,6 +97,7 @@ class BacktestResult:
             "metrics": self.metrics,
             "stress": list(self.stress),
             "coverage": self.coverage,
+            "leakage_status": self.leakage_status,
             "trades": [t.to_dict() for t in self.ledger.primary_trades],
             "decisions": [d.to_dict() for d in self.ledger.decisions],
             "equity": list(self.ledger.equity),
@@ -179,4 +181,5 @@ class BacktestRunner:
             "complete": len(ledger.decisions) == expected,
             "dataset": DATASET,
         }
-        return BacktestResult(manifest, ledger, metrics, tuple(stress_rows), coverage)
+        leakage = assess_leakage(ledger, complete=bool(coverage["complete"]))
+        return BacktestResult(manifest, ledger, metrics, tuple(stress_rows), coverage, leakage)
