@@ -208,7 +208,7 @@ def evaluate_policy(
             accepted=tuple(accepted),
         )
 
-    candidate, candidate_reasons = _candidate_from(actionable)
+    candidate, candidate_reasons = _candidate_from(actionable, snapshot=snapshot)
     if candidate is None:
         gates.append(("strategy_candidate", False, candidate_reasons[0]))
         return _closed(
@@ -366,10 +366,25 @@ def _conflict_strings(
 
 def _candidate_from(
     actionable: list[AgentResult],
+    *,
+    snapshot: AgentMarketSnapshot,
 ) -> tuple[StrategyCandidate | None, tuple[str, ...]]:
     merged: dict[str, Any] = {}
     conflicts: list[str] = []
-    keys = ("strategy", "direction", "underlying", "limit_price", "stop_loss", "quantity")
+    keys = (
+        "strategy",
+        "direction",
+        "underlying",
+        "limit_price",
+        "stop_loss",
+        "quantity",
+        "target",
+        "take_profit",
+        "lot_size",
+        "strike",
+        "expiry",
+        "option_type",
+    )
     for row in actionable:
         for key in keys:
             if key not in row.calculated_metrics:
@@ -406,6 +421,45 @@ def _candidate_from(
         return None, ("AGENT_CONFLICT", suffix_conflict)
     confidences = [row.confidence for row in actionable if row.confidence is not None]
     confidence = min(confidences) if confidences else 0.0
+
+    target = _as_float(merged.get("target"))
+    if target is None:
+        target = _as_float(merged.get("take_profit"))
+    lot_size = merged.get("lot_size")
+    if isinstance(lot_size, bool) or (lot_size is not None and not isinstance(lot_size, int)):
+        return None, ("INCOMPLETE_CANDIDATE",)
+    if isinstance(lot_size, int) and lot_size < 1:
+        return None, ("INCOMPLETE_CANDIDATE",)
+
+    option_type = merged.get("option_type")
+    strike = _as_float(merged.get("strike"))
+    expiry = merged.get("expiry")
+    if expiry is not None and not isinstance(expiry, str):
+        expiry = str(expiry)
+
+    # Lazy import: grow.paper.__init__ pulls the engine which imports this policy.
+    from grow.paper.quotes import match_contract
+
+    quote = match_contract(snapshot, instrument, str(underlying).strip().upper())
+    if quote is not None:
+        option_type = quote.option_type
+        strike = float(quote.strike)
+        expiry = quote.expiry.isoformat()
+        if lot_size is None and quote.lot_size is not None:
+            lot_size = int(quote.lot_size)
+    elif option_type is None:
+        upper = instrument.upper()
+        if upper.endswith("-CE"):
+            option_type = "CE"
+        elif upper.endswith("-PE"):
+            option_type = "PE"
+
+    if option_type is not None and option_type not in {"CE", "PE"}:
+        return None, ("INCOMPLETE_CANDIDATE",)
+    # Option-shaped instruments must resolve strike/expiry for Phase-4 provenance.
+    if option_type in {"CE", "PE"} and (strike is None or strike <= 0 or not expiry):
+        return None, ("INCOMPLETE_CANDIDATE",)
+
     return (
         StrategyCandidate(
             strategy=strategy.strip(),
@@ -416,6 +470,11 @@ def _candidate_from(
             stop_loss=stop,
             quantity=quantity,
             confidence=confidence,
+            option_type=None if option_type is None else str(option_type),
+            strike=strike,
+            expiry=None if expiry is None else str(expiry),
+            target=target,
+            lot_size=lot_size,
         ),
         (),
     )

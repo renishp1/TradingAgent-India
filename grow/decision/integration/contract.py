@@ -4,6 +4,10 @@ Status values are the existing project outcomes plus the 4C safety block:
 NO_TRADE and CANDIDATE already exist on ``grow.options.models.DecisionStatus``.
 BLOCKED is the Risk Guard rejection outcome required by 4C. CANDIDATE is a
 paper-trade candidate (the requirement's TRADE_CANDIDATE). It is not an order.
+
+Phase 4 adds the deterministic Decision Engine surface:
+``DecisionAction`` is BUY_CE | BUY_PE | NO_TRADE, and ``TradeCandidate`` carries
+full option provenance (strike/expiry/stop/target/package digest/agent versions).
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 
-DECISION_SCHEMA = "grow.decision.integration.v1"
+DECISION_SCHEMA = "grow.decision.integration.v2"
 
 REQUIRED_DECISION_FIELDS = (
     "decision_id",
@@ -35,6 +39,8 @@ REQUIRED_DECISION_FIELDS = (
     "supporting_findings",
     "conflicting_findings",
     "status",
+    "action",
+    "trade_candidate",
     "reason_codes",
     "risk_guard_result",
     "risk_guard_reason",
@@ -58,6 +64,14 @@ class IntegratedDecisionStatus(str, Enum):
     NO_TRADE = "NO_TRADE"
     CANDIDATE = "CANDIDATE"
     BLOCKED = "BLOCKED"
+
+
+class DecisionAction(str, Enum):
+    """Phase-4 Decision Engine surface. Buyer-only; never SELL / short."""
+
+    BUY_CE = "BUY_CE"
+    BUY_PE = "BUY_PE"
+    NO_TRADE = "NO_TRADE"
 
 
 def digest_payload(payload: Mapping[str, Any]) -> str:
@@ -134,6 +148,11 @@ class StrategyCandidate:
     stop_loss: float
     quantity: int
     confidence: float
+    option_type: str | None = None
+    strike: float | None = None
+    expiry: str | None = None
+    target: float | None = None
+    lot_size: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -145,7 +164,144 @@ class StrategyCandidate:
             "stop_loss": self.stop_loss,
             "quantity": self.quantity,
             "confidence": self.confidence,
+            "option_type": self.option_type,
+            "strike": self.strike,
+            "expiry": self.expiry,
+            "target": self.target,
+            "lot_size": self.lot_size,
         }
+
+
+@dataclass(frozen=True)
+class TradeCandidate:
+    """Phase-4 paper trade candidate with full option provenance.
+
+    Present only when the Decision Engine action is BUY_CE or BUY_PE.
+    Never an order; Risk Guard approval is recorded separately on the decision.
+    """
+
+    strategy: str
+    instrument: str
+    underlying: str
+    option_type: str
+    direction: str
+    strike: float
+    expiry: str
+    limit_price: float
+    stop_loss: float
+    target: float | None
+    quantity: int
+    lot_size: int | None
+    confidence: float
+    package_digest: str
+    agent_versions: tuple[tuple[str, str], ...]
+    snapshot_id: str
+    snapshot_version: str
+    analysis_cycle_id: str
+
+    def __post_init__(self) -> None:
+        if self.option_type not in {"CE", "PE"}:
+            raise ValueError("TradeCandidate option_type must be CE or PE")
+        if self.strike <= 0:
+            raise ValueError("TradeCandidate strike must be positive")
+        if not self.expiry:
+            raise ValueError("TradeCandidate expiry is required")
+        if self.stop_loss <= 0:
+            raise ValueError("TradeCandidate stop_loss must be positive")
+        object.__setattr__(self, "agent_versions", tuple(self.agent_versions))
+
+    @property
+    def action(self) -> DecisionAction:
+        return DecisionAction.BUY_CE if self.option_type == "CE" else DecisionAction.BUY_PE
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "strategy": self.strategy,
+            "instrument": self.instrument,
+            "underlying": self.underlying,
+            "option_type": self.option_type,
+            "direction": self.direction,
+            "strike": self.strike,
+            "expiry": self.expiry,
+            "limit_price": self.limit_price,
+            "stop_loss": self.stop_loss,
+            "target": self.target,
+            "quantity": self.quantity,
+            "lot_size": self.lot_size,
+            "confidence": self.confidence,
+            "package_digest": self.package_digest,
+            "agent_versions": [
+                {"agent": name, "version": version} for name, version in self.agent_versions
+            ],
+            "snapshot_id": self.snapshot_id,
+            "snapshot_version": self.snapshot_version,
+            "analysis_cycle_id": self.analysis_cycle_id,
+            "action": self.action.value,
+        }
+
+
+def resolve_decision_action(
+    status: IntegratedDecisionStatus | str,
+    *,
+    option_type: str | None = None,
+    trade_candidate: TradeCandidate | None = None,
+) -> DecisionAction:
+    """Map 4C status + option identity onto the Phase-4 DecisionAction surface."""
+    if isinstance(status, str):
+        try:
+            status = IntegratedDecisionStatus(status)
+        except ValueError:
+            return DecisionAction.NO_TRADE
+    if status is not IntegratedDecisionStatus.CANDIDATE:
+        return DecisionAction.NO_TRADE
+    resolved = None
+    if trade_candidate is not None:
+        resolved = trade_candidate.option_type
+    elif option_type in {"CE", "PE"}:
+        resolved = option_type
+    if resolved == "CE":
+        return DecisionAction.BUY_CE
+    if resolved == "PE":
+        return DecisionAction.BUY_PE
+    return DecisionAction.NO_TRADE
+
+
+def build_trade_candidate(
+    candidate: StrategyCandidate,
+    *,
+    package_digest: str,
+    agent_versions: tuple[tuple[str, str], ...],
+    snapshot_id: str,
+    snapshot_version: str,
+    analysis_cycle_id: str,
+) -> TradeCandidate | None:
+    """Build a Phase-4 TradeCandidate when strike/expiry/option_type are known."""
+    if candidate.option_type not in {"CE", "PE"}:
+        return None
+    if candidate.strike is None or candidate.strike <= 0:
+        return None
+    if not candidate.expiry:
+        return None
+    return TradeCandidate(
+        strategy=candidate.strategy,
+        instrument=candidate.instrument,
+        underlying=candidate.underlying,
+        option_type=candidate.option_type,
+        direction=candidate.direction,
+        strike=float(candidate.strike),
+        expiry=str(candidate.expiry),
+        limit_price=candidate.limit_price,
+        stop_loss=candidate.stop_loss,
+        target=candidate.target,
+        quantity=candidate.quantity,
+        lot_size=candidate.lot_size,
+        confidence=candidate.confidence,
+        package_digest=package_digest,
+        agent_versions=agent_versions,
+        snapshot_id=snapshot_id,
+        snapshot_version=snapshot_version,
+        analysis_cycle_id=analysis_cycle_id,
+    )
 
 
 @dataclass(frozen=True)
@@ -175,6 +331,8 @@ class IntegratedDecision:
     audit_references: tuple[str, ...]
     gate_results: tuple[tuple[str, bool, str], ...]
     risk_rule_results: tuple[tuple[str, bool, str], ...] = ()
+    action: DecisionAction = DecisionAction.NO_TRADE
+    trade_candidate: TradeCandidate | None = None
     schema_version: str = DECISION_SCHEMA
     paper_mode: bool = True
     live_trading: bool = False
@@ -184,10 +342,21 @@ class IntegratedDecision:
     def __post_init__(self) -> None:
         if self.status not in set(IntegratedDecisionStatus):
             raise ValueError("unsupported decision status")
+        if self.action not in set(DecisionAction):
+            raise ValueError("unsupported decision action")
         if self.schema_version != DECISION_SCHEMA:
             raise ValueError("unsupported decision schema")
         if self.live_trading or self.broker_order_path or self.executed or not self.paper_mode:
             raise ValueError("4C decisions stay paper-only and unexecuted")
+        if self.action in {DecisionAction.BUY_CE, DecisionAction.BUY_PE} and self.trade_candidate is None:
+            raise ValueError("BUY_CE/BUY_PE require a TradeCandidate")
+        if self.action in {DecisionAction.BUY_CE, DecisionAction.BUY_PE}:
+            if self.status is not IntegratedDecisionStatus.CANDIDATE:
+                raise ValueError("BUY_CE/BUY_PE require CANDIDATE status")
+        if self.trade_candidate is not None and self.action is DecisionAction.NO_TRADE:
+            raise ValueError("TradeCandidate requires BUY_CE or BUY_PE action")
+        if self.trade_candidate is not None and self.action is not self.trade_candidate.action:
+            raise ValueError("decision action must match TradeCandidate option_type")
         object.__setattr__(self, "calculated_evidence", MappingProxyType(dict(self.calculated_evidence)))
 
     @property
@@ -212,6 +381,10 @@ class IntegratedDecision:
             "supporting_findings": list(self.supporting_findings),
             "conflicting_findings": list(self.conflicting_findings),
             "status": self.status.value,
+            "action": self.action.value,
+            "trade_candidate": None
+            if self.trade_candidate is None
+            else self.trade_candidate.to_dict(),
             "paper_trade_candidate": self.paper_trade_candidate,
             "reason_codes": list(self.reason_codes),
             "risk_guard_result": self.risk_guard_result,
