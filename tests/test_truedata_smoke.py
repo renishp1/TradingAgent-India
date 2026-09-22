@@ -18,6 +18,7 @@ from grow.live_data.models import CycleStatus
 from grow.live_data.smoke import (
     FAIL,
     HARD_FAIL,
+    MAX_OPTION_REJECTION_SAMPLES,
     PASS,
     PASS_WITH_NO_TRADE,
     SMOKE_SCHEMA,
@@ -634,7 +635,8 @@ class OptionQuoteFreshnessTests(unittest.TestCase):
         self.assertIn("Rejection: stale_option_quote", evidence)
         self.assertIn(f"Rejected quote timestamp: {quote_time.isoformat()}", evidence)
         self.assertEqual(report["option_tick_rejection"], "stale_option_quote")
-        self.assertNotEqual(report.get("first_option_tick"), report["option_tick_rejections"][0])
+        self.assertEqual(report["option_tick_rejection_counts"]["stale_option_quote"], 1)
+        self.assertNotEqual(report.get("first_option_tick"), report["option_tick_rejection_samples"][0])
         priced = next(
             contract
             for contract in stale.chains["NIFTY"].contracts
@@ -662,7 +664,7 @@ class OptionQuoteFreshnessTests(unittest.TestCase):
         check = _assess(self.loop, snapshot)
         self.assertFalse(check.ok)
         self.assertEqual(check.quotes, ())
-        self.assertEqual(check.rejections[0]["reason"], "quote_after_event_time")
+        self.assertEqual(check.rejection_samples[0]["reason"], "quote_after_event_time")
         report = self._report_for(snapshot)
         self.assertIsNone(report["first_option_tick"])
         self.assertEqual(report["option_tick_rejection"], "quote_after_event_time")
@@ -687,7 +689,7 @@ class OptionQuoteFreshnessTests(unittest.TestCase):
         check = _assess(self.loop, snapshot)
         self.assertFalse(check.ok)
         self.assertEqual(check.quotes, ())
-        self.assertEqual(check.rejections[0]["reason"], "invalid_option_type")
+        self.assertEqual(check.rejection_samples[0]["reason"], "invalid_option_type")
         report = self._report_for(snapshot)
         self.assertIsNone(report["first_option_tick"])
         self.assertEqual(report["option_tick_rejection"], "invalid_option_type")
@@ -699,7 +701,7 @@ class OptionQuoteFreshnessTests(unittest.TestCase):
             "option_tick_ok": False,
             "first_option_tick": None,
             "option_tick_rejection": "stale_option_quote",
-            "option_tick_rejections": [
+            "option_tick_rejection_samples": [
                 {
                     "reason": "stale_option_quote",
                     "quote_timestamp": "2026-09-18T10:00:00+05:30",
@@ -739,3 +741,202 @@ class OptionQuoteFreshnessTests(unittest.TestCase):
         self.assertFalse(report["option_tick_ok"])
         self.assertIsNone(report["first_option_tick"])
         self.assertEqual(report["result"], FAIL)
+
+
+def _priced_ce(snapshot):
+    for contract in snapshot.chains["NIFTY"].contracts:
+        kind = str(getattr(contract.option_type, "value", contract.option_type))
+        priced = contract.bid is not None or contract.ask is not None or contract.last_price is not None
+        if kind == "CE" and priced:
+            return contract
+    raise AssertionError("priced CE quote missing")
+
+
+def _with_contracts(snapshot, contracts):
+    chain = snapshot.chains["NIFTY"]
+    chains = dict(snapshot.chains)
+    chains["NIFTY"] = replace(chain, contracts=tuple(contracts))
+    return replace(snapshot, chains=chains)
+
+
+class OptionRejectionDiagnosticTests(unittest.TestCase):
+    """Rejection rows are capped diagnostics. They never become accepted quotes."""
+
+    def setUp(self) -> None:
+        catalog = _nifty_catalog()
+        incoming, _ce = _index_then_ce_incoming(catalog)
+        self.loop = _start_smoke(incoming, catalog)
+        self.reports = drain_smoke_loop(self.loop, max_cycles=8)
+        self.limit = self.loop.config.live_data.max_staleness_seconds
+        self.fresh = self.loop.last_snapshot
+        self.ce = _priced_ce(self.fresh)
+        self.assertIsNotNone(self.fresh)
+        self.assertTrue(self.fresh.freshness_ok)
+
+    def tearDown(self) -> None:
+        self.loop.stop()
+
+    def _report_for(self, snapshot):
+        self.loop.last_snapshot = snapshot
+        return build_smoke_report(self.loop, self.reports, root=ROOT)
+
+    def _stale(self, strike_offset: float):
+        return replace(
+            self.ce,
+            strike=float(self.ce.strike) + strike_offset,
+            timestamp=AS_OF - timedelta(seconds=self.limit + 60),
+        )
+
+    def _assert_diagnostics_only(self, check, report) -> None:
+        self.assertNotIn("option_tick_rejections", report)
+        self.assertEqual(report["option_tick_rejection_count"], check.rejection_count)
+        self.assertEqual(report["option_tick_rejection_counts"], dict(check.rejection_counts))
+        self.assertEqual(len(report["option_tick_rejection_samples"]), len(check.rejection_samples))
+        self.assertLessEqual(len(report["option_tick_rejection_samples"]), MAX_OPTION_REJECTION_SAMPLES)
+        self.assertEqual(sum(report["option_tick_rejection_counts"].values()), report["option_tick_rejection_count"])
+        for quote in check.quotes:
+            self.assertNotIn("reason", quote)
+        for sample in report["option_tick_rejection_samples"]:
+            self.assertIn("reason", sample)
+            self.assertNotIn(sample, list(check.quotes))
+
+    def test_a_multiple_rejections_stay_diagnostics(self) -> None:
+        rejected = [self._stale(offset) for offset in (100.0, 200.0, 300.0)]
+        snapshot = _with_contracts(self.fresh, rejected)
+        check = _assess(self.loop, snapshot)
+        report = self._report_for(snapshot)
+        self.assertFalse(check.ok)
+        self.assertEqual(check.quotes, ())
+        self.assertEqual(check.rejection_count, 3)
+        self.assertEqual(len(check.rejection_samples), 3)
+        self.assertEqual([sample["reason"] for sample in check.rejection_samples], ["stale_option_quote"] * 3)
+        self.assertFalse(report["option_tick_ok"])
+        self.assertIsNone(report["first_option_tick"])
+        self.assertIsNone(report["first_tick"])
+        self.assertEqual(report["option_tick_rejection"], "stale_option_quote")
+        self._assert_diagnostics_only(check, report)
+
+    def test_b_rejection_samples_are_capped(self) -> None:
+        total = MAX_OPTION_REJECTION_SAMPLES + 5
+        rejected = [self._stale(float(index + 1) * 50) for index in range(total)]
+        snapshot = _with_contracts(self.fresh, rejected)
+        check = _assess(self.loop, snapshot)
+        report = self._report_for(snapshot)
+        self.assertEqual(check.rejection_count, total)
+        self.assertEqual(len(check.rejection_samples), MAX_OPTION_REJECTION_SAMPLES)
+        self.assertEqual(check.rejection_counts["stale_option_quote"], total)
+        self.assertEqual(len(report["option_tick_rejection_samples"]), MAX_OPTION_REJECTION_SAMPLES)
+        self.assertEqual(report["option_tick_rejection_count"], total)
+        self.assertEqual(report["option_tick_rejection_samples"][0]["strike"], rejected[0].strike)
+        self.assertEqual(
+            report["option_tick_rejection_samples"][-1]["strike"],
+            rejected[MAX_OPTION_REJECTION_SAMPLES - 1].strike,
+        )
+        self.assertNotIn(
+            rejected[-1].strike,
+            [sample["strike"] for sample in report["option_tick_rejection_samples"]],
+        )
+        self.assertEqual(check.quotes, ())
+        self.assertIsNone(report["first_option_tick"])
+        self._assert_diagnostics_only(check, report)
+
+    def test_c_rejection_counts_aggregate_by_reason(self) -> None:
+        event_time = AS_OF - timedelta(seconds=20)
+        stale = [self._stale(offset) for offset in (100.0, 200.0, 300.0)]
+        future = [
+            replace(self.ce, strike=float(self.ce.strike) + 400, timestamp=AS_OF + timedelta(seconds=2)),
+            replace(self.ce, strike=float(self.ce.strike) + 500, timestamp=AS_OF + timedelta(seconds=3)),
+        ]
+        unmapped = [
+            replace(self.ce, strike=float(self.ce.strike) + 600, provider_contract_id="UNMAPPED-CE-1"),
+            replace(self.ce, strike=float(self.ce.strike) + 700, provider_contract_id="UNMAPPED-CE-2"),
+        ]
+        after_event = replace(self.ce, strike=float(self.ce.strike) + 800, timestamp=AS_OF - timedelta(seconds=5))
+        invalid_time = replace(self.ce, strike=float(self.ce.strike) + 900, timestamp=AS_OF.replace(tzinfo=None))
+        invalid_type = replace(self.ce, strike=float(self.ce.strike) + 1000, option_type="XX")
+        unpriced = replace(self.ce, strike=float(self.ce.strike) + 1100, bid=None, ask=None, last_price=None)
+        contracts = [*stale, *future, *unmapped, after_event, invalid_time, invalid_type, unpriced]
+        snapshot = _with_contracts(replace(self.fresh, event_time=event_time), contracts)
+        check = _assess(self.loop, snapshot)
+        report = self._report_for(snapshot)
+        self.assertEqual(
+            dict(check.rejection_counts),
+            {
+                "stale_option_quote": 3,
+                "future_option_quote": 2,
+                "missing_symbol_mapping": 2,
+                "quote_after_event_time": 1,
+                "invalid_quote_timestamp": 1,
+                "invalid_option_type": 1,
+            },
+        )
+        self.assertEqual(check.rejection_count, 10)
+        self.assertEqual(check.primary_rejection, "stale_option_quote")
+        self.assertEqual(report["option_tick_rejection"], "stale_option_quote")
+        self.assertEqual(report["option_tick_rejection_counts"], dict(check.rejection_counts))
+        self.assertEqual(check.quotes, ())
+        self.assertFalse(report["option_tick_ok"])
+        self.assertIsNone(report["first_option_tick"])
+        self._assert_diagnostics_only(check, report)
+
+    def test_d_one_valid_ce_stays_accepted_beside_rejections(self) -> None:
+        rejected = [self._stale(offset) for offset in (100.0, 200.0, 300.0, 400.0)]
+        snapshot = _with_contracts(self.fresh, [self.ce, *rejected])
+        check = _assess(self.loop, snapshot)
+        report = self._report_for(snapshot)
+        self.assertTrue(check.ok)
+        self.assertEqual(len(check.quotes), 1)
+        self.assertEqual(check.rejection_count, 4)
+        self.assertEqual(check.rejection_counts["stale_option_quote"], 4)
+        accepted = check.quotes[0]
+        self.assertEqual(accepted["option_type"], "CE")
+        self.assertEqual(accepted["provider_symbol"], self.ce.provider_contract_id)
+        self.assertEqual(float(accepted["strike"]), float(self.ce.strike))
+        self.assertEqual(accepted["quote_timestamp"], AS_OF.isoformat())
+        self.assertTrue(accepted["quote_freshness"])
+        self.assertTrue(report["option_tick_ok"])
+        self.assertEqual(report["first_option_tick"], accepted)
+        self.assertEqual(report["first_tick"]["provider_symbol"], accepted["provider_symbol"])
+        self.assertEqual(report["first_tick"]["contracts"][0]["strike"], accepted["strike"])
+        self.assertIn(report["result"], {PASS, PASS_WITH_NO_TRADE})
+        for sample in report["option_tick_rejection_samples"]:
+            self.assertEqual(sample["reason"], "stale_option_quote")
+            self.assertNotEqual(sample["strike"], accepted["strike"])
+        self._assert_diagnostics_only(check, report)
+
+    def test_e_only_stale_future_and_invalid_quotes_fail(self) -> None:
+        contracts = [
+            self._stale(100.0),
+            replace(self.ce, strike=float(self.ce.strike) + 200, timestamp=AS_OF + timedelta(seconds=1)),
+            replace(self.ce, strike=float(self.ce.strike) + 300, timestamp=AS_OF.replace(tzinfo=None)),
+        ]
+        snapshot = _with_contracts(self.fresh, contracts)
+        check = _assess(self.loop, snapshot)
+        report = self._report_for(snapshot)
+        self.assertFalse(check.ok)
+        self.assertEqual(check.quotes, ())
+        self.assertEqual(check.primary_rejection, "stale_option_quote")
+        self.assertEqual(
+            dict(check.rejection_counts),
+            {"stale_option_quote": 1, "future_option_quote": 1, "invalid_quote_timestamp": 1},
+        )
+        self.assertFalse(report["option_tick_ok"])
+        self.assertIsNone(report["first_option_tick"])
+        self.assertIsNone(report["first_tick"])
+        self.assertEqual(report["result"], FAIL)
+        self._assert_diagnostics_only(check, report)
+
+    def test_f_fixture_remains_hard_fail(self) -> None:
+        chain = self.fresh.chains["NIFTY"]
+        snapshot = replace(self.fresh, chains={"NIFTY": replace(chain, is_fixture=True)})
+        check = _assess(self.loop, snapshot)
+        report = self._report_for(snapshot)
+        self.assertTrue(check.fixture_rejected)
+        self.assertEqual(check.quotes, ())
+        self.assertEqual(check.primary_rejection, "fixture_quote")
+        self.assertEqual(report["result"], HARD_FAIL)
+        self.assertFalse(report["option_tick_ok"])
+        self.assertIsNone(report["first_option_tick"])
+        self.assertEqual(report["option_tick_rejection"], "fixture_quote")
+        self.assertEqual(report["option_tick_rejection_counts"]["fixture_quote"], 1)
+        self.assertTrue(report["safety"]["fixture_fallback"])
