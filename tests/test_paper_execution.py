@@ -49,6 +49,7 @@ def _quote(as_of, **overrides):
         provider_contract_id="RELIANCE-2500-CE",
         quality=DataQualityStatus.OK,
         lot_size=1,
+        expiry_class="WEEKLY",
     )
     payload.update(overrides)
     return OptionQuoteView(**payload)

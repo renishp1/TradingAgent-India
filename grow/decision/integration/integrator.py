@@ -174,7 +174,7 @@ class DecisionIntegrator:
                 rules=(),
             )
 
-        policy = evaluate_policy(snapshot, package)
+        policy = evaluate_policy(snapshot, package, config=self.config)
         if policy.terminal_status == "BLOCKED":
             return self._finish(
                 snapshot,

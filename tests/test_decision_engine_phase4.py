@@ -48,6 +48,7 @@ def _quote(*, option_type: str = "CE", strike: float = 2500.0, underlying: str =
         provider_contract_id=f"{underlying}-{int(strike)}-{option_type}",
         quality=DataQualityStatus.OK,
         lot_size=75,
+        expiry_class="WEEKLY",
     )
 
 
