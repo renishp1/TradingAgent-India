@@ -58,7 +58,11 @@ An index in the registry but absent from the contract master is
 
 `resolve_nearest_expiry` is the audit resolver. Decision-time selection is
 still `choose_expiry` on the reconstructed chain, with the same profile.
-2C does not invent strikes or expiries.
+Per-index `strike_policy_profile` (`ATM_PM0`–`ATM_PM3`) sets the 2C strike
+window. `liquidity_policy=options.select.v1` uses the locked 2C liquidity
+gates. `lot_size_source=CONTRACT_MASTER` requires a historical lot size on
+the selected contract. Unknown profiles fail closed. 2C does not invent
+strikes or expiries.
 
 ## CE / PE
 

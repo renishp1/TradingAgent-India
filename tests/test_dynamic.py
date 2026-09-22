@@ -264,11 +264,9 @@ class QualificationAndFlowTests(unittest.TestCase):
             IndexOptionsEngine(live)
         store = build_2i_store()
         store.meta = replace(store.meta, is_fixture=False)
-        flow = DynamicCandidateOrchestrator(store)
-        self.assertEqual(flow.engine.config.options.provider, "historical")
-        as_of = _ts(date(2026, 9, 14))
-        result = flow.evaluate(as_of, {"NIFTY": _signal("NIFTY", "BULLISH", as_of)})
-        self.assertTrue(any(row.underlying == "NIFTY" for row in result.contexts))
+        with self.assertRaises(GrowConfigError) as ctx:
+            DynamicCandidateOrchestrator(store)
+        self.assertIn("FRAMEWORK_TEST_ONLY", str(ctx.exception))
 
     def test_expiry_resolution_mismatch_rewrites_no_trade(self) -> None:
         from grow.history.candidate_flow import EXPIRY_RESOLUTION_MISMATCH, bind_resolution
@@ -322,8 +320,69 @@ class QualificationAndFlowTests(unittest.TestCase):
             picked = result.pick(cid)
             self.assertEqual(picked["verdict"], "TRADE_APPROVE")
             self.assertEqual(picked["candidate"]["candidate_id"], cid)
-            with self.assertRaises(TypeError):
-                picked["candidate"] = {}  # type: ignore[index]
+            with self.assertRaises((TypeError, AttributeError)):
+                picked["candidate"]["score"]["total"] = 0  # type: ignore[index]
+            with self.assertRaises((TypeError, AttributeError)):
+                picked["candidate"]["diagnostics"].append("hack")  # type: ignore[index]
+
+    def test_unqualified_historical_dataset_is_rejected(self) -> None:
+        from grow.history.eval import DatasetQualificationRecord
+        from grow.history.models import APPROVED_FOR_2E, HISTORICAL_RESEARCH
+
+        store = build_2i_store()
+        hist = replace(store.meta, is_fixture=False, usage_scope=HISTORICAL_RESEARCH)
+        store.meta = hist
+        with self.assertRaises(GrowConfigError) as ctx:
+            DynamicCandidateOrchestrator(store)
+        self.assertIn("QUALIFICATION_REQUIRED", str(ctx.exception))
+        bad = DatasetQualificationRecord(
+            dataset_id=hist.dataset_id,
+            dataset_version=hist.version,
+            fingerprint=hist.fingerprint,
+            evaluation_schema="provider.eval.v1",
+            qualification_status="QUALIFIED",
+            approved_for_2e=False,
+            limitations=(),
+            quality_warnings=(),
+            prior_status="CANDIDATE",
+            checks=(),
+        )
+        with self.assertRaises(GrowConfigError) as ctx:
+            DynamicCandidateOrchestrator(store, qualification=bad)
+        self.assertIn("HISTORICAL_NOT_APPROVED_FOR_2E", str(ctx.exception))
+        ok = replace(bad, qualification_status=APPROVED_FOR_2E, approved_for_2e=True)
+        flow = DynamicCandidateOrchestrator(store, qualification=ok)
+        self.assertEqual(flow.engine.config.options.provider, "historical")
+        as_of = _ts(date(2026, 9, 14))
+        result = flow.evaluate(as_of, {"NIFTY": _signal("NIFTY", "BULLISH", as_of)})
+        self.assertTrue(any(row.underlying == "NIFTY" for row in result.contexts))
+
+    def test_policy_overlay_fingerprint_changes_with_policy(self) -> None:
+        from grow.history.universe import IndexUniverseRegistry, default_index_policies
+
+        base = default_index_registry()
+        tweaked = tuple(
+            replace(p, strike_policy_profile="ATM_PM1") if p.canonical_symbol == "NIFTY" else p
+            for p in default_index_policies()
+        )
+        other = IndexUniverseRegistry(tweaked)
+        self.assertNotEqual(base.fingerprint, other.fingerprint)
+        store = build_2i_store()
+        as_of = _ts(date(2026, 9, 14))
+        a = DynamicCandidateOrchestrator(store).evaluate(as_of, {"NIFTY": _signal("NIFTY", "BULLISH", as_of)})
+        b = DynamicCandidateOrchestrator(store, registry=other).evaluate(as_of, {"NIFTY": _signal("NIFTY", "BULLISH", as_of)})
+        self.assertNotEqual(a.policy_fingerprint, b.policy_fingerprint)
+        self.assertEqual(a.policy_registry_version, b.policy_registry_version)
+        payload = a.to_research_input()
+        self.assertEqual(payload["policy_fingerprint"], a.policy_fingerprint)
+        vis = universe_at(store, "NIFTY", as_of)
+        r1 = resolve_nearest_expiry(
+            "NIFTY", as_of, vis, WEEKLY_PREFERRED, policy_fingerprint=base.fingerprint
+        )
+        r2 = resolve_nearest_expiry(
+            "NIFTY", as_of, vis, WEEKLY_PREFERRED, policy_fingerprint=other.fingerprint
+        )
+        self.assertNotEqual(r1.resolution_id, r2.resolution_id)
 
 
 if __name__ == "__main__":

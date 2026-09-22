@@ -6,8 +6,10 @@ index underlyings are added here, not by hard-coding the provider layer.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
+import hashlib
+import json
 
 from grow.clock import IST
 from grow.errors import GrowConfigError
@@ -21,6 +23,9 @@ KNOWN_EXPIRY_PROFILES = frozenset(
 )
 OPTIDX = "OPTIDX"
 REGISTRY_VERSION = "index.universe.v1"
+KNOWN_STRIKE_PROFILES = frozenset({"ATM_PM0", "ATM_PM1", "ATM_PM2", "ATM_PM3"})
+KNOWN_LIQUIDITY_POLICIES = frozenset({"options.select.v1"})
+KNOWN_LOT_SIZE_SOURCES = frozenset({"CONTRACT_MASTER"})
 FORBIDDEN_UNDERLYINGS = frozenset(
     {
         "RELIANCE",
@@ -128,9 +133,16 @@ class IndexUniverseRegistry:
                 raise GrowConfigError(f"UNSUPPORTED_INSTRUMENT_TYPE:{policy.instrument_type}")
             if policy.expiry_policy_profile not in KNOWN_EXPIRY_PROFILES:
                 raise GrowConfigError(f"UNKNOWN_EXPIRY_PROFILE:{policy.expiry_policy_profile}")
+            if policy.strike_policy_profile not in KNOWN_STRIKE_PROFILES:
+                raise GrowConfigError(f"UNKNOWN_STRIKE_PROFILE:{policy.strike_policy_profile}")
+            if policy.liquidity_policy not in KNOWN_LIQUIDITY_POLICIES:
+                raise GrowConfigError(f"UNKNOWN_LIQUIDITY_POLICY:{policy.liquidity_policy}")
+            if policy.lot_size_source not in KNOWN_LOT_SIZE_SOURCES:
+                raise GrowConfigError(f"UNKNOWN_LOT_SIZE_SOURCE:{policy.lot_size_source}")
             by_id[policy.canonical_symbol] = policy
         self._policies = by_id
         self.version = REGISTRY_VERSION
+        self.fingerprint = fingerprint_policies(tuple(by_id.values()))
 
     def policy(self, symbol: str, day: date | None = None) -> IndexPolicy | None:
         item = self._policies.get(symbol)
@@ -159,6 +171,42 @@ def default_index_registry() -> IndexUniverseRegistry:
     if _DEFAULT is None:
         _DEFAULT = IndexUniverseRegistry()
     return _DEFAULT
+
+
+def fingerprint_policies(policies: tuple[IndexPolicy, ...]) -> str:
+    rows = []
+    for policy in sorted(policies, key=lambda item: item.canonical_symbol):
+        rows.append(
+            {
+                "index_id": policy.index_id,
+                "symbol": policy.canonical_symbol,
+                "expiry": policy.expiry_policy_profile,
+                "strike": policy.strike_policy_profile,
+                "lot": policy.lot_size_source,
+                "liquidity": policy.liquidity_policy,
+                "from": policy.active_from.isoformat(),
+                "to": None if policy.active_to is None else policy.active_to.isoformat(),
+                "option_supported": policy.option_supported,
+            }
+        )
+    body = json.dumps({"version": REGISTRY_VERSION, "policies": rows}, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def strike_window_distance(profile: str) -> int:
+    if profile not in KNOWN_STRIKE_PROFILES or not profile.startswith("ATM_PM"):
+        raise GrowConfigError(f"UNKNOWN_STRIKE_PROFILE:{profile}")
+    return int(profile.removeprefix("ATM_PM"))
+
+
+def apply_index_policy(options_config, policy: IndexPolicy):
+    """Map IndexPolicy research profiles onto 2C options config. Fail closed."""
+    if policy.liquidity_policy not in KNOWN_LIQUIDITY_POLICIES:
+        raise GrowConfigError(f"UNKNOWN_LIQUIDITY_POLICY:{policy.liquidity_policy}")
+    if policy.lot_size_source not in KNOWN_LOT_SIZE_SOURCES:
+        raise GrowConfigError(f"UNKNOWN_LOT_SIZE_SOURCE:{policy.lot_size_source}")
+    distance = strike_window_distance(policy.strike_policy_profile)
+    return replace(options_config, max_distance_from_atm=distance)
 
 
 def is_forbidden_instrument(symbol: str) -> bool:

@@ -74,7 +74,7 @@ class IndexOptionsEngine:
             return empty((str(exc),))
         if signal.direction in {"LONG", "SHORT", "SELL", "BUY", "OPTION_SELL"}:
             return empty((f"EXECUTION_LANGUAGE:{signal.direction}",))
-        from grow.history.universe import default_index_registry, is_forbidden_instrument
+        from grow.history.universe import apply_index_policy, default_index_registry, is_forbidden_instrument
 
         overlay = registry or default_index_registry()
         ticker = signal.symbol.ticker
@@ -102,6 +102,11 @@ class IndexOptionsEngine:
         if not kept and any(n.startswith("STALE") or n in {"CHAIN_FROM_FUTURE", "LIVE_CHAIN_FORBIDDEN"} for n in notes):
             return empty(notes, rejected)
         policy = overlay.policy(ticker, as_of.date())
+        if policy is not None:
+            try:
+                cfg = apply_index_policy(cfg, policy)
+            except GrowConfigError as exc:
+                return empty((str(exc),))
         expiry, expiry_why = choose_expiry(
             option_chain,
             as_of,

@@ -10,7 +10,7 @@ from datetime import date, datetime
 from grow.clock import IST
 from grow.errors import GrowConfigError
 from grow.history.models import HistoricalExpiryRecord
-from grow.history.universe import CUSTOM_HISTORICAL, MONTHLY_ONLY, WEEKLY_PREFERRED, WEEKLY_THEN_MONTHLY
+from grow.history.universe import CUSTOM_HISTORICAL, MONTHLY_ONLY, REGISTRY_VERSION, WEEKLY_PREFERRED, WEEKLY_THEN_MONTHLY
 
 RESOLVER_VERSION = "expiry.resolver.v1"
 NO_ELIGIBLE_EXPIRY = "NO_ELIGIBLE_EXPIRY"
@@ -36,6 +36,8 @@ class ExpiryResolution:
     dataset_version: str
     dataset_fingerprint: str
     resolver_version: str = RESOLVER_VERSION
+    policy_registry_version: str = REGISTRY_VERSION
+    policy_fingerprint: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -52,6 +54,8 @@ class ExpiryResolution:
             "dataset_version": self.dataset_version,
             "dataset_fingerprint": self.dataset_fingerprint,
             "resolver_version": self.resolver_version,
+            "policy_registry_version": self.policy_registry_version,
+            "policy_fingerprint": self.policy_fingerprint,
         }
 
 
@@ -77,6 +81,8 @@ def resolve_nearest_expiry(
     dataset_id: str = "",
     dataset_version: str = "",
     dataset_fingerprint: str = "",
+    policy_registry_version: str = REGISTRY_VERSION,
+    policy_fingerprint: str = "",
 ) -> ExpiryResolution:
     moment = as_of.astimezone(IST)
     today = moment.date()
@@ -129,6 +135,8 @@ def resolve_nearest_expiry(
         "discovered": list(discovered),
         "version": RESOLVER_VERSION,
         "dataset_fingerprint": dataset_fingerprint,
+        "policy_fingerprint": policy_fingerprint,
+        "policy_registry_version": policy_registry_version,
     }
     rid = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     return ExpiryResolution(
@@ -144,4 +152,6 @@ def resolve_nearest_expiry(
         dataset_id=dataset_id,
         dataset_version=dataset_version,
         dataset_fingerprint=dataset_fingerprint,
+        policy_registry_version=policy_registry_version,
+        policy_fingerprint=policy_fingerprint,
     )
