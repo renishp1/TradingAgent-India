@@ -48,9 +48,16 @@ class LiveHealth:
     subscribed: tuple[str, ...] = ()
     last_heartbeat_at: datetime | None = None
 
+    @property
+    def market_data_health(self) -> str:
+        from grow.live_data.health import map_session_health
+
+        return map_session_health(self.state).value
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "state": self.state.value,
+            "market_data_health": self.market_data_health,
             "provider_id": self.provider_id,
             "adapter_version": self.adapter_version,
             "last_message_at": None if self.last_message_at is None else self.last_message_at.isoformat(),

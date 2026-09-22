@@ -11,9 +11,10 @@ from typing import Any
 
 from grow.decision.contracts.agent_result import AgentResult, AgentStatus, CandidateAction
 from grow.decision.integration.contract import AgentOutputRef, StrategyCandidate, plain_data
+from grow.live_data.health import MARKET_DATA_NOT_HEALTHY, reject_unhealthy_market_data
 from grow.market_data.normalized.models import AgentMarketSnapshot, DataQualityStatus
-from grow.market_data.snapshots.builder import gate_snapshot_quality
 from grow.market_data.provenance import MIXED_MARKET_DATA_SOURCE, reject_mixed_market_data
+from grow.market_data.snapshots.builder import gate_snapshot_quality
 from grow.orchestration.models import AggregateAnalysisPackage
 from grow.orchestration.validator import validate_agent_output
 
@@ -99,6 +100,28 @@ def evaluate_policy(
             package=package,
             observations=tuple(snapshot.quality_notes),
         )
+    unhealthy = reject_unhealthy_market_data(
+        data_quality=quality,
+        diagnostics=dict(snapshot.diagnostics or {}),
+        freshness_ok=bool((snapshot.diagnostics or {}).get("freshness_ok", True)),
+    )
+    if unhealthy:
+        gates.append(("market_data_health", False, unhealthy))
+        return _closed(
+            terminal="BLOCKED",
+            reasons=(unhealthy,),
+            gates=tuple(gates),
+            quality=quality.value,
+            package=package,
+            observations=tuple(snapshot.quality_notes),
+        )
+    gates.append(
+        (
+            "market_data_health",
+            True,
+            str((snapshot.diagnostics or {}).get("market_data_health") or "HEALTHY"),
+        )
+    )
 
     accepted: list[AgentResult] = []
     refs: list[AgentOutputRef] = []
