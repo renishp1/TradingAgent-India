@@ -5,6 +5,7 @@ final safety authority. No broker order path.
 
 Phase 4 exposes ``DecisionEngine`` with explicit BUY_CE / BUY_PE / NO_TRADE.
 Phase 6 adds campaign option-chain intelligence as the sole candidate filter.
+Phase 7 attaches a dedicated Signal Engine (explained action + counter-evidence).
 """
 
 from grow.decision.integration.chain_filter import (
@@ -32,6 +33,13 @@ from grow.decision.integration.contract import (
 from grow.decision.integration.engine import DecisionEngine
 from grow.decision.integration.integrator import DecisionAuditLog, DecisionIntegrator
 from grow.decision.integration.policy import classify_output
+from grow.decision.signal import (
+    SIGNAL_ENGINE_VERSION,
+    SIGNAL_SCHEMA,
+    CampaignSignal,
+    CounterEvidence,
+    SignalEngine,
+)
 
 __all__ = [
     "CHAIN_FILTER_REJECTED",
@@ -40,8 +48,12 @@ __all__ = [
     "DECISION_SCHEMA",
     "MISSING_OPTION_CHAIN",
     "REQUIRED_DECISION_FIELDS",
+    "SIGNAL_ENGINE_VERSION",
+    "SIGNAL_SCHEMA",
     "AgentOutputRef",
+    "CampaignSignal",
     "ChainFilterResult",
+    "CounterEvidence",
     "DecisionAction",
     "DecisionAuditLog",
     "DecisionBookState",
@@ -49,6 +61,7 @@ __all__ = [
     "DecisionIntegrator",
     "IntegratedDecision",
     "IntegratedDecisionStatus",
+    "SignalEngine",
     "StrategyCandidate",
     "TradeCandidate",
     "allow_campaign_candidate",
