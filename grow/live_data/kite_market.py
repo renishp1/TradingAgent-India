@@ -3,11 +3,18 @@
 Downstream code receives the same normalized snapshot shape as every other
 live provider. Exchange timestamps are kept. Receipt time is never written
 back onto a quote to make it look fresh.
+
+Binary packets follow the public market-data layout: 8 (ltp), 28 and 32
+(index), 44 (quote), and 184 (full, with exchange timestamp at bytes 60-64
+and depth from byte 64). The official broker client is not imported. That
+package also exposes order placement, which this milestone does not call.
+The socket library is the declared websocket-client package.
 """
 
 from __future__ import annotations
 
 import csv
+import gzip
 import io
 import json
 import struct
@@ -99,6 +106,43 @@ class NormalizedOptionQuote:
         if self.open_interest is not None:
             row["oi"] = self.open_interest
         return row
+
+
+def decode_http_text(payload: bytes) -> str:
+    """Turn an HTTP body into text. Gzip-compressed catalog bytes are inflated first."""
+    raw = payload
+    if len(raw) >= 2 and raw[:2] == b"\x1f\x8b":
+        try:
+            raw = gzip.decompress(raw)
+        except OSError:
+            raise GrowConfigError("METADATA_UNAVAILABLE") from None
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise GrowConfigError("METADATA_UNAVAILABLE") from None
+
+
+def classify_socket_failure(exc: BaseException) -> str:
+    """Map a socket failure to a public code. The original text is not returned."""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(exc, "status", None)
+    try:
+        code = int(status) if status is not None else None
+    except (TypeError, ValueError):
+        code = None
+    if code in {401, 403}:
+        return "AUTH_FAILED"
+    if isinstance(exc, ImportError):
+        return "DEPENDENCY_MISSING"
+    if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
+        return "CONNECT_FAILED"
+    name = type(exc).__name__.lower()
+    if "timeout" in name or "address" in name:
+        return "CONNECT_FAILED"
+    if "closed" in name or "disconnect" in name:
+        return "FEED_DISCONNECTED"
+    return "NETWORK_ERROR"
 
 
 def load_kite_market_secrets(environ: Mapping[str, str]) -> tuple[str, str]:
@@ -344,12 +388,15 @@ class RealKiteTransport:
 
         try:
             ws_mod = importlib.import_module("websocket")
-            url = f"{SOCKET_URL}?api_key={self._api_key}&access_token={self._access_token}"
+        except ImportError:
+            raise GrowConfigError("DEPENDENCY_MISSING") from None
+        url = f"{SOCKET_URL}?api_key={self._api_key}&access_token={self._access_token}"
+        try:
             self._ws = ws_mod.create_connection(url, timeout=15)
         except GrowConfigError:
             raise
         except Exception as exc:
-            raise GrowConfigError("AUTH_FAILED") from exc
+            raise GrowConfigError(classify_socket_failure(exc)) from None
         self.connected = True
 
     def disconnect(self) -> None:
@@ -363,8 +410,7 @@ class RealKiteTransport:
                 pass
 
     def fetch_instruments(self) -> str:
-        payload = self._get(INSTRUMENTS_URL)
-        return payload.decode("utf-8")
+        return decode_http_text(self._get(INSTRUMENTS_URL))
 
     def fetch_index_quote(self, underlying: str) -> tuple[float, int]:
         name = underlying.upper()
@@ -375,7 +421,7 @@ class RealKiteTransport:
 
         parse = importlib.import_module("urllib.parse")
         url = f"{QUOTE_URL}?i={parse.quote(query)}"
-        body = json.loads(self._get(url).decode("utf-8"))
+        body = json.loads(decode_http_text(self._get(url)))
         if body.get("status") != "success":
             raise GrowConfigError("METADATA_UNAVAILABLE")
         data = body.get("data") or {}
@@ -408,8 +454,8 @@ class RealKiteTransport:
             raise GrowConfigError("FEED_DISCONNECTED")
         try:
             raw = self._ws.recv()
-        except Exception as exc:
-            raise GrowConfigError("FEED_DISCONNECTED") from exc
+        except Exception:
+            raise GrowConfigError("FEED_DISCONNECTED") from None
         if raw is None or raw == b"" or raw == "":
             return None
         return raw
@@ -431,12 +477,14 @@ class RealKiteTransport:
                 return response.read()
         except error_mod.HTTPError as exc:
             if exc.code in {401, 403}:
-                raise GrowConfigError("AUTH_FAILED") from exc
-            raise GrowConfigError("METADATA_UNAVAILABLE") from exc
+                raise GrowConfigError("AUTH_FAILED") from None
+            raise GrowConfigError("METADATA_UNAVAILABLE") from None
+        except error_mod.URLError:
+            raise GrowConfigError("NETWORK_ERROR") from None
         except GrowConfigError:
             raise
-        except Exception as exc:
-            raise GrowConfigError("METADATA_UNAVAILABLE") from exc
+        except Exception:
+            raise GrowConfigError("METADATA_UNAVAILABLE") from None
 
 
 class KiteMarketProvider:

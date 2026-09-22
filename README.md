@@ -70,9 +70,10 @@ TradingAgent-India/
 
 ## Quick start
 
-Python 3.10+. No third-party dependencies in milestone 1.
+Python 3.10+. The paper core is stdlib. The Zerodha market-data smoke declares `websocket-client` and does not import a broker order client.
 
 ```bash
+python -m pip install -e .
 python -m unittest discover -s tests -v
 export GROW_RISK_SECRET=$(python -c "import secrets; print(secrets.token_hex(32))")
 python scripts/run_paper_cycle.py RELIANCE
