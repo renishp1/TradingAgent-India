@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ast
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -248,13 +248,26 @@ def _marked_fixture(value: Any) -> bool:
     return getattr(value, "is_fixture", False) is True
 
 
+MAX_OPTION_REJECTION_SAMPLES = 20
+
+
 @dataclass(frozen=True)
 class OptionTickCheck:
-    """Live option-quote evidence. Catalog rows and index ticks are not quotes."""
+    """Accepted live quotes only.
+
+    ``quotes`` are the contracts that passed assessment. Rejection fields are
+    diagnostics: they never enter ``quotes``, never become ``first_option_tick``,
+    and never set ``option_tick_ok``. One accepted CE/PE quote stays accepted
+    when other candidate contracts are rejected. Samples are capped; counts
+    still record every rejection.
+    """
 
     quotes: tuple[Mapping[str, Any], ...] = ()
     fixture_rejected: bool = False
-    rejections: tuple[Mapping[str, Any], ...] = ()
+    rejection_count: int = 0
+    primary_rejection: str | None = None
+    rejection_counts: Mapping[str, int] = field(default_factory=dict)
+    rejection_samples: tuple[Mapping[str, Any], ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -452,6 +465,52 @@ def _live_option_quote(
     return accepted, None
 
 
+def _note_rejection(
+    rejection: Mapping[str, Any],
+    *,
+    primary: list[str | None],
+    counts: dict[str, int],
+    samples: list[dict[str, Any]],
+) -> None:
+    reason = str(rejection.get("reason") or NO_OPTION_QUOTE)
+    if primary[0] is None:
+        primary[0] = reason
+    counts[reason] = counts.get(reason, 0) + 1
+    if len(samples) < MAX_OPTION_REJECTION_SAMPLES:
+        samples.append(dict(rejection))
+
+
+def _rejection_check(
+    *,
+    quotes: Sequence[Mapping[str, Any]] = (),
+    fixture_rejected: bool = False,
+    primary: str | None = None,
+    counts: Mapping[str, int] | None = None,
+    samples: Sequence[Mapping[str, Any]] = (),
+    count: int | None = None,
+) -> OptionTickCheck:
+    grouped = dict(counts or {})
+    total = sum(grouped.values()) if count is None else count
+    return OptionTickCheck(
+        quotes=tuple(quotes),
+        fixture_rejected=fixture_rejected,
+        rejection_count=total,
+        primary_rejection=primary,
+        rejection_counts=grouped,
+        rejection_samples=tuple(samples),
+    )
+
+
+def _one_rejection(reason: str, *, fixture_rejected: bool = False) -> OptionTickCheck:
+    return _rejection_check(
+        fixture_rejected=fixture_rejected,
+        primary=reason,
+        counts={reason: 1},
+        samples=({"reason": reason},),
+        count=1,
+    )
+
+
 def assess_option_ticks(
     snapshot: Any,
     symbol_ids: Mapping[str, str] | None = None,
@@ -461,16 +520,19 @@ def assess_option_ticks(
 ) -> OptionTickCheck:
     """A first live tick is one CE/PE contract with a fresh quote, not merely a snapshot."""
     if snapshot is None:
-        return OptionTickCheck(rejections=({"reason": NO_OPTION_QUOTE},))
+        return _one_rejection(NO_OPTION_QUOTE)
     if _snapshot_marked_fixture(snapshot):
-        return OptionTickCheck(fixture_rejected=True, rejections=({"reason": FIXTURE_QUOTE},))
+        return _one_rejection(FIXTURE_QUOTE, fixture_rejected=True)
     if getattr(snapshot, "freshness_ok", False) is not True:
-        return OptionTickCheck(rejections=({"reason": NO_OPTION_QUOTE},))
+        return _one_rejection(NO_OPTION_QUOTE)
     if not _valid_timestamp(getattr(snapshot, "event_time", None)):
-        return OptionTickCheck(rejections=({"reason": NO_OPTION_QUOTE},))
+        return _one_rejection(NO_OPTION_QUOTE)
     reverse = _reverse_symbol_ids(dict(symbol_ids or {}))
     quotes: list[dict[str, Any]] = []
-    rejections: list[dict[str, Any]] = []
+    primary: list[str | None] = [None]
+    counts: dict[str, int] = {}
+    samples: list[dict[str, Any]] = []
+    seen = 0
     for chain in (getattr(snapshot, "chains", {}) or {}).values():
         for contract in getattr(chain, "contracts", ()) or ():
             accepted, rejection = _live_option_quote(
@@ -483,16 +545,23 @@ def assess_option_ticks(
             if accepted is not None:
                 quotes.append(accepted)
             elif rejection is not None:
-                rejections.append(rejection)
-    if not quotes and not rejections:
-        rejections.append({"reason": NO_OPTION_QUOTE})
-    return OptionTickCheck(tuple(quotes), rejections=tuple(rejections))
+                seen += 1
+                _note_rejection(rejection, primary=primary, counts=counts, samples=samples)
+    if not quotes and seen == 0:
+        return _one_rejection(NO_OPTION_QUOTE)
+    return _rejection_check(
+        quotes=quotes,
+        primary=primary[0],
+        counts=counts,
+        samples=samples,
+        count=seen,
+    )
 
 
 def _loop_option_check(loop: Any) -> OptionTickCheck:
     provider = getattr(loop, "provider", None)
     if _provider_quotes_marked_fixture(provider):
-        return OptionTickCheck(fixture_rejected=True, rejections=({"reason": FIXTURE_QUOTE},))
+        return _one_rejection(FIXTURE_QUOTE, fixture_rejected=True)
     symbol_ids = dict(getattr(provider, "_symbol_ids", {}) or {})
     return assess_option_ticks(
         getattr(loop, "last_snapshot", None),
@@ -609,6 +678,34 @@ def _is_hard_fail_error(error: str | None) -> bool:
     return any(token in text for token in ("FIXTURE_FALLBACK", "LIVE_TRADING", "LIVE_EXECUTION", "BROKER"))
 
 
+def _smoke_rejection_diagnostics(check: OptionTickCheck, *, fixture_fallback: bool) -> dict[str, Any]:
+    """Diagnostics only. They do not accept a quote or clear an accepted one."""
+    counts = dict(check.rejection_counts)
+    samples = [dict(item) for item in check.rejection_samples]
+    total = check.rejection_count
+    primary = check.primary_rejection
+    if fixture_fallback and counts.get(FIXTURE_QUOTE, 0) == 0:
+        counts[FIXTURE_QUOTE] = 1
+        total += 1
+        primary = FIXTURE_QUOTE
+        samples = [{"reason": FIXTURE_QUOTE}, *samples][:MAX_OPTION_REJECTION_SAMPLES]
+    elif fixture_fallback:
+        primary = FIXTURE_QUOTE
+    if total == 0 and not check.ok:
+        counts = {NO_OPTION_QUOTE: 1}
+        total = 1
+        primary = NO_OPTION_QUOTE
+        samples = [{"reason": NO_OPTION_QUOTE}]
+    if total == 0:
+        primary = None
+    return {
+        "option_tick_rejection": primary,
+        "option_tick_rejection_count": total,
+        "option_tick_rejection_counts": counts,
+        "option_tick_rejection_samples": samples,
+    }
+
+
 def build_smoke_report(
     loop: Any,
     reports: Sequence[LiveCycleReport],
@@ -643,16 +740,7 @@ def build_smoke_report(
     if quote_fixture or tick_check.fixture_rejected:
         fixture_fallback = True
     option_tick_ok = tick_check.ok and not fixture_fallback
-    rejections = [dict(item) for item in tick_check.rejections]
-    if fixture_fallback and not any(item.get("reason") == FIXTURE_QUOTE for item in rejections):
-        rejections.insert(0, {"reason": FIXTURE_QUOTE})
-    if option_tick_ok:
-        option_tick_rejection = None
-    elif rejections:
-        option_tick_rejection = str(rejections[0].get("reason") or NO_OPTION_QUOTE)
-    else:
-        option_tick_rejection = NO_OPTION_QUOTE
-        rejections = [{"reason": NO_OPTION_QUOTE}]
+    rejection_diagnostics = _smoke_rejection_diagnostics(tick_check, fixture_fallback=fixture_fallback)
     paper_fill = any(row.status is CycleStatus.PAPER_FILL for row in reports)
     hard_fail = bool(broker_hits or loaded or fixture_fallback or _is_hard_fail_error(error))
     result = classify_smoke_result(
@@ -702,8 +790,10 @@ def build_smoke_report(
             "events": list(getattr(provider, "subscription_events", ()) or ())[-8:],
         },
         "option_tick_ok": option_tick_ok,
-        "option_tick_rejection": option_tick_rejection,
-        "option_tick_rejections": rejections if not option_tick_ok else [item for item in rejections if item.get("reason") != NO_OPTION_QUOTE],
+        "option_tick_rejection": rejection_diagnostics["option_tick_rejection"],
+        "option_tick_rejection_count": rejection_diagnostics["option_tick_rejection_count"],
+        "option_tick_rejection_counts": rejection_diagnostics["option_tick_rejection_counts"],
+        "option_tick_rejection_samples": rejection_diagnostics["option_tick_rejection_samples"],
         "first_option_tick": first,
         "first_tick": None
         if first is None or snapshot is None
@@ -807,7 +897,7 @@ def format_option_tick_evidence(report: Mapping[str, Any]) -> str:
     rejection = report.get("option_tick_rejection")
     if rejection:
         lines.append(f"Rejection: {rejection}")
-    raw_rejections = report.get("option_tick_rejections")
+    raw_rejections = report.get("option_tick_rejection_samples")
     detail = raw_rejections[0] if isinstance(raw_rejections, list) and raw_rejections else None
     if isinstance(detail, Mapping):
         if detail.get("quote_timestamp"):
