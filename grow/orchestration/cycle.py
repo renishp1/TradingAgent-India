@@ -44,7 +44,11 @@ class AnalysisCycleStore:
 
 
 class AnalysisOrchestrator:
-    """Create one analysis cycle over one immutable snapshot (4B)."""
+    """Canonical 4B intelligence pipeline over one immutable snapshot.
+
+    Dispatch (concurrent, bounded wait) → validate → conflict-preserving
+    aggregate → optional replay. Paper-only; no broker order path.
+    """
 
     def __init__(
         self,

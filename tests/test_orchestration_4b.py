@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import threading
 import time
 import unittest
 from datetime import datetime
@@ -14,36 +15,104 @@ from grow.market_data.normalized.models import DataQualityStatus, OptionQuoteVie
 from grow.market_data.snapshots.builder import build_fixture_snapshot
 from grow.orchestration import AnalysisOrchestrator, aggregate_outputs, validate_agent_output
 from grow.orchestration.cycle import AnalysisCycleStore
+from grow.orchestration.dispatcher import dispatch_agents
+
+
+def _pass_result(snapshot, *, agent_name: str, agent_version: str, cycle_id: str, **kwargs) -> AgentResult:
+    defaults = dict(
+        agent_name=agent_name,
+        agent_version=agent_version,
+        snapshot_id=snapshot.snapshot_id,
+        snapshot_version=snapshot.version,
+        decision_timestamp=snapshot.decision_timestamp,
+        status=AgentStatus.PASS,
+        observations=("ok",),
+        calculated_metrics={},
+        interpretation=(),
+        findings=("OK",),
+        data_quality_concerns=(),
+        assumptions=(),
+        evidence=("e",),
+        metrics_used=(),
+        candidate_action=CandidateAction.NONE,
+        candidate_instrument=None,
+        entry_reason=None,
+        invalidation_reason=None,
+        risk_flags=(),
+        missing_data=(),
+        cycle_id=cycle_id,
+    )
+    defaults.update(kwargs)
+    return AgentResult(**defaults)
 
 
 class _SlowAgent:
     agent_name = "slow"
     agent_version = "slow.v1"
 
+    def __init__(self, delay: float = 0.5, name: str = "slow") -> None:
+        self.delay = delay
+        self.agent_name = name
+        self.agent_version = f"{name}.v1"
+
     def analyze(self, snapshot, *, cycle_id: str = ""):
-        time.sleep(0.5)
-        return AgentResult(
+        time.sleep(self.delay)
+        return _pass_result(
+            snapshot,
             agent_name=self.agent_name,
             agent_version=self.agent_version,
-            snapshot_id=snapshot.snapshot_id,
-            snapshot_version=snapshot.version,
-            decision_timestamp=snapshot.decision_timestamp,
-            status=AgentStatus.PASS,
-            observations=("slow",),
-            calculated_metrics={},
-            interpretation=(),
-            findings=("OK",),
-            data_quality_concerns=(),
-            assumptions=(),
-            evidence=(),
-            metrics_used=(),
-            candidate_action=CandidateAction.NONE,
-            candidate_instrument=None,
-            entry_reason=None,
-            invalidation_reason=None,
-            risk_flags=(),
-            missing_data=(),
             cycle_id=cycle_id,
+            observations=("slow",),
+            findings=("OK",),
+            candidate_action=CandidateAction.PAPER_OPEN,
+            candidate_instrument="NIFTY-25000-CE",
+            entry_reason="should-not-survive-timeout",
+        )
+
+
+class _BoomAgent:
+    agent_name = "boom"
+    agent_version = "boom.v1"
+
+    def analyze(self, snapshot, *, cycle_id: str = ""):
+        raise RuntimeError("specialist exploded")
+
+
+class _HealthyAgent:
+    def __init__(self, name: str, delay: float = 0.0) -> None:
+        self.agent_name = name
+        self.agent_version = f"{name}.v1"
+        self.delay = delay
+
+    def analyze(self, snapshot, *, cycle_id: str = ""):
+        if self.delay:
+            time.sleep(self.delay)
+        return _pass_result(
+            snapshot,
+            agent_name=self.agent_name,
+            agent_version=self.agent_version,
+            cycle_id=cycle_id,
+            observations=(self.agent_name,),
+            findings=("HEALTHY",),
+        )
+
+
+class _OrderAgent:
+    def __init__(self, name: str, hold: threading.Event, release: threading.Event) -> None:
+        self.agent_name = name
+        self.agent_version = f"{name}.v1"
+        self._hold = hold
+        self._release = release
+
+    def analyze(self, snapshot, *, cycle_id: str = ""):
+        self._hold.set()
+        self._release.wait(timeout=2.0)
+        return _pass_result(
+            snapshot,
+            agent_name=self.agent_name,
+            agent_version=self.agent_version,
+            cycle_id=cycle_id,
+            observations=(self.agent_name,),
         )
 
 
@@ -169,13 +238,136 @@ class Orchestration4BTests(unittest.TestCase):
 
     def test_timeout_marks_agent_unavailable(self) -> None:
         orch = AnalysisOrchestrator(
-            specialists=(_SlowAgent(),),
+            specialists=(_SlowAgent(delay=0.5),),
             agent_timeout_seconds=0.05,
         )
         package = orch.run(_snap(), cycle_id="cycle-timeout")
         self.assertEqual(package.agent_outputs[0].status, AgentStatus.ERROR)
         self.assertIn("TIMEOUT", package.agent_outputs[0].invalidation_reason or "")
         self.assertIn("slow", package.unavailable_agents)
+
+    def test_a_bounded_timeout_does_not_wait_for_slow_worker(self) -> None:
+        """Orchestration must return after timeout without waiting for sleep to finish."""
+        orch = AnalysisOrchestrator(
+            specialists=(_SlowAgent(delay=0.5),),
+            agent_timeout_seconds=0.05,
+        )
+        started = time.monotonic()
+        package = orch.run(_snap(), cycle_id="cycle-timeout-bound")
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 0.35, msg=f"dispatcher blocked too long: {elapsed:.3f}s")
+        self.assertGreaterEqual(elapsed, 0.04)
+        row = package.agent_outputs[0]
+        self.assertEqual(row.status, AgentStatus.ERROR)
+        self.assertIn("AGENT_TIMEOUT", row.risk_flags)
+
+    def test_b_timeout_classification(self) -> None:
+        orch = AnalysisOrchestrator(
+            specialists=(_SlowAgent(delay=0.5),),
+            agent_timeout_seconds=0.05,
+        )
+        package = orch.run(_snap(), cycle_id="cycle-timeout-class")
+        row = package.agent_outputs[0]
+        self.assertEqual(row.status, AgentStatus.ERROR)
+        self.assertIn("AGENT_TIMEOUT", row.risk_flags)
+        self.assertIn("TIMEOUT", row.invalidation_reason or "")
+        self.assertEqual(row.findings, ("AGENT_UNAVAILABLE",))
+        self.assertEqual(row.candidate_action, CandidateAction.NONE)
+        self.assertIsNone(row.confidence)
+        self.assertNotIn("AGENT_FAILURE", row.risk_flags)
+
+    def test_c_ordinary_exception_classification(self) -> None:
+        orch = AnalysisOrchestrator(
+            specialists=(_BoomAgent(),),
+            agent_timeout_seconds=1.0,
+        )
+        package = orch.run(_snap(), cycle_id="cycle-failure-class")
+        row = package.agent_outputs[0]
+        self.assertEqual(row.status, AgentStatus.ERROR)
+        self.assertIn("AGENT_FAILURE", row.risk_flags)
+        self.assertNotIn("AGENT_TIMEOUT", row.risk_flags)
+        self.assertEqual(row.findings, ("AGENT_UNAVAILABLE",))
+        self.assertEqual(row.candidate_action, CandidateAction.NONE)
+
+    def test_d_parallel_execution_wall_clock(self) -> None:
+        delay = 0.12
+        specialists = (
+            _HealthyAgent("a", delay=delay),
+            _HealthyAgent("b", delay=delay),
+            _HealthyAgent("c", delay=delay),
+        )
+        orch = AnalysisOrchestrator(specialists=specialists, agent_timeout_seconds=2.0)
+        started = time.monotonic()
+        package = orch.run(_snap(), cycle_id="cycle-parallel")
+        elapsed = time.monotonic() - started
+        self.assertEqual(len(package.agent_outputs), 3)
+        self.assertEqual({row.status for row in package.agent_outputs}, {AgentStatus.PASS})
+        # Parallel ≈ max(delay); sequential would be ~3*delay.
+        self.assertLess(elapsed, delay * 2.5, msg=f"expected parallel wall clock, got {elapsed:.3f}s")
+        self.assertGreaterEqual(elapsed, delay * 0.5)
+
+    def test_e_deterministic_result_ordering(self) -> None:
+        hold_first = threading.Event()
+        hold_second = threading.Event()
+        hold_third = threading.Event()
+        release = threading.Event()
+        specialists = (
+            _OrderAgent("first", hold_first, release),
+            _OrderAgent("second", hold_second, release),
+            _OrderAgent("third", hold_third, release),
+        )
+        snap = _snap()
+
+        def _run():
+            return dispatch_agents(
+                cycle_id="cycle-order",
+                snapshot=snap,
+                specialists=specialists,
+                timeout_seconds=2.0,
+            )
+
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(_run)
+            self.assertTrue(hold_first.wait(timeout=2.0))
+            self.assertTrue(hold_second.wait(timeout=2.0))
+            self.assertTrue(hold_third.wait(timeout=2.0))
+            release.set()
+            accepted, _rejected, _records = fut.result(timeout=2.0)
+        self.assertEqual(
+            [row.agent_name for row in accepted],
+            ["first", "second", "third"],
+        )
+
+    def test_f_timeout_with_healthy_specialists(self) -> None:
+        orch = AnalysisOrchestrator(
+            specialists=(
+                _HealthyAgent("alpha"),
+                _SlowAgent(delay=0.5, name="slowpoke"),
+                _HealthyAgent("beta"),
+                _BullAgent(),
+            ),
+            agent_timeout_seconds=0.05,
+        )
+        package = orch.run(_snap(), cycle_id="cycle-mixed-timeout")
+        by_name = {row.agent_name: row for row in package.agent_outputs}
+        self.assertEqual(
+            [row.agent_name for row in package.agent_outputs],
+            ["alpha", "slowpoke", "beta", "bull"],
+        )
+        self.assertEqual(by_name["alpha"].status, AgentStatus.PASS)
+        self.assertEqual(by_name["beta"].status, AgentStatus.PASS)
+        self.assertEqual(by_name["bull"].status, AgentStatus.PASS)
+        timed = by_name["slowpoke"]
+        self.assertEqual(timed.status, AgentStatus.ERROR)
+        self.assertIn("AGENT_TIMEOUT", timed.risk_flags)
+        self.assertEqual(timed.candidate_action, CandidateAction.NONE)
+        self.assertIn("slowpoke", package.unavailable_agents)
+        # Timed-out agent must not create an actionable recommendation.
+        self.assertNotEqual(timed.candidate_action, CandidateAction.PAPER_OPEN)
+        # ERROR agents must not cast direction votes from fabricated findings.
+        self.assertFalse(any("slowpoke" in c for c in package.conflicts if c.startswith("DIRECTION_")))
 
     def test_version_mismatch_rejected(self) -> None:
         snap = _snap()

@@ -8,7 +8,10 @@ Not a live trading milestone. No broker order path.
 ```
 Normalized Market Snapshot (immutable snapshot_id + version)
         ↓
+AnalysisOrchestrator  ← canonical 4B intelligence pipeline
+        ↓
 Market Data | Technical | Options | Regime | Strategy Research
+   (concurrent dispatch; shared immutable snapshot only)
         ↓
 Output validation (schema, snapshot identity, cycle id)
         ↓
@@ -17,12 +20,18 @@ Conflict-preserving aggregation
 AggregateAnalysisPackage → 4C
 ```
 
+`AnalysisOrchestrator` (`grow.orchestration.cycle`) is the **canonical** 4B
+intelligence pipeline (dispatch → validate → aggregate → replay). The earlier
+`AgentCycleOrchestrator` remains as a paper-safety compatibility wrapper that
+consumes `AnalysisOrchestrator`; do not add a third orchestration path.
+
 ## Packages
 
 | Area | Path |
 |------|------|
 | Specialist agents | `grow/agents/{market_data,technical,options,regime,strategy_research}/` |
-| Orchestration | `grow/orchestration/` (`cycle`, `dispatcher`, `validator`, `aggregator`, `models`) |
+| Canonical orchestration | `grow/orchestration/` (`cycle`, `dispatcher`, `validator`, `aggregator`, `models`) |
+| Compatibility wrapper | `grow/agents/orchestrator/` (`AgentCycleOrchestrator` → Risk Guard consumer) |
 | Contracts | `grow/decision/contracts/agent_result.py` (`grow.agent.result.v2`) |
 | Snapshot | `grow/market_data/` (unchanged contract; fixture diagnostics may carry `history_closes`) |
 
@@ -42,11 +51,15 @@ Agents never fetch newer market data, fabricate missing values, place orders, or
 
 1. One `analysis_cycle_id` per run over exactly one snapshot version.
 2. Snapshot quality gate can stop the cycle before dispatch.
-3. Dispatch validates every output; snapshot mismatches are rejected and recorded.
-4. Timeouts/errors mark the agent unavailable — no fabricated substitute findings.
-5. Conflicts are preserved (`DIRECTION_CONFLICT`, action/instrument conflicts).
-6. Aggregate package is digest-stable for fixed inputs and replayable from the stored snapshot.
-7. `paper_mode=true`, `live_trading=false`, `broker_order_path=false`.
+3. Independent specialists start **concurrently** against the same immutable snapshot.
+4. Dispatch wait is **bounded**: after `timeout_seconds` the cycle continues with fail-closed `ERROR` + `AGENT_TIMEOUT` (workers are not claimed forcibly killed).
+5. Ordinary exceptions classify as `AGENT_FAILURE` (distinct from timeout).
+6. Results preserve input specialist order (not completion order).
+7. Dispatch validates every output; snapshot mismatches are rejected and recorded.
+8. Timeouts/errors mark the agent unavailable — no fabricated substitute findings, no actionable recommendation from a timed-out agent.
+9. Conflicts are preserved (`DIRECTION_CONFLICT`, action/instrument conflicts).
+10. Aggregate package is digest-stable for fixed inputs and replayable from the stored snapshot.
+11. `paper_mode=true`, `live_trading=false`, `broker_order_path=false`.
 
 ## Safety
 

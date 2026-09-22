@@ -1,4 +1,8 @@
-"""Requirement 4B orchestration layer — analysis only, no broker orders."""
+"""Requirement 4B orchestration layer — analysis only, no broker orders.
+
+Canonical pipeline: ``AnalysisOrchestrator`` (dispatch → validate → aggregate).
+``AgentCycleOrchestrator`` remains a compatibility Risk Guard consumer only.
+"""
 
 from grow.orchestration.aggregator import aggregate_outputs
 from grow.orchestration.cycle import AnalysisCycleStore, AnalysisOrchestrator, stable_cycle_id

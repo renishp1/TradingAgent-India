@@ -25,9 +25,12 @@ def aggregate_outputs(
     conflicts = list(debate.conflicts)
 
     # Finding-level conflicts (e.g. bullish technical vs bearish regime).
+    # ERROR / unavailable specialists (including timeouts) never cast a direction vote.
     bullish = []
     bearish = []
     for row in outputs:
+        if row.status is AgentStatus.ERROR:
+            continue
         blob = " ".join(row.findings + row.interpretation).upper()
         if any(token in blob for token in ("BULL", "TRENDING_UP", "SMA_FAST_ABOVE")):
             bullish.append(row.agent_name)

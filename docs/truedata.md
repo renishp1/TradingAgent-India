@@ -1,6 +1,11 @@
-# Milestone 3C — Real Indian live market-data adapter (TrueData)
+# Milestone 3C (historical) — TrueData live market-data adapter
 
-Status: **TrueData adapter feeds the existing 3A/3B paper loop.**  
+> **Historical / legacy.** Current 3C direction is **provider-neutral** market
+> data with **Zerodha/Kite** (`kite_market`) as the active real quote provider.
+> This document retains the TrueData adapter contract for history and
+> regression; do not treat TrueData as the only 3C path.
+
+Status (legacy): **TrueData adapter feeds the existing 3A/3B paper loop.**  
 3C.1 classifies expiries. 3C.2 is the real-account smoke + first-tick evidence
 path. No broker. No live orders. No silent fixture fallback.
 
