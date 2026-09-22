@@ -10,8 +10,11 @@ Milestone 2H (provider evaluation, nearest weekly) lives in [`docs/provider.md`]
 Milestone 2I (dynamic index/expiry discovery) lives in [`docs/dynamic.md`](dynamic.md).
 Milestone 3A (live stream → paper) lives in [`docs/live_data.md`](live_data.md).
 Milestone 3B (paper MTM + exits) lives in [`docs/positions.md`](positions.md).
-Milestone 3C (TrueData live adapter) lives in [`docs/truedata.md`](truedata.md).
-Milestone 4B (specialist agents & orchestration) lives in [`docs/milestone-4b.md`](milestone-4b.md).
+Milestone 3C is **provider-neutral live market data** (current real provider:
+Zerodha/Kite market-data quotes only). Historical TrueData adapter notes live in
+[`docs/truedata.md`](truedata.md) (legacy). Milestone 4B (specialist agents &
+orchestration; canonical `AnalysisOrchestrator`) lives in
+[`docs/milestone-4b.md`](milestone-4b.md).
 
 ## Product split
 

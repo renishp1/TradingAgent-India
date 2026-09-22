@@ -135,7 +135,8 @@ class HardeningOrchestratorTests(unittest.TestCase):
         started = time.monotonic()
         decision = orch.run(_snapshot())
         elapsed = time.monotonic() - started
-        self.assertLess(elapsed, 2.0)
+        # Must not block on the slow worker after the bounded timeout.
+        self.assertLess(elapsed, 1.0)
         result = decision.agent_results[0]
         self.assertEqual(result.status, AgentStatus.ERROR)
         self.assertIn("AGENT_TIMEOUT", result.risk_flags)
