@@ -383,6 +383,70 @@ class LoopTests(unittest.TestCase):
         self.assertNotEqual(second.reason, "SNAPSHOT_INTERVAL")
         self.assertEqual(second.reason, "DUPLICATE_OPEN_POSITION")
 
+    def test_provider_failure_does_not_consume_interval(self) -> None:
+        loop = _loop(
+            [
+                {"provider": "grow.data.fixture.v1", "sequence": 1, "is_fixture": True},
+                bullish_event(sequence=1),
+            ],
+            config=_live_config(
+                snapshot_interval_seconds=10,
+                session_timeout_seconds=3600,
+                max_staleness_seconds=30,
+            ),
+        )
+        first = loop.run_once("NIFTY")[0]
+        self.assertEqual(first.status, CycleStatus.NO_TRADE)
+        self.assertIn("FIXTURE_FALLBACK_FORBIDDEN", first.reason)
+        self.assertIsNone(loop._last_cycle_at)
+        second = loop.run_once("NIFTY")[0]
+        self.assertNotEqual(second.reason, "SNAPSHOT_INTERVAL")
+        self.assertEqual(second.status, CycleStatus.PAPER_FILL, second.reason)
+        self.assertEqual(loop._last_cycle_at, loop.clock.now())
+
+    def test_invalid_snapshot_does_not_consume_interval(self) -> None:
+        future = AS_OF + timedelta(seconds=5)
+        bad = bullish_event(sequence=1)
+        bad["event_time"] = future.isoformat()
+        bad["received_time"] = future.isoformat()
+        loop = _loop(
+            [bad, bullish_event(sequence=1)],
+            config=_live_config(
+                snapshot_interval_seconds=10,
+                session_timeout_seconds=3600,
+                max_staleness_seconds=30,
+            ),
+        )
+        first = loop.run_once("NIFTY")[0]
+        self.assertEqual(first.status, CycleStatus.NO_TRADE)
+        self.assertIn("FUTURE_SNAPSHOT", first.reason)
+        self.assertIsNone(loop._last_cycle_at)
+        second = loop.run_once("NIFTY")[0]
+        self.assertNotEqual(second.reason, "SNAPSHOT_INTERVAL")
+        self.assertEqual(second.status, CycleStatus.PAPER_FILL, second.reason)
+
+    def test_interval_measured_from_successful_cycle_completion(self) -> None:
+        loop = _loop(
+            [bullish_event(sequence=1), bullish_event(sequence=2)],
+            config=_live_config(
+                snapshot_interval_seconds=10,
+                session_timeout_seconds=3600,
+                max_staleness_seconds=30,
+            ),
+        )
+        first = loop.run_once("NIFTY")[0]
+        self.assertEqual(first.status, CycleStatus.PAPER_FILL, first.reason)
+        completed_at = loop.clock.now()
+        self.assertEqual(loop._last_cycle_at, completed_at)
+        loop.clock.advance(timedelta(seconds=9))
+        blocked = loop.run_once("NIFTY")[0]
+        self.assertEqual(blocked.reason, "SNAPSHOT_INTERVAL")
+        self.assertEqual(loop._last_cycle_at, completed_at)
+        loop.clock.advance(timedelta(seconds=1))
+        nxt = loop.run_once("NIFTY")[0]
+        self.assertNotEqual(nxt.reason, "SNAPSHOT_INTERVAL")
+        self.assertEqual(loop._last_cycle_at, loop.clock.now())
+
 
     def test_disconnect_no_trade(self) -> None:
         loop = _loop([bullish_event()])

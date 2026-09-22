@@ -191,7 +191,6 @@ class LivePaperLoop:
             )
             self.cycles.append(report)
             return [report]
-        self._last_cycle_at = self.clock.now()
         try:
             raw = self.provider.poll()
         except GrowConfigError as exc:
@@ -276,12 +275,14 @@ class LivePaperLoop:
                 )
                 self.cycles.append(report)
                 reports.append(report)
+            self._complete_cycle()
             return reports
         self._transition(SessionHealth.RUNNING)
         targets = [underlying] if underlying else list(snapshot.underlyings)
         reports: list[LiveCycleReport] = []
         for symbol in targets:
             reports.append(self._evaluate(symbol, snapshot))
+        self._complete_cycle()
         return reports
 
     def _evaluate(self, symbol: str, snapshot: LiveSnapshot) -> LiveCycleReport:
@@ -476,6 +477,9 @@ class LivePaperLoop:
             return False
         elapsed = (self.clock.now() - self._last_cycle_at).total_seconds()
         return elapsed < interval
+
+    def _complete_cycle(self) -> None:
+        self._last_cycle_at = self.clock.now()
 
     def _ensure_universe(self, ticker: str) -> None:
         current = self.guard.config.market.universe

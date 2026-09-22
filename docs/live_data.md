@@ -73,7 +73,7 @@ The loop only refuses a cycle using the injected `Clock`:
 | Knob | Behaviour |
 |---|---|
 | `session_timeout_seconds` | Session age ≥ timeout → `stop()`, health `STOPPED`, `SESSION_TIMEOUT` / NO_TRADE. The session cannot continue. |
-| `snapshot_interval_seconds` | After a processed cycle, a later `run_once()` before the interval has elapsed returns `SNAPSHOT_INTERVAL` / NO_TRADE without polling. `0` disables the gate. |
+| `snapshot_interval_seconds` | Measured from **completion** of a cycle that processed a valid snapshot. A later `run_once()` before the interval has elapsed returns `SNAPSHOT_INTERVAL` / NO_TRADE without polling. Provider failures and invalid/future/out-of-order/duplicate snapshots do not start the interval. `0` disables the gate. |
 
 These gates are deterministic under `FrozenClock.advance()`.
 
