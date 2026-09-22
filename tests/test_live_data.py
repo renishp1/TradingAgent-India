@@ -147,6 +147,37 @@ class NormalizeTests(unittest.TestCase):
         self.assertFalse(snap.freshness_ok)
         self.assertTrue(any(item.startswith("STALE") for item in snap.diagnostics))
 
+    def test_future_event_time_rejected(self) -> None:
+        payload = bullish_event()
+        future = AS_OF + timedelta(seconds=5)
+        payload["event_time"] = future.isoformat()
+        payload["received_time"] = future.isoformat()
+        with self.assertRaises(GrowConfigError) as ctx:
+            normalize_event(payload, now=AS_OF, max_staleness_seconds=30, calendar=self.cal)
+        self.assertIn("FUTURE_SNAPSHOT", str(ctx.exception))
+
+    def test_future_received_time_rejected(self) -> None:
+        payload = bullish_event()
+        payload["received_time"] = (AS_OF + timedelta(seconds=5)).isoformat()
+        with self.assertRaises(GrowConfigError) as ctx:
+            normalize_event(payload, now=AS_OF, max_staleness_seconds=30, calendar=self.cal)
+        self.assertIn("FUTURE_RECEIVED_TIME", str(ctx.exception))
+
+    def test_normal_event_time_accepted(self) -> None:
+        snap = normalize_event(bullish_event(), now=AS_OF, max_staleness_seconds=30, calendar=self.cal)
+        self.assertTrue(snap.freshness_ok)
+        self.assertEqual(snap.event_time, AS_OF)
+        self.assertFalse(any("FUTURE" in item or item.startswith("STALE") for item in snap.diagnostics))
+
+    def test_future_timestamp_is_not_treated_as_fresh(self) -> None:
+        payload = bullish_event()
+        future = AS_OF + timedelta(seconds=1)
+        payload["event_time"] = future.isoformat()
+        payload["received_time"] = future.isoformat()
+        with self.assertRaises(GrowConfigError) as ctx:
+            normalize_event(payload, now=AS_OF, max_staleness_seconds=30, calendar=self.cal)
+        self.assertEqual(str(ctx.exception), "FUTURE_SNAPSHOT")
+
     def test_out_of_order_and_duplicate(self) -> None:
         first = normalize_event(bullish_event(sequence=2), now=AS_OF, max_staleness_seconds=30, calendar=self.cal)
         with self.assertRaises(GrowConfigError) as ctx:
@@ -230,6 +261,18 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(loop.ledger.book.fills, [])
         self.assertEqual(loop.health.state, SessionHealth.STALE)
 
+    def test_future_snapshot_is_no_trade(self) -> None:
+        payload = bullish_event()
+        future = AS_OF + timedelta(seconds=5)
+        payload["event_time"] = future.isoformat()
+        payload["received_time"] = future.isoformat()
+        loop = _loop([payload])
+        report = loop.run_once("NIFTY")[0]
+        self.assertEqual(report.status, CycleStatus.NO_TRADE)
+        self.assertIn("FUTURE_SNAPSHOT", report.reason)
+        self.assertEqual(loop.ledger.book.fills, [])
+        self.assertNotEqual(loop.health.state, SessionHealth.RUNNING)
+
     def test_missing_option_chain(self) -> None:
         payload = bullish_event()
         payload["contract_master"] = []
@@ -258,7 +301,10 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(report.candidate_id is not None or report.reason == "MISSING_LOT_SIZE", True)
 
     def test_duplicate_open_is_no_trade(self) -> None:
-        loop = _loop([bullish_event(sequence=1), bullish_event(sequence=2)])
+        loop = _loop(
+            [bullish_event(sequence=1), bullish_event(sequence=2)],
+            config=_live_config(snapshot_interval_seconds=0),
+        )
         first = loop.run_once("NIFTY")[0]
         self.assertEqual(first.status, CycleStatus.PAPER_FILL, first.reason)
         second = loop.run_once("NIFTY")[0]
@@ -267,13 +313,76 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(len(loop.ledger.book.fills), 1)
 
     def test_out_of_order_no_trade(self) -> None:
-        loop = _loop([bullish_event(sequence=2), bullish_event(sequence=1)])
+        loop = _loop(
+            [bullish_event(sequence=2), bullish_event(sequence=1)],
+            config=_live_config(snapshot_interval_seconds=0),
+        )
         first = loop.run_once("NIFTY")[0]
         self.assertEqual(first.status, CycleStatus.PAPER_FILL, first.reason)
         second = loop.run_once("NIFTY")[0]
         self.assertEqual(second.status, CycleStatus.NO_TRADE)
         self.assertIn("OUT_OF_ORDER", second.reason)
         self.assertEqual(len(loop.ledger.book.fills), 1)
+
+    def test_session_timeout_stops_session(self) -> None:
+        loop = _loop(
+            [bullish_event()],
+            config=_live_config(session_timeout_seconds=30, snapshot_interval_seconds=0),
+        )
+        self.assertIsInstance(loop.clock, FrozenClock)
+        loop.clock.advance(timedelta(seconds=30))
+        report = loop.run_once("NIFTY")[0]
+        self.assertEqual(report.status, CycleStatus.NO_TRADE)
+        self.assertEqual(report.reason, "SESSION_TIMEOUT")
+        self.assertEqual(loop.health.state, SessionHealth.STOPPED)
+        self.assertEqual(loop.ledger.book.fills, [])
+        later = loop.run_once("NIFTY")[0]
+        self.assertEqual(later.status, CycleStatus.NO_TRADE)
+        self.assertIn("STOPPED", later.reason)
+
+    def test_session_within_timeout_still_runs(self) -> None:
+        loop = _loop(
+            [bullish_event()],
+            config=_live_config(session_timeout_seconds=30, snapshot_interval_seconds=0, max_staleness_seconds=30),
+        )
+        loop.clock.advance(timedelta(seconds=10))
+        report = loop.run_once("NIFTY")[0]
+        self.assertEqual(report.status, CycleStatus.PAPER_FILL, report.reason)
+        self.assertEqual(loop.health.state, SessionHealth.RUNNING)
+
+    def test_snapshot_interval_blocks_until_elapsed(self) -> None:
+        loop = _loop(
+            [bullish_event(sequence=1), bullish_event(sequence=2)],
+            config=_live_config(
+                snapshot_interval_seconds=10,
+                session_timeout_seconds=3600,
+                max_staleness_seconds=30,
+            ),
+        )
+        first = loop.run_once("NIFTY")[0]
+        self.assertEqual(first.status, CycleStatus.PAPER_FILL, first.reason)
+        blocked = loop.run_once("NIFTY")[0]
+        self.assertEqual(blocked.status, CycleStatus.NO_TRADE)
+        self.assertEqual(blocked.reason, "SNAPSHOT_INTERVAL")
+        self.assertEqual(len(loop.ledger.book.fills), 1)
+        self.assertEqual(loop.health.state, SessionHealth.RUNNING)
+        loop.clock.advance(timedelta(seconds=10))
+        nxt = loop.run_once("NIFTY")[0]
+        self.assertEqual(nxt.status, CycleStatus.NO_TRADE)
+        self.assertEqual(nxt.reason, "DUPLICATE_OPEN_POSITION")
+        self.assertEqual(len(loop.ledger.book.fills), 1)
+
+    def test_snapshot_interval_zero_allows_consecutive_cycles(self) -> None:
+        loop = _loop(
+            [bullish_event(sequence=1), bullish_event(sequence=2)],
+            config=_live_config(snapshot_interval_seconds=0, session_timeout_seconds=3600),
+        )
+        first = loop.run_once("NIFTY")[0]
+        second = loop.run_once("NIFTY")[0]
+        self.assertEqual(first.status, CycleStatus.PAPER_FILL, first.reason)
+        self.assertNotEqual(second.reason, "SNAPSHOT_INTERVAL")
+        self.assertEqual(second.reason, "DUPLICATE_OPEN_POSITION")
+
 
     def test_disconnect_no_trade(self) -> None:
         loop = _loop([bullish_event()])
@@ -407,6 +516,16 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(cfg.live_data.provider, "mock")
         self.assertEqual(cfg.options.provider, "fixture")
         self.assertFalse(cfg.execution.live_trading_enabled)
+
+    def test_timing_config_bounds(self) -> None:
+        base = load_config()
+        with self.assertRaises(GrowConfigError) as ctx:
+            replace(base, live_data=replace(base.live_data, session_timeout_seconds=0)).assert_safe()
+        self.assertIn("session_timeout_seconds", str(ctx.exception))
+        with self.assertRaises(GrowConfigError) as ctx:
+            replace(base, live_data=replace(base.live_data, snapshot_interval_seconds=-1)).assert_safe()
+        self.assertIn("snapshot_interval_seconds", str(ctx.exception))
+        replace(base, live_data=replace(base.live_data, snapshot_interval_seconds=0)).assert_safe()
 
 
 if __name__ == "__main__":

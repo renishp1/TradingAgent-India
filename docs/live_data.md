@@ -49,6 +49,34 @@ cannot be selected unless `live_data.enabled=true`.
 A fixture or historical payload presented to the mock adapter fails closed
 with `FIXTURE_FALLBACK_FORBIDDEN`.
 
+## Freshness
+
+Snapshots use IST-aware `event_time` and `received_time`. Fail-closed:
+
+| Condition | Result |
+|---|---|
+| Naive timestamp | `NAIVE_TIMESTAMP` |
+| `event_time > now` | `FUTURE_SNAPSHOT` — never treated as fresh |
+| `received_time > now` | `FUTURE_RECEIVED_TIME` |
+| `received_time < event_time` | `TIMESTAMP_INVERTED` |
+| age ≤ `max_staleness_seconds` | `freshness_ok=true` |
+| age > `max_staleness_seconds` | `STALE` / NO_TRADE; health `STALE` |
+
+A future timestamp is rejected even if `age <= max_staleness_seconds`
+(negative age is not freshness).
+
+## Timing (Clock-gated, no internal scheduler)
+
+`run_once()` is pull-based. An external runner owns sleep/scheduling.
+The loop only refuses a cycle using the injected `Clock`:
+
+| Knob | Behaviour |
+|---|---|
+| `session_timeout_seconds` | Session age ≥ timeout → `stop()`, health `STOPPED`, `SESSION_TIMEOUT` / NO_TRADE. The session cannot continue. |
+| `snapshot_interval_seconds` | After a processed cycle, a later `run_once()` before the interval has elapsed returns `SNAPSHOT_INTERVAL` / NO_TRADE without polling. `0` disables the gate. |
+
+These gates are deterministic under `FrozenClock.advance()`.
+
 ## Session health
 
 `DISCONNECTED` → `CONNECTING` → `READY` → `RUNNING`.  

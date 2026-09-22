@@ -386,6 +386,10 @@ class GrowConfig:
             raise GrowConfigError("3A live_data.reconnect_policy must be fail_closed.")
         if self.live_data.max_staleness_seconds < 1:
             raise GrowConfigError("live_data.max_staleness_seconds must be >= 1")
+        if self.live_data.session_timeout_seconds < 1:
+            raise GrowConfigError("live_data.session_timeout_seconds must be >= 1")
+        if self.live_data.snapshot_interval_seconds < 0:
+            raise GrowConfigError("live_data.snapshot_interval_seconds must be >= 0")
         if self.live_data.quantity < 1:
             raise GrowConfigError("live_data.quantity (lots) must be >= 1")
         if self.live_data.enabled:

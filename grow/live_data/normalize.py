@@ -75,6 +75,11 @@ def normalize_event(
     received_time = _aware(raw.get("received_time") or raw.get("event_time"), "received_time")
     if received_time < event_time:
         raise GrowConfigError("TIMESTAMP_INVERTED")
+    now_ist = now.astimezone(IST)
+    if event_time > now_ist:
+        raise GrowConfigError("FUTURE_SNAPSHOT")
+    if received_time > now_ist:
+        raise GrowConfigError("FUTURE_RECEIVED_TIME")
     try:
         sequence = int(raw.get("sequence") or 0)
     except (TypeError, ValueError) as exc:

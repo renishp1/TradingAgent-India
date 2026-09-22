@@ -118,6 +118,7 @@ class LivePaperLoop:
         )
         self._state = SessionHealth.DISCONNECTED
         self._last_sequence: int | None = None
+        self._last_cycle_at: datetime | None = None
         self._seen_events: set[str] = set()
         self._open_contracts: set[str] = set()
         self.cycles: list[LiveCycleReport] = []
@@ -163,6 +164,34 @@ class LivePaperLoop:
             )
             self.cycles.append(report)
             return [report]
+        if self._session_timed_out():
+            self.stop()
+            report = _no_trade(
+                session_id=self.session.session_id,
+                event_id=f"{self.session.session_id}:timeout",
+                sequence=self._last_sequence or 0,
+                as_of=self.clock.now(),
+                underlying=underlying or "*",
+                reason="SESSION_TIMEOUT",
+                provider_id=self.provider.identity,
+                health=self._state,
+            )
+            self.cycles.append(report)
+            return [report]
+        if self._interval_pending():
+            report = _no_trade(
+                session_id=self.session.session_id,
+                event_id=f"{self.session.session_id}:interval",
+                sequence=self._last_sequence or 0,
+                as_of=self.clock.now(),
+                underlying=underlying or "*",
+                reason="SNAPSHOT_INTERVAL",
+                provider_id=self.provider.identity,
+                health=self._state,
+            )
+            self.cycles.append(report)
+            return [report]
+        self._last_cycle_at = self.clock.now()
         try:
             raw = self.provider.poll()
         except GrowConfigError as exc:
@@ -436,6 +465,17 @@ class LivePaperLoop:
         )
         self.cycles.append(report)
         return report
+
+    def _session_timed_out(self) -> bool:
+        elapsed = (self.clock.now() - self.session.started_at).total_seconds()
+        return elapsed >= self.config.live_data.session_timeout_seconds
+
+    def _interval_pending(self) -> bool:
+        interval = self.config.live_data.snapshot_interval_seconds
+        if interval <= 0 or self._last_cycle_at is None:
+            return False
+        elapsed = (self.clock.now() - self._last_cycle_at).total_seconds()
+        return elapsed < interval
 
     def _ensure_universe(self, ticker: str) -> None:
         current = self.guard.config.market.universe

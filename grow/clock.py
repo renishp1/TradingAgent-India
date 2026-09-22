@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -28,4 +28,9 @@ class FrozenClock(Clock):
         self._when = when.astimezone(IST)
 
     def now(self) -> datetime:
+        return self._when
+
+    def advance(self, delta: timedelta) -> datetime:
+        """Move the frozen instant forward. Tests own scheduling; this is not a runner."""
+        self._when = self._when + delta
         return self._when
