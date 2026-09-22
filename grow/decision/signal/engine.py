@@ -7,6 +7,8 @@ engine refuses a trade. Risk Guard remains outside this module.
 
 from __future__ import annotations
 
+from typing import Any
+
 from grow.config import GrowConfig, load_config
 from grow.decision.contracts.agent_result import AgentResult, AgentStatus, CandidateAction
 from grow.decision.integration.chain_filter import allow_campaign_candidate
@@ -262,7 +264,40 @@ class SignalEngine:
         )
 
 
+def _parse_float(value: Any) -> float | None:
+    """Parse an untrusted float. Fail closed on bool/None/malformed values."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed != parsed or parsed in (float("inf"), float("-inf")):
+        return None
+    return parsed
+
+
+def _parse_int(value: Any) -> int | None:
+    """Parse an untrusted int. Fail closed on bool/None/malformed values."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        if isinstance(value, float):
+            if not value.is_integer():
+                return None
+            return int(value)
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            return int(text)
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _candidate_from_agent(row: AgentResult) -> StrategyCandidate | None:
+    """Build a StrategyCandidate from agent metrics. All metric parsing fails closed."""
     metrics = dict(row.calculated_metrics or {})
     direction = str(metrics.get("direction") or "").strip().upper()
     instrument = (row.candidate_instrument or "").strip()
@@ -271,21 +306,61 @@ def _candidate_from_agent(row: AgentResult) -> StrategyCandidate | None:
         return None
     if not underlying:
         underlying = instrument.split("-")[0].upper()
-    try:
-        limit_price = float(metrics["limit_price"])
-        stop_loss = float(metrics["stop_loss"])
-    except (KeyError, TypeError, ValueError):
+
+    if "limit_price" not in metrics or "stop_loss" not in metrics:
         return None
+    limit_price = _parse_float(metrics.get("limit_price"))
+    stop_loss = _parse_float(metrics.get("stop_loss"))
+    if limit_price is None or stop_loss is None:
+        return None
+
+    if "quantity" in metrics:
+        quantity = _parse_int(metrics.get("quantity"))
+    elif "lots" in metrics:
+        quantity = _parse_int(metrics.get("lots"))
+    else:
+        return None
+    if quantity is None or quantity < 1:
+        return None
+
+    strike_raw = metrics.get("strike")
+    if strike_raw is None:
+        strike: float | None = None
+    else:
+        strike = _parse_float(strike_raw)
+        if strike is None:
+            return None
+
+    target_raw = metrics.get("target")
+    if target_raw is None:
+        target: float | None = None
+    else:
+        target = _parse_float(target_raw)
+        if target is None:
+            return None
+
+    lot_size_raw = metrics.get("lot_size")
+    if lot_size_raw is None:
+        lot_size: int | None = None
+    else:
+        lot_size = _parse_int(lot_size_raw)
+        if lot_size is None:
+            return None
+
     option_type = metrics.get("option_type")
     if option_type is None and instrument:
         token = instrument.upper().split("-")[-1]
         if token in {"CE", "PE"}:
             option_type = token
-    strike = metrics.get("strike")
+
     expiry = metrics.get("expiry")
-    target = metrics.get("target")
-    lot_size = metrics.get("lot_size")
-    quantity = int(metrics.get("quantity") or metrics.get("lots") or 1)
+    confidence = 0.0
+    if row.confidence is not None:
+        parsed_confidence = _parse_float(row.confidence)
+        if parsed_confidence is None:
+            return None
+        confidence = parsed_confidence
+
     return StrategyCandidate(
         strategy=str(metrics.get("strategy") or row.agent_name),
         instrument=instrument,
@@ -294,10 +369,10 @@ def _candidate_from_agent(row: AgentResult) -> StrategyCandidate | None:
         limit_price=limit_price,
         stop_loss=stop_loss,
         quantity=quantity,
-        confidence=float(row.confidence) if row.confidence is not None else 0.0,
+        confidence=confidence,
         option_type=None if option_type is None else str(option_type).upper(),
-        strike=None if strike is None else float(strike),
+        strike=strike,
         expiry=None if expiry is None else str(expiry),
-        target=None if target is None else float(target),
-        lot_size=None if lot_size is None else int(lot_size),
+        target=target,
+        lot_size=lot_size,
     )

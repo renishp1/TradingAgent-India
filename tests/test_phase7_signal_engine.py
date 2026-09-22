@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import unittest
+from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -187,6 +188,124 @@ class SignalEngineUnitTests(unittest.TestCase):
         self.assertEqual(signal.action, DecisionAction.NO_TRADE)
         self.assertTrue(any(item.code == "CHAIN_FILTER" for item in signal.counter_evidence))
         self.assertIn("UNKNOWN_EXPIRY_CLASS", signal.reason_codes)
+
+
+class CandidateFromAgentFailClosedTests(unittest.TestCase):
+    """Malformed agent metrics must fail closed — never raise into decide()."""
+
+    def _assert_incomplete_no_trade(self, **metric_overrides) -> CampaignSignal:
+        snap = _snapshot()
+        signal = SignalEngine().evaluate(
+            snapshot=snap,
+            package=_package(snap, _result(snap, **metric_overrides)),
+        )
+        self.assertEqual(signal.action, DecisionAction.NO_TRADE)
+        self.assertIn("INCOMPLETE_SIGNAL_CANDIDATE", signal.reason_codes)
+        self.assertTrue(
+            any(item.code == "INCOMPLETE_SIGNAL_CANDIDATE" for item in signal.counter_evidence)
+        )
+        return signal
+
+    def test_invalid_quantity_string_is_no_trade(self) -> None:
+        self._assert_incomplete_no_trade(quantity="abc")
+
+    def test_invalid_quantity_none_is_no_trade(self) -> None:
+        self._assert_incomplete_no_trade(quantity=None)
+
+    def test_invalid_strike_string_is_no_trade(self) -> None:
+        self._assert_incomplete_no_trade(strike="abc")
+
+    def test_invalid_target_string_is_no_trade(self) -> None:
+        self._assert_incomplete_no_trade(target="abc")
+
+    def test_invalid_lot_size_string_is_no_trade(self) -> None:
+        self._assert_incomplete_no_trade(lot_size="abc")
+
+    def test_invalid_limit_price_string_is_no_trade(self) -> None:
+        self._assert_incomplete_no_trade(limit_price="abc")
+
+    def test_invalid_stop_loss_string_is_no_trade(self) -> None:
+        self._assert_incomplete_no_trade(stop_loss="abc")
+
+    def test_malformed_numeric_combinations_is_no_trade(self) -> None:
+        self._assert_incomplete_no_trade(
+            quantity="abc",
+            strike="abc",
+            target="abc",
+            lot_size="abc",
+            limit_price="abc",
+            stop_loss="abc",
+        )
+
+    def test_invalid_lots_when_quantity_absent_is_no_trade(self) -> None:
+        snap = _snapshot()
+        base = _result(snap)
+        metrics = {key: value for key, value in base.calculated_metrics.items() if key != "quantity"}
+        metrics["lots"] = "abc"
+        result = replace(base, calculated_metrics=metrics)
+        signal = SignalEngine().evaluate(snapshot=snap, package=_package(snap, result))
+        self.assertEqual(signal.action, DecisionAction.NO_TRADE)
+        self.assertIn("INCOMPLETE_SIGNAL_CANDIDATE", signal.reason_codes)
+
+    def test_decide_malformed_metrics_returns_no_trade_not_raise(self) -> None:
+        """DecisionEngine.decide() stays deterministic NO_TRADE; never raises."""
+        snap = _snapshot()
+        # Required / quantity-path malformations: integrator also fails closed → NO_TRADE.
+        required_cases = (
+            {"quantity": "abc"},
+            {"quantity": None},
+            {"lot_size": "abc"},
+            {"limit_price": "abc"},
+            {"stop_loss": "abc"},
+            {
+                "quantity": "abc",
+                "strike": "abc",
+                "target": "abc",
+                "lot_size": "abc",
+                "limit_price": "abc",
+                "stop_loss": "abc",
+            },
+        )
+        for overrides in required_cases:
+            with self.subTest(overrides=overrides):
+                engine = _engine()
+                decision = engine.decide(
+                    snapshot=snap,
+                    package=_package(snap, _result(snap, **overrides)),
+                )
+                self.assertEqual(decision.action, DecisionAction.NO_TRADE)
+                self.assertEqual(decision.campaign_signal["action"], "NO_TRADE")
+                self.assertIn(
+                    "INCOMPLETE_SIGNAL_CANDIDATE",
+                    decision.campaign_signal["reason_codes"],
+                )
+                again = _engine().decide(
+                    snapshot=snap,
+                    package=_package(snap, _result(snap, **overrides)),
+                )
+                self.assertEqual(decision.action, again.action)
+                self.assertEqual(
+                    decision.campaign_signal["reason_codes"],
+                    again.campaign_signal["reason_codes"],
+                )
+                self.assertEqual(
+                    decision.campaign_signal["signal_id"],
+                    again.campaign_signal["signal_id"],
+                )
+
+        # Optional numeric malformations: SignalEngine fails closed; decide must not raise.
+        for overrides in ({"strike": "abc"}, {"target": "abc"}):
+            with self.subTest(optional=overrides):
+                engine = _engine()
+                decision = engine.decide(
+                    snapshot=snap,
+                    package=_package(snap, _result(snap, **overrides)),
+                )
+                self.assertEqual(decision.campaign_signal["action"], "NO_TRADE")
+                self.assertIn(
+                    "INCOMPLETE_SIGNAL_CANDIDATE",
+                    decision.campaign_signal["reason_codes"],
+                )
 
 
 class DecisionEngineSignalAttachmentTests(unittest.TestCase):
