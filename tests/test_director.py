@@ -7,19 +7,13 @@ from datetime import date, datetime, timedelta
 
 from grow.clock import IST
 from grow.config import load_config
-from grow.director.catalog import (
-    ACCEPT_DATASET_WARNINGS,
-    APPROVED_WITH_WARNINGS,
-    ApprovedDataSource,
-    FIXTURE_DATASET,
-    UNAPPROVED_STUB,
-    default_catalog,
-)
+from grow.director.catalog import APPROVED_WITH_WARNINGS, ApprovedDataSource, FIXTURE_DATASET, UNAPPROVED_STUB, default_catalog
 from grow.director.coordinator import BacktestCoordinator
 from grow.director.director import FixtureDirector, LogicalClock
 from grow.director.models import FROZEN, HOLD, READY, REJECT, ResearchResult, WindowSpec
 from grow.director.validate import ResearchPlanValidator
 from grow.errors import GrowConfigError
+from grow.history.models import BID_ASK_GAPS, MISSING_IV, OPTION_SNAPSHOT_GAPS
 from tests.helpers import make_runtime
 
 
@@ -364,8 +358,9 @@ class DirectorCoordinatorTests(unittest.TestCase):
 
 
 class DirectorWarningAckTests(unittest.TestCase):
-    def test_approved_with_warnings_needs_plan_ack(self) -> None:
+    def test_approved_with_warnings_needs_explicit_ids(self) -> None:
         _, plan = _valid_plan()
+        warnings = (BID_ASK_GAPS, MISSING_IV, OPTION_SNAPSHOT_GAPS)
         hist = ApprovedDataSource(
             dataset_id="hist.warn",
             provider="file",
@@ -387,15 +382,26 @@ class DirectorWarningAckTests(unittest.TestCase):
             provenance="test",
             usage_scope="HISTORICAL_RESEARCH",
             is_fixture=False,
+            quality_warnings=warnings,
         )
-        allowed = replace(hist, dataset_id="hist.ok", quality_status="APPROVED")
+        allowed = replace(hist, dataset_id="hist.ok", quality_status="APPROVED", quality_warnings=())
         cat = {**default_catalog(), hist.dataset_id: hist, allowed.dataset_id: allowed}
         warned = replace(plan, dataset_id=hist.dataset_id, dataset_version="v1")
         with self.assertRaises(GrowConfigError) as ctx:
             ResearchPlanValidator().validate(warned, cat)
         self.assertIn("WARNINGS_NOT_ACKNOWLEDGED", str(ctx.exception))
-        acked = replace(warned, acceptance_rules=plan.acceptance_rules + (ACCEPT_DATASET_WARNINGS,))
-        ResearchPlanValidator().validate(acked, cat)
+        exact = replace(warned, accepted_dataset_warnings=warnings)
+        frozen = ResearchPlanValidator().validate(exact, cat)
+        self.assertEqual(frozen.plan.accepted_dataset_warnings, warnings)
+        self.assertIn("accepted_dataset_warnings", exact.freeze_payload())
+        unknown = replace(warned, accepted_dataset_warnings=warnings + ("NOT_A_WARNING",))
+        with self.assertRaises(GrowConfigError) as ctx:
+            ResearchPlanValidator().validate(unknown, cat)
+        self.assertIn("UNKNOWN_WARNING_ID", str(ctx.exception))
+        partial = replace(warned, accepted_dataset_warnings=(MISSING_IV, BID_ASK_GAPS))
+        with self.assertRaises(GrowConfigError) as ctx:
+            ResearchPlanValidator().validate(partial, cat)
+        self.assertIn("WARNINGS_NOT_ACKNOWLEDGED", str(ctx.exception))
         clean = replace(plan, dataset_id=allowed.dataset_id, dataset_version="v1")
         ResearchPlanValidator().validate(clean, cat)
 

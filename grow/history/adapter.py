@@ -11,6 +11,8 @@ from grow.clock import IST
 from grow.errors import GrowConfigError
 from grow.history.models import (
     FRAMEWORK_TEST_ONLY,
+    KNOWN_MAPPING_POLICIES,
+    MAPPING_EXACT,
     DatasetVersion,
     HistoricalBar,
     HistoricalOptionContract,
@@ -66,7 +68,12 @@ def load_payload(raw: dict) -> CanonicalStore:
         usage_scope=str(meta_raw.get("usage_scope", FRAMEWORK_TEST_ONLY)),
         is_fixture=bool(meta_raw.get("is_fixture", False)),
         snapshot_cadence=tuple(meta_raw.get("snapshot_cadence") or ()),
+        quality_warnings=tuple(meta_raw.get("quality_warnings") or ()),
+        mapping_policy=str(meta_raw.get("mapping_policy") or MAPPING_EXACT),
+        slot_tolerance_seconds=int(meta_raw.get("slot_tolerance_seconds") or 0),
     )
+    if meta.mapping_policy not in KNOWN_MAPPING_POLICIES:
+        raise GrowConfigError(f"UNKNOWN_MAPPING_POLICY:{meta.mapping_policy}")
     store = CanonicalStore(meta)
     for row in raw.get("sessions", []):
         store.add_session(

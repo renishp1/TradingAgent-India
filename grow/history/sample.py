@@ -77,6 +77,9 @@ def build_sample_store() -> CanonicalStore:
         usage_scope=FRAMEWORK_TEST_ONLY,
         is_fixture=True,
         snapshot_cadence=("11:00", "15:15"),
+        quality_warnings=(),
+        mapping_policy="EXACT",
+        slot_tolerance_seconds=0,
     )
     store = CanonicalStore(meta)
     for day in _weekdays(START, END):

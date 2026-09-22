@@ -11,7 +11,6 @@ from grow.config import load_config
 from grow.data.schedule import complete_starts
 from grow.data.schema import Timeframe
 from grow.director.catalog import (
-    ACCEPT_DATASET_WARNINGS,
     APPROVED_WITH_WARNINGS,
     ApprovedDataSource,
     default_catalog,
@@ -22,8 +21,11 @@ from grow.history.adapter import _dt, load_payload
 from grow.history.bridge import HistoricalMarketSource, HistoricalOptionSource
 from grow.history.calendar import calendar_for, session_state_at
 from grow.history.models import (
-    APPROVED_WITH_WARNINGS,
+    BID_ASK_GAPS,
     FRAMEWORK_TEST_ONLY,
+    MISSING_IV,
+    MISSING_OI,
+    OPTION_SNAPSHOT_GAPS,
     REJECTED,
     SYNTHETIC,
     DatasetVersion,
@@ -69,6 +71,9 @@ def _meta(**kwargs) -> DatasetVersion:
         usage_scope="HISTORICAL_RESEARCH",
         is_fixture=False,
         snapshot_cadence=("11:00", "15:15"),
+        quality_warnings=(),
+        mapping_policy="EXACT",
+        slot_tolerance_seconds=0,
     )
     base.update(kwargs)
     return DatasetVersion(**base)
@@ -624,7 +629,8 @@ class HistoryHardeningTests(unittest.TestCase):
         self.assertIn(published.quality_status, {APPROVED_WITH_WARNINGS, REJECTED})
         self.assertNotEqual(published.quality_status, "APPROVED")
 
-    def test_warnings_require_explicit_ack(self) -> None:
+    def test_warnings_require_explicit_ids(self) -> None:
+        warnings = (BID_ASK_GAPS, MISSING_IV, OPTION_SNAPSHOT_GAPS)
         src = ApprovedDataSource(
             dataset_id="hist.warn",
             provider="file",
@@ -646,14 +652,46 @@ class HistoryHardeningTests(unittest.TestCase):
             provenance="test",
             usage_scope="HISTORICAL_RESEARCH",
             is_fixture=False,
+            quality_warnings=warnings,
         )
-        clean = replace(src, quality_status="APPROVED", dataset_id="hist.ok")
+        clean = replace(src, quality_status="APPROVED", dataset_id="hist.ok", quality_warnings=())
         cat = {src.dataset_id: src, clean.dataset_id: clean}
         require_historical_research(cat, clean.dataset_id)
         with self.assertRaises(GrowConfigError) as ctx:
             require_historical_research(cat, src.dataset_id)
         self.assertIn("WARNINGS_NOT_ACKNOWLEDGED", str(ctx.exception))
-        require_historical_research(cat, src.dataset_id, accept_warnings=True)
+        require_historical_research(cat, src.dataset_id, accepted_warnings=warnings)
+        with self.assertRaises(GrowConfigError) as ctx:
+            require_historical_research(cat, src.dataset_id, accepted_warnings=(MISSING_IV, "NOT_A_WARNING"))
+        self.assertIn("UNKNOWN_WARNING_ID", str(ctx.exception))
+        with self.assertRaises(GrowConfigError) as ctx:
+            require_historical_research(cat, src.dataset_id, accepted_warnings=(MISSING_IV, BID_ASK_GAPS))
+        self.assertIn("WARNINGS_NOT_ACKNOWLEDGED", str(ctx.exception))
+
+    def test_slot_mapping_schema_is_exact_for_fixture(self) -> None:
+        store = build_sample_store()
+        self.assertEqual(store.meta.mapping_policy, "EXACT")
+        self.assertEqual(store.meta.slot_tolerance_seconds, 0)
+        with self.assertRaises(GrowConfigError) as ctx:
+            CanonicalStore(_meta(mapping_policy="SILENT_NEAREST"))
+        self.assertIn("UNKNOWN_MAPPING_POLICY", str(ctx.exception))
+        loaded = load_payload(
+            {
+                "meta": {
+                    **_meta().to_dict(),
+                    "coverage_start": "2026-09-21",
+                    "coverage_end": "2026-09-21",
+                    "mapping_policy": "NEAREST_WITHIN_TOLERANCE",
+                    "slot_tolerance_seconds": 30,
+                },
+                "sessions": [_session().to_dict()],
+                "bars": [],
+                "contracts": [],
+                "quotes": [],
+            }
+        )
+        self.assertEqual(loaded.meta.mapping_policy, "NEAREST_WITHIN_TOLERANCE")
+        self.assertEqual(loaded.meta.slot_tolerance_seconds, 30)
 
     def test_missing_m15_quality_not_complete(self) -> None:
         store = CanonicalStore(_meta())

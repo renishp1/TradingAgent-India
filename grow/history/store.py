@@ -13,7 +13,15 @@ from grow.history.models import (
     ALLOWED_UNDERLYINGS,
     APPROVED,
     APPROVED_WITH_WARNINGS,
+    BID_ASK_GAPS,
     FRAMEWORK_TEST_ONLY,
+    KNOWN_MAPPING_POLICIES,
+    MAPPING_EXACT,
+    MISSING_IV,
+    MISSING_OI,
+    MISSING_SESSIONS,
+    MISSING_VOLUME,
+    OPTION_SNAPSHOT_GAPS,
     REJECTED,
     SYNTHETIC,
     CoverageReport,
@@ -29,6 +37,10 @@ from grow.history.quality import validate_bar, validate_contract, validate_quote
 class CanonicalStore:
     def __init__(self, meta: DatasetVersion) -> None:
         self.meta = meta
+        if meta.mapping_policy not in KNOWN_MAPPING_POLICIES:
+            raise GrowConfigError(f"UNKNOWN_MAPPING_POLICY:{meta.mapping_policy}")
+        if meta.slot_tolerance_seconds < 0:
+            raise GrowConfigError("SLOT_TOLERANCE")
         self._sessions: dict[date, HistoricalSession] = {}
         self._bars: dict[tuple[str, str, datetime], HistoricalBar] = {}
         self._contracts: dict[str, HistoricalOptionContract] = {}
@@ -104,6 +116,8 @@ class CanonicalStore:
         observed_quotes = 0
         missing_snaps: list[str] = []
         cadence = self.meta.snapshot_cadence
+        # v1 coverage is EXACT slot match. mapping_policy is recorded for future
+        # vendor adapters; NEAREST_WITHIN_TOLERANCE is not applied here.
         quotes_by_slot: dict[tuple[str, datetime], HistoricalOptionQuote] = {}
         for quote in self._quotes:
             quotes_by_slot[(quote.contract_id, quote.timestamp)] = quote
@@ -218,24 +232,25 @@ class CanonicalStore:
 
 
 def apply_quality_gate(meta: DatasetVersion, report: CoverageReport) -> DatasetVersion:
-    if meta.usage_scope == FRAMEWORK_TEST_ONLY or meta.is_fixture:
-        return replace(meta, quality_status=SYNTHETIC, license_status="NOT_APPROVED")
-    status = meta.quality_status
-    required_ok = not report.missing_sessions and report.expected_quotes > 0 and report.quote_completeness == 1.0
+    warnings: list[str] = []
+    if report.missing_sessions:
+        warnings.append(MISSING_SESSIONS)
+    if report.expected_quotes == 0 or report.quote_completeness < 1.0:
+        warnings.append(OPTION_SNAPSHOT_GAPS)
     if meta.bid_ask_available and report.bid_ask_completeness < 1.0:
-        required_ok = False
+        warnings.append(BID_ASK_GAPS)
     if meta.oi_available and report.oi_completeness < 1.0:
-        required_ok = False
+        warnings.append(MISSING_OI)
     if meta.volume_available and report.volume_completeness < 1.0:
-        required_ok = False
-    if not required_ok:
-        if report.observed_quotes == 0 or report.actual_sessions == 0:
-            status = REJECTED
-        else:
-            status = APPROVED_WITH_WARNINGS
-        if meta.quality_status == APPROVED:
-            status = status
-    elif status == APPROVED:
-        status = APPROVED
-    return replace(meta, quality_status=status)
+        warnings.append(MISSING_VOLUME)
+    if meta.iv_available and report.iv_completeness < 1.0:
+        warnings.append(MISSING_IV)
+    coded = tuple(sorted(dict.fromkeys(warnings)))
+    if meta.usage_scope == FRAMEWORK_TEST_ONLY or meta.is_fixture:
+        return replace(meta, quality_status=SYNTHETIC, license_status="NOT_APPROVED", quality_warnings=coded)
+    if report.observed_quotes == 0 or report.actual_sessions == 0:
+        return replace(meta, quality_status=REJECTED, quality_warnings=coded)
+    if coded:
+        return replace(meta, quality_status=APPROVED_WITH_WARNINGS, quality_warnings=coded)
+    return replace(meta, quality_status=APPROVED, quality_warnings=())
 

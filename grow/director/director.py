@@ -147,6 +147,7 @@ class FixtureDirector:
             prompt_version=PROMPT_VERSION,
             provider="fixture",
             model_name=DIRECTOR_VERSION,
+            accepted_dataset_warnings=(),
         )
         plan = replace(draft, plan_id=_plan_id(draft))
         self.plans[plan.plan_id] = plan

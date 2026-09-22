@@ -81,6 +81,7 @@ class ResearchPlan:
     prompt_version: str
     provider: str
     model_name: str
+    accepted_dataset_warnings: tuple[str, ...] = ()
 
     def freeze_payload(self) -> dict[str, Any]:
         return {
@@ -103,6 +104,7 @@ class ResearchPlan:
             "acceptance_rules": list(self.acceptance_rules),
             "exclusion_rules": list(self.exclusion_rules),
             "calibration_mode": self.calibration_mode,
+            "accepted_dataset_warnings": list(self.accepted_dataset_warnings),
             "plan_schema_version": self.plan_schema_version,
         }
 

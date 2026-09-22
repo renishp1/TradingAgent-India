@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from grow.director.catalog import acknowledge_dataset_warnings
 from grow.errors import GrowConfigError
 from grow.history.sample import build_sample_store
 from grow.history.store import CanonicalStore
@@ -31,17 +32,25 @@ class DatasetRegistry:
             raise GrowConfigError("DATASET_UNAVAILABLE")
         return self._stores[key]
 
-    def require_approved(self, dataset_id: str, version: str, *, accept_warnings: bool = False) -> CanonicalStore:
+    def require_approved(
+        self, dataset_id: str, version: str, *, accepted_warnings: tuple[str, ...] = ()
+    ) -> CanonicalStore:
         store = self.get(dataset_id, version)
         if store.meta.usage_scope != "HISTORICAL_RESEARCH" or store.meta.is_fixture:
             raise GrowConfigError(f"DATASET_FRAMEWORK_ONLY:{dataset_id}")
         if store.meta.license_status not in {"APPROVED", "APPROVED_WITH_WARNINGS"}:
             raise GrowConfigError(f"DATASET_NOT_APPROVED:{dataset_id}")
         if store.meta.quality_status == "APPROVED":
+            extra = acknowledge_dataset_warnings(store.meta.quality_warnings, accepted_warnings)
+            if extra:
+                raise GrowConfigError(";".join(extra))
             return store
         if store.meta.quality_status == "APPROVED_WITH_WARNINGS":
-            if not accept_warnings:
-                raise GrowConfigError("WARNINGS_NOT_ACKNOWLEDGED")
+            issues = acknowledge_dataset_warnings(store.meta.quality_warnings, accepted_warnings)
+            if not store.meta.quality_warnings:
+                issues = ("WARNINGS_NOT_ACKNOWLEDGED",) + issues
+            if issues:
+                raise GrowConfigError(";".join(issues))
             return store
         raise GrowConfigError(f"DATASET_NOT_APPROVED:{dataset_id}")
 
@@ -73,6 +82,9 @@ class DatasetRegistry:
                     "provenance": f"{meta.provenance}|fp={meta.fingerprint}",
                     "usage_scope": meta.usage_scope,
                     "is_fixture": meta.is_fixture,
+                    "quality_warnings": list(meta.quality_warnings),
+                    "mapping_policy": meta.mapping_policy,
+                    "slot_tolerance_seconds": meta.slot_tolerance_seconds,
                 }
             )
         return tuple(rows)

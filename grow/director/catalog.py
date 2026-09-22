@@ -12,7 +12,6 @@ from grow.errors import GrowConfigError
 APPROVED = "APPROVED"
 APPROVED_WITH_WARNINGS = "APPROVED_WITH_WARNINGS"
 NOT_APPROVED = "NOT_APPROVED"
-ACCEPT_DATASET_WARNINGS = "ACCEPT_DATASET_WARNINGS"
 FIXTURE_DATASET = "grow.data.fixture.v1"
 UNAPPROVED_STUB = "grow.data.unapproved.stub.v1"
 
@@ -39,6 +38,7 @@ class ApprovedDataSource:
     provenance: str
     usage_scope: str
     is_fixture: bool
+    quality_warnings: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -62,6 +62,7 @@ class ApprovedDataSource:
             "provenance": self.provenance,
             "usage_scope": self.usage_scope,
             "is_fixture": self.is_fixture,
+            "quality_warnings": list(self.quality_warnings),
         }
 
 
@@ -139,6 +140,7 @@ def default_catalog() -> dict[str, ApprovedDataSource]:
             provenance=row["provenance"],
             usage_scope=row.get("usage_scope", "FRAMEWORK_TEST_ONLY"),
             is_fixture=bool(row.get("is_fixture", True)),
+            quality_warnings=tuple(row.get("quality_warnings") or ()),
         )
     return cat
 
@@ -152,19 +154,43 @@ def require_approved(catalog: Mapping[str, ApprovedDataSource], dataset_id: str)
     return source
 
 
+def acknowledge_dataset_warnings(
+    dataset_warnings: tuple[str, ...] | list[str],
+    accepted: tuple[str, ...] | list[str],
+) -> tuple[str, ...]:
+    material = frozenset(dataset_warnings)
+    chosen = frozenset(accepted)
+    issues: list[str] = []
+    if not material:
+        if chosen:
+            issues.extend(f"UNKNOWN_WARNING_ID:{wid}" for wid in sorted(chosen))
+        return tuple(issues)
+    unknown = chosen - material
+    missing = material - chosen
+    if unknown:
+        issues.extend(f"UNKNOWN_WARNING_ID:{wid}" for wid in sorted(unknown))
+    if missing:
+        issues.append("WARNINGS_NOT_ACKNOWLEDGED")
+    return tuple(issues)
+
+
 def require_historical_research(
     catalog: Mapping[str, ApprovedDataSource],
     dataset_id: str,
     *,
-    accept_warnings: bool = False,
+    accepted_warnings: tuple[str, ...] = (),
 ) -> ApprovedDataSource:
     source = require_approved(catalog, dataset_id)
     if source.usage_scope != "HISTORICAL_RESEARCH" or source.is_fixture:
         raise GrowConfigError(f"DATASET_FRAMEWORK_ONLY:{dataset_id}")
     if source.quality_status == "APPROVED":
+        extra = acknowledge_dataset_warnings(source.quality_warnings, accepted_warnings)
+        if extra:
+            raise GrowConfigError(";".join(extra))
         return source
     if source.quality_status == APPROVED_WITH_WARNINGS:
-        if not accept_warnings:
-            raise GrowConfigError("WARNINGS_NOT_ACKNOWLEDGED")
+        issues = acknowledge_dataset_warnings(source.quality_warnings, accepted_warnings)
+        if issues:
+            raise GrowConfigError(";".join(issues))
         return source
     raise GrowConfigError(f"DATASET_FRAMEWORK_ONLY:{dataset_id}")

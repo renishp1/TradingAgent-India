@@ -21,6 +21,20 @@ SYNTHETIC = "SYNTHETIC"
 FRAMEWORK_TEST_ONLY = "FRAMEWORK_TEST_ONLY"
 HISTORICAL_RESEARCH = "HISTORICAL_RESEARCH"
 
+MISSING_IV = "MISSING_IV"
+BID_ASK_GAPS = "BID_ASK_GAPS"
+OPTION_SNAPSHOT_GAPS = "OPTION_SNAPSHOT_GAPS"
+MISSING_OI = "MISSING_OI"
+MISSING_VOLUME = "MISSING_VOLUME"
+MISSING_SESSIONS = "MISSING_SESSIONS"
+KNOWN_QUALITY_WARNINGS = frozenset(
+    {MISSING_IV, BID_ASK_GAPS, OPTION_SNAPSHOT_GAPS, MISSING_OI, MISSING_VOLUME, MISSING_SESSIONS}
+)
+
+MAPPING_EXACT = "EXACT"
+MAPPING_NEAREST = "NEAREST_WITHIN_TOLERANCE"
+KNOWN_MAPPING_POLICIES = frozenset({MAPPING_EXACT, MAPPING_NEAREST})
+
 
 @dataclass(frozen=True)
 class HistoricalSession:
@@ -193,6 +207,9 @@ class DatasetVersion:
     usage_scope: str
     is_fixture: bool
     snapshot_cadence: tuple[str, ...]
+    quality_warnings: tuple[str, ...]
+    mapping_policy: str
+    slot_tolerance_seconds: int
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -224,6 +241,9 @@ class DatasetVersion:
             "usage_scope": self.usage_scope,
             "is_fixture": self.is_fixture,
             "snapshot_cadence": list(self.snapshot_cadence),
+            "quality_warnings": list(self.quality_warnings),
+            "mapping_policy": self.mapping_policy,
+            "slot_tolerance_seconds": self.slot_tolerance_seconds,
             "label": "HISTORICAL DATA / RESEARCH ONLY",
         }
 

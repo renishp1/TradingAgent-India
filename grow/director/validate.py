@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from grow.director.capabilities import HARD_LOCKS, candidate_by_id
-from grow.director.catalog import ACCEPT_DATASET_WARNINGS, APPROVED, APPROVED_WITH_WARNINGS, ApprovedDataSource
+from grow.director.catalog import APPROVED, APPROVED_WITH_WARNINGS, ApprovedDataSource, acknowledge_dataset_warnings
 from grow.director.models import FROZEN, READY, ResearchPlan
 from grow.errors import GrowConfigError
 
@@ -47,10 +47,17 @@ class ResearchPlanValidator:
                 issues.append(f"DATASET_NOT_APPROVED:{plan.dataset_id}")
             if source.usage_scope == "HISTORICAL_RESEARCH":
                 if source.quality_status == APPROVED_WITH_WARNINGS:
-                    if ACCEPT_DATASET_WARNINGS not in plan.acceptance_rules:
+                    if not source.quality_warnings:
                         issues.append("WARNINGS_NOT_ACKNOWLEDGED")
+                    issues.extend(
+                        acknowledge_dataset_warnings(source.quality_warnings, plan.accepted_dataset_warnings)
+                    )
                 elif source.quality_status != APPROVED:
                     issues.append(f"DATASET_NOT_APPROVED:{plan.dataset_id}")
+                else:
+                    issues.extend(
+                        acknowledge_dataset_warnings(source.quality_warnings, plan.accepted_dataset_warnings)
+                    )
             start, end = plan.historical_period.start, plan.historical_period.end
             if start < source.date_coverage[0] or end > source.date_coverage[1] or start > end:
                 issues.append("INSUFFICIENT_COVERAGE")
