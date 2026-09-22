@@ -10,7 +10,12 @@ from dataclasses import dataclass
 from typing import Any
 
 from grow.decision.contracts.agent_result import AgentResult, AgentStatus, CandidateAction
+from grow.decision.integration.chain_filter import (
+    CHAIN_FILTER_REJECTED,
+    allow_campaign_candidate,
+)
 from grow.decision.integration.contract import AgentOutputRef, StrategyCandidate, plain_data
+from grow.config import GrowConfig
 from grow.live_data.health import MARKET_DATA_NOT_HEALTHY, reject_unhealthy_market_data
 from grow.market_data.normalized.models import AgentMarketSnapshot, DataQualityStatus
 from grow.market_data.provenance import MIXED_MARKET_DATA_SOURCE, reject_mixed_market_data
@@ -60,6 +65,8 @@ def classify_output(
 def evaluate_policy(
     snapshot: AgentMarketSnapshot,
     package: AggregateAnalysisPackage,
+    *,
+    config: GrowConfig | None = None,
 ) -> PolicyResult:
     gates: list[tuple[str, bool, str]] = []
     mixed = reject_mixed_market_data(snapshot)
@@ -235,6 +242,31 @@ def evaluate_policy(
             accepted=tuple(accepted),
         )
     gates.append(("instrument_quality", True, candidate.instrument))
+
+    chain_reject, chain = allow_campaign_candidate(snapshot, candidate, config=config)
+    if chain_reject:
+        detail = chain_reject
+        if chain.diagnostics.get("rejected"):
+            detail = f"{chain_reject}:{chain.diagnostics.get('eligible_count', 0)}"
+        gates.append(("option_chain_filter", False, detail))
+        return _closed(
+            terminal="NO_TRADE",
+            reasons=(chain_reject if chain_reject != CHAIN_FILTER_REJECTED else CHAIN_FILTER_REJECTED,),
+            gates=tuple(gates),
+            quality=quality.value,
+            package=package,
+            refs=tuple(refs),
+            accepted=tuple(accepted),
+            observations=tuple(snapshot.quality_notes)
+            + (f"chain_filter={chain.diagnostics.get('filter_version')}",),
+        )
+    gates.append(
+        (
+            "option_chain_filter",
+            True,
+            f"eligible={len(chain.eligible_quotes)};expiry={chain.selected_expiry};atm={chain.atm}",
+        )
+    )
     gates.append(("strategy_candidate", True, candidate.strategy))
 
     relied = {row.agent_name for row in actionable}

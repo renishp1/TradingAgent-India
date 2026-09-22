@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast
 import unittest
 from dataclasses import replace
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 from grow.clock import IST, FrozenClock
@@ -25,14 +25,39 @@ from tests.helpers import make_guard
 
 ROOT = Path(__file__).resolve().parents[1]
 AS_OF = datetime(2026, 9, 22, 11, 0, tzinfo=IST)
+EXPIRY = date(2026, 9, 24)
 
 
-def _snapshot(quality: DataQualityStatus = DataQualityStatus.OK, *, options=()):
+def _ce_quote(**overrides):
+    payload = dict(
+        underlying="RELIANCE",
+        expiry=EXPIRY,
+        strike=100.0,
+        option_type="CE",
+        ltp=100.0,
+        bid=99.0,
+        ask=101.0,
+        open_interest=10,
+        volume=10,
+        quote_timestamp=AS_OF,
+        quote_age_seconds=0.0,
+        provider_contract_id="RELIANCE-100-CE",
+        quality=DataQualityStatus.OK,
+        lot_size=1,
+        expiry_class="WEEKLY",
+    )
+    payload.update(overrides)
+    return OptionQuoteView(**payload)
+
+
+def _snapshot(quality: DataQualityStatus = DataQualityStatus.OK, *, options=None):
+    if options is None:
+        options = (_ce_quote(),) if quality is DataQualityStatus.OK else ()
     return build_fixture_snapshot(
         underlying="RELIANCE",
         as_of=AS_OF,
         spot=100.0,
-        option_contracts=options,
+        option_contracts=tuple(options),
         quality=quality,
         notes=("stale",) if quality is DataQualityStatus.STALE else (),
     )
@@ -69,7 +94,7 @@ def _result(snapshot, *, name="strategy_research", action=CandidateAction.PAPER_
         evidence=(f"snapshot_id={snapshot.snapshot_id}",),
         metrics_used=("limit_price", "stop_loss"),
         candidate_action=action,
-        candidate_instrument=kwargs.pop("instrument", "RELIANCE"),
+        candidate_instrument=kwargs.pop("instrument", "RELIANCE-100-CE"),
         entry_reason="test",
         invalidation_reason=None,
         risk_flags=kwargs.pop("risk_flags", ()),
@@ -207,7 +232,7 @@ class DecisionIntegrationTests(unittest.TestCase):
         decision = _integrator().integrate(snapshot=snap, package=_package(snap, (_result(snap),)))
         self.assertEqual(decision.status, IntegratedDecisionStatus.CANDIDATE)
         self.assertEqual(decision.candidate_strategy, "trend")
-        self.assertEqual(decision.candidate_instrument, "RELIANCE")
+        self.assertEqual(decision.candidate_instrument, "RELIANCE-100-CE")
         self.assertEqual(decision.direction, "BULLISH")
         self.assertFalse(decision.executed)
         self.assertFalse(decision.broker_order_path)
