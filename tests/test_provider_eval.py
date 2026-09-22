@@ -344,6 +344,7 @@ class HarnessAndVendorTests(unittest.TestCase):
                     record,
                     dataset_id=SAMPLE_ID,
                     dataset_version=fixture_src.dataset_version,
+                    fingerprint=fixture_src.fingerprint,
                     approved_for_2e=True,
                     qualification_status=APPROVED_FOR_2E,
                 ),
@@ -357,6 +358,7 @@ class HarnessAndVendorTests(unittest.TestCase):
                 is_fixture=False,
                 licensing_status="APPROVED",
                 quality_status="APPROVED",
+                fingerprint=record.fingerprint,
             ),
             record,
         )
@@ -365,6 +367,53 @@ class HarnessAndVendorTests(unittest.TestCase):
         with self.assertRaises(GrowConfigError) as ctx:
             require_approved_for_2e({updated.dataset_id: updated}, updated.dataset_id)
         self.assertIn("NOT_APPROVED_FOR_2E", str(ctx.exception))
+
+    def test_qualification_fingerprint_and_approval_binding(self) -> None:
+        store = build_eval_store()
+        record = ProviderEvaluationRunner().qualify(store)
+        src = ApprovedDataSource(
+            dataset_id=record.dataset_id,
+            provider="file",
+            instrument_scope=("NIFTY", "BANKNIFTY"),
+            date_coverage=(date(2026, 1, 1), date(2026, 12, 31)),
+            timestamp_granularity=("M15",),
+            timezone="Asia/Kolkata",
+            option_chain_depth="atm_pm2",
+            bid_ask_available=True,
+            oi_available=True,
+            volume_available=True,
+            iv_available=False,
+            greeks_available=False,
+            historical_contract_metadata=True,
+            session_calendar_version="nse.session.eval.v1",
+            quality_status="APPROVED",
+            licensing_status="APPROVED",
+            dataset_version=record.dataset_version,
+            provenance="test",
+            usage_scope="HISTORICAL_RESEARCH",
+            is_fixture=False,
+            fingerprint=record.fingerprint,
+        )
+        consume_qualification(src, record)
+        with self.assertRaises(GrowConfigError) as ctx:
+            consume_qualification(replace(src, fingerprint="deadbeef" * 8), record)
+        self.assertIn("QUALIFICATION_FINGERPRINT_MISMATCH", str(ctx.exception))
+        with self.assertRaises(GrowConfigError) as ctx:
+            consume_qualification(src, replace(record, approved_for_2e=True))
+        self.assertIn("QUALIFICATION_APPROVAL_INCONSISTENT", str(ctx.exception))
+        with self.assertRaises(GrowConfigError) as ctx:
+            consume_qualification(src, replace(record, schema="dataset.qualification.v0"))
+        self.assertIn("QUALIFICATION_SCHEMA", str(ctx.exception))
+
+    def test_adversarial_pit_leaves_original_store_unchanged(self) -> None:
+        store = build_eval_store()
+        n = len(store.all_contracts())
+        from grow.history.eval import _pit
+
+        check = _pit(store)
+        self.assertEqual(check.outcome, "PASS")
+        self.assertEqual(len(store.all_contracts()), n)
+        self.assertFalse(any(c.contract_id == "pit-adversarial-future-ce" for c in store.all_contracts()))
 
     def test_2f_rejects_framework_sample_for_2e(self) -> None:
         cat = default_catalog()

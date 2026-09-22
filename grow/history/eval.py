@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from typing import Any
 
 from grow.clock import IST
@@ -25,6 +25,8 @@ from grow.history.models import (
     QUALIFIED,
     QUALIFIED_WITH_WARNINGS,
     REJECTED,
+    HistoricalOptionContract,
+    HistoricalOptionQuote,
 )
 from grow.history.store import CanonicalStore
 from grow.options.select import choose_expiry
@@ -344,21 +346,91 @@ def _coverage(store: CanonicalStore, limitations: list[str], derived: tuple[str,
     return CheckResult("COVERAGE", "PASS", f"quotes={report.observed_quotes}/{report.expected_quotes}", False)
 
 
+def _unpublished_copy(store: CanonicalStore) -> CanonicalStore:
+    from dataclasses import replace as _replace
+
+    clone = CanonicalStore(_replace(store.meta, fingerprint="pending"))
+    for session in store._sessions.values():
+        clone.add_session(session)
+    for bar in store.all_bars():
+        clone.add_bar(bar)
+    for contract in store.all_contracts():
+        clone.add_contract(contract)
+    for quote in store.all_quotes():
+        clone.add_quote(quote)
+    return clone
+
+
 def _pit(store: CanonicalStore) -> CheckResult:
     days = [s.session_date for s in store._sessions.values() if s.status == "OPEN"]
     if not days:
         return CheckResult("PIT", "FAIL", "no open session", True)
     as_of = datetime.combine(days[0], time(11, 0), tzinfo=IST)
-    before_c, before_q = store.snapshot_quotes("NIFTY", as_of)
+    underlying = "NIFTY" if "NIFTY" in store.meta.instrument_scope else next(iter(store.meta.instrument_scope), "NIFTY")
+    try:
+        before_c, before_q = store.snapshot_quotes(underlying, as_of)
+    except Exception as exc:
+        return CheckResult("PIT", "FAIL", str(exc), True)
     future = datetime.combine(days[-1], time(15, 15), tzinfo=IST)
     if future <= as_of:
-        return CheckResult("PIT", "PASS", "single slot", True)
-    later_c, later_q = store.snapshot_quotes("NIFTY", as_of)
-    if [c.contract_id for c in before_c] != [c.contract_id for c in later_c]:
-        return CheckResult("PIT", "FAIL", "snapshot mutated", True)
-    if [q.ltp for q in before_q] != [q.ltp for q in later_q]:
-        return CheckResult("PIT", "FAIL", "quotes mutated", True)
-    return CheckResult("PIT", "PASS", "as_of snapshot stable", True)
+        future = as_of + timedelta(hours=4)
+    clone = _unpublished_copy(store)
+    cid = "pit-adversarial-future-ce"
+    clone.add_contract(
+        HistoricalOptionContract(
+            underlying=underlying,
+            expiry=(future + timedelta(days=14)).date(),
+            strike=25000,
+            option_type="CE",
+            contract_id=cid,
+            provider_contract_id=cid,
+            lot_size=75,
+            expiry_class="WEEKLY",
+            first_seen_at=future,
+            last_seen_at=future + timedelta(days=14),
+            listing_status="ACTIVE",
+            source_id=store.meta.source_id,
+            dataset_version=store.meta.version,
+        )
+    )
+    clone.add_quote(
+        HistoricalOptionQuote(
+            contract_id=cid,
+            timestamp=future,
+            bid=9.0,
+            ask=11.0,
+            ltp=10.0,
+            volume=1,
+            open_interest=1,
+            previous_open_interest=None,
+            implied_volatility=None,
+            delta=None,
+            gamma=None,
+            theta=None,
+            vega=None,
+            greek_source=None,
+            iv_source=None,
+            source_id=store.meta.source_id,
+            dataset_version=store.meta.version,
+            as_of_available_at=future,
+            quality_flags=(),
+        )
+    )
+    after_c, after_q = clone.snapshot_quotes(underlying, as_of)
+    if [c.contract_id for c in before_c] != [c.contract_id for c in after_c]:
+        return CheckResult("PIT", "FAIL", "future contract leaked into T", True)
+    if [(q.contract_id, q.timestamp, q.ltp) for q in before_q] != [(q.contract_id, q.timestamp, q.ltp) for q in after_q]:
+        return CheckResult("PIT", "FAIL", "future quote leaked into T", True)
+    if cid in {c.contract_id for c in after_c}:
+        return CheckResult("PIT", "FAIL", "adversarial contract visible at T", True)
+    later_c, later_q = clone.snapshot_quotes(underlying, future)
+    if cid not in {c.contract_id for c in later_c}:
+        return CheckResult("PIT", "FAIL", "future contract missing at T+1", True)
+    if not any(q.contract_id == cid for q in later_q):
+        return CheckResult("PIT", "FAIL", "future quote missing at T+1", True)
+    if cid in {c.contract_id for c in store.snapshot_quotes(underlying, as_of)[0]}:
+        return CheckResult("PIT", "FAIL", "original store mutated", True)
+    return CheckResult("PIT", "PASS", "adversarial future rows isolated from T", True)
 
 
 def _two_c_expiry(store: CanonicalStore, underlying: str, as_of: datetime) -> date | None:

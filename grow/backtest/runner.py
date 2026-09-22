@@ -242,7 +242,9 @@ class BacktestRunner:
             "expected_decisions": expected,
             "observed_decisions": len(ledger.decisions),
             "complete": len(ledger.decisions) == expected,
-            "dataset": DATASET,
+            "dataset": manifest.dataset_id,
+            "dataset_version": manifest.dataset_version,
+            "dataset_fingerprint": manifest.dataset_fingerprint,
         }
         leakage = assess_leakage(ledger, complete=bool(coverage["complete"]))
         return BacktestResult(manifest, ledger, metrics, tuple(stress_rows), coverage, leakage)

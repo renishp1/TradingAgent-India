@@ -40,6 +40,7 @@ class ApprovedDataSource:
     is_fixture: bool
     quality_warnings: tuple[str, ...] = ()
     qualification_status: str = ""
+    fingerprint: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -65,6 +66,7 @@ class ApprovedDataSource:
             "is_fixture": self.is_fixture,
             "quality_warnings": list(self.quality_warnings),
             "qualification_status": self.qualification_status,
+            "fingerprint": self.fingerprint,
         }
 
 
@@ -144,6 +146,7 @@ def default_catalog() -> dict[str, ApprovedDataSource]:
             is_fixture=bool(row.get("is_fixture", True)),
             quality_warnings=tuple(row.get("quality_warnings") or ()),
             qualification_status=str(row.get("qualification_status") or ""),
+            fingerprint=str(row.get("fingerprint") or ""),
         )
     return cat
 
@@ -215,12 +218,19 @@ def require_approved_for_2e(
 
 
 def consume_qualification(source: ApprovedDataSource, record) -> ApprovedDataSource:
+    if getattr(record, "schema", "") != "dataset.qualification.v1":
+        raise GrowConfigError("QUALIFICATION_SCHEMA")
+    approved = bool(record.approved_for_2e)
+    if approved != (record.qualification_status == "APPROVED_FOR_2E"):
+        raise GrowConfigError("QUALIFICATION_APPROVAL_INCONSISTENT")
     if source.dataset_id != record.dataset_id:
         raise GrowConfigError("QUALIFICATION_DATASET_MISMATCH")
     if source.dataset_version != record.dataset_version:
         raise GrowConfigError("QUALIFICATION_VERSION_MISMATCH")
+    if source.fingerprint != record.fingerprint:
+        raise GrowConfigError("QUALIFICATION_FINGERPRINT_MISMATCH")
     if source.is_fixture or source.usage_scope == "FRAMEWORK_TEST_ONLY":
-        if record.approved_for_2e or record.qualification_status == "APPROVED_FOR_2E":
+        if approved or record.qualification_status == "APPROVED_FOR_2E":
             raise GrowConfigError("FRAMEWORK_TEST_ONLY cannot become APPROVED_FOR_2E")
     return replace(
         source,

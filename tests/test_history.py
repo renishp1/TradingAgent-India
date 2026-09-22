@@ -414,6 +414,9 @@ class HistorySampleTests(unittest.TestCase):
         self.assertEqual(result.manifest.dataset_id, SAMPLE_ID)
         self.assertEqual(result.manifest.dataset_version, SAMPLE_VERSION)
         self.assertEqual(result.manifest.calendar_version, store.meta.calendar_version)
+        self.assertEqual(result.coverage["dataset"], SAMPLE_ID)
+        self.assertEqual(result.coverage["dataset_version"], SAMPLE_VERSION)
+        self.assertEqual(result.coverage["dataset_fingerprint"], store.meta.fingerprint)
         self.assertTrue(result.coverage["complete"])
         self.assertIn(result.leakage_status, {"CLEAN", "LEAKAGE", "UNKNOWN"})
 
