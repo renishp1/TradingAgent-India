@@ -21,7 +21,7 @@ classifiers = [
     "Topic :: Office/Business :: Financial :: Investment",
     "Private :: Do Not Upload",
 ]
-dependencies = []
+dependencies = ["websocket-client>=1.8.0"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]

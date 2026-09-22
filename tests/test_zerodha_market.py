@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import gzip
 import struct
 import unittest
 from datetime import timedelta
@@ -13,6 +14,8 @@ from grow.errors import GrowConfigError, GrowLiveTradingDisabled
 from grow.execution.lock import inspect_environment
 from grow.live_data.kite_market import (
     KiteMarketProvider,
+    classify_socket_failure,
+    decode_http_text,
     decode_market_packet,
     parse_nfo_instruments,
     select_option_contract,
@@ -169,6 +172,61 @@ class PacketTests(unittest.TestCase):
             decode_market_packet(b"\x00" * 10)
         self.assertIn("MALFORMED_MESSAGE", str(ctx.exception))
 
+    def test_public_packet_lengths_keep_their_offsets(self) -> None:
+        when = AS_OF - timedelta(seconds=2)
+        epoch = int(when.timestamp())
+        ltp = decode_market_packet(struct.pack(">II", CE_TOKEN, 10150))
+        self.assertEqual(len(struct.pack(">II", CE_TOKEN, 10150)), 8)
+        self.assertEqual(ltp.mode, "ltp")
+        self.assertEqual(ltp.last_price, 101.5)
+        self.assertIsNone(ltp.exchange_timestamp)
+        self.assertIsNone(ltp.bid)
+
+        index_quote = bytearray(28)
+        struct.pack_into(">I", index_quote, 0, INDEX_TOKEN)
+        struct.pack_into(">I", index_quote, 4, 2421000)
+        struct.pack_into(">I", index_quote, 8, 2430000)
+        struct.pack_into(">I", index_quote, 12, 2410000)
+        struct.pack_into(">I", index_quote, 16, 2415000)
+        struct.pack_into(">I", index_quote, 20, 2420000)
+        tick28 = decode_market_packet(bytes(index_quote))
+        self.assertEqual(tick28.mode, "index")
+        self.assertEqual(tick28.last_price, 24210.0)
+        self.assertIsNone(tick28.exchange_timestamp)
+        self.assertFalse(tick28.tradable)
+
+        index_full = bytearray(32)
+        index_full[:28] = index_quote
+        struct.pack_into(">I", index_full, 28, epoch)
+        tick32 = decode_market_packet(bytes(index_full))
+        self.assertEqual(tick32.exchange_timestamp, when)
+        self.assertIsNone(tick32.volume)
+        self.assertIsNone(tick32.bid)
+
+        quote = bytearray(44)
+        struct.pack_into(">I", quote, 0, CE_TOKEN)
+        struct.pack_into(">I", quote, 4, 10150)
+        struct.pack_into(">I", quote, 16, 40)
+        tick44 = decode_market_packet(bytes(quote))
+        self.assertEqual(tick44.mode, "quote")
+        self.assertEqual(tick44.last_price, 101.5)
+        self.assertEqual(tick44.volume, 40)
+        self.assertIsNone(tick44.open_interest)
+        self.assertIsNone(tick44.exchange_timestamp)
+        self.assertIsNone(tick44.bid)
+        self.assertIsNone(tick44.ask)
+
+        full = decode_market_packet(
+            _full_packet(CE_TOKEN, ltp=101.5, bid=101.0, ask=102.0, volume=40, oi=80, when=when)
+        )
+        self.assertEqual(len(_full_packet(CE_TOKEN, ltp=1, bid=1, ask=1, volume=1, oi=1, when=when)), 184)
+        self.assertEqual(full.mode, "full")
+        self.assertEqual(full.exchange_timestamp, when)
+        self.assertEqual(full.bid, 101.0)
+        self.assertEqual(full.ask, 102.0)
+        self.assertEqual(full.open_interest, 80)
+        self.assertEqual(full.volume, 40)
+
 
 class OptionGateTests(unittest.TestCase):
     def test_index_tick_does_not_pass_the_option_gate(self) -> None:
@@ -313,6 +371,50 @@ class OptionGateTests(unittest.TestCase):
         self.assertIsNone(report["first_option_tick"])
         self.assertFalse(report["option_tick_ok"])
         loop.stop()
+
+
+class CatalogEncodingTests(unittest.TestCase):
+    def test_gzip_nfo_payload_becomes_option_rows(self) -> None:
+        compressed = gzip.compress(CSV.encode("utf-8"))
+        self.assertEqual(compressed[:2], b"\x1f\x8b")
+        text = decode_http_text(compressed)
+        rows = parse_nfo_instruments(text)
+        calls = [row for row in rows if row.underlying == "NIFTY" and row.option_type == "CE"]
+        puts = [row for row in rows if row.underlying == "NIFTY" and row.option_type == "PE"]
+        self.assertGreaterEqual(len(calls), 1)
+        self.assertGreaterEqual(len(puts), 1)
+        self.assertEqual(calls[0].instrument_token, CE_TOKEN)
+        plain = decode_http_text(CSV.encode("utf-8"))
+        self.assertEqual(parse_nfo_instruments(plain), rows)
+
+
+class SocketFailureTests(unittest.TestCase):
+    def test_connection_errors_stay_distinct_and_sanitized(self) -> None:
+        class _Auth(Exception):
+            def __init__(self) -> None:
+                super().__init__("wss://example?access_token=SECRETTOKEN")
+                self.status_code = 403
+
+        self.assertEqual(classify_socket_failure(_Auth()), "AUTH_FAILED")
+        self.assertEqual(classify_socket_failure(ConnectionRefusedError("down")), "CONNECT_FAILED")
+        self.assertEqual(classify_socket_failure(TimeoutError("slow")), "CONNECT_FAILED")
+        self.assertEqual(classify_socket_failure(ImportError("websocket")), "DEPENDENCY_MISSING")
+
+        class _Closed(Exception):
+            pass
+
+        _Closed.__name__ = "WebSocketConnectionClosedException"
+        self.assertEqual(classify_socket_failure(_Closed()), "FEED_DISCONNECTED")
+        self.assertEqual(classify_socket_failure(RuntimeError("socket blew up")), "NETWORK_ERROR")
+        self.assertNotIn("SECRETTOKEN", classify_socket_failure(_Auth()))
+
+    def test_socket_client_is_declared(self) -> None:
+        text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertIn("websocket-client", text)
+        market = (ROOT / "grow" / "live_data" / "kite_market.py").read_text(encoding="utf-8")
+        self.assertNotIn("place_order", market)
+        self.assertNotIn("/orders", market)
+        self.assertNotIn("kiteconnect", market.lower())
 
 
 class ZerodhaSmokeSafetyTests(unittest.TestCase):
