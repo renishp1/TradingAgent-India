@@ -41,6 +41,9 @@ grow:
   paper:
     starting_cash: 1000000
     venue_id: GROW_PAPER
+    fill_model: deterministic
+    entry_price_source: LTP
+    exit_price_source: BID
 
   model:
     provider: mock
