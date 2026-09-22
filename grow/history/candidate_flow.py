@@ -227,7 +227,7 @@ def _require_lot(store: CanonicalStore, decision: OptionsDecision, source: str) 
             candidate=None,
             diagnostics=decision.diagnostics + (MISSING_LOT_SIZE,),
         )
-    return decision
+    return replace(decision, candidate=replace(cand, lot_size=lot))
 
 
 class DynamicCandidateOrchestrator:

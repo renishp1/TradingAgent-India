@@ -174,6 +174,7 @@ class OptionCandidate:
     strategy_version: str
     selection_version: str
     reasons: tuple[str, ...]
+    lot_size: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         if self.intent != "BUY":
@@ -214,6 +215,7 @@ class OptionCandidate:
             "strategy_version": self.strategy_version,
             "selection_version": self.selection_version,
             "reasons": list(self.reasons),
+            "lot_size": self.lot_size,
             "executed": False,
         }
 

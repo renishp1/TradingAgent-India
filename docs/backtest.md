@@ -37,6 +37,8 @@ Metrics + walk-forward TEST windows (no calibration)
 | Exit | 15:15 IST square-off (or earlier stop/target) |
 | Quantity | **lots**; `lot_size` is the contract multiplier |
 | P&L | `(exit − entry) × lot_size × lots` |
+| Historical lot | canonical contract `lot_size` (never the global config default) |
+| Fixture lot | configured `backtest.lot_size` is the fixture contract multiplier |
 | Walk-forward | TRAIN/VALIDATE/TEST windows; **`calibration_mode=NONE`** |
 | Trainable parameters | `()` — v1 does not tune |
 | Costs | `costs.india.fn_o.v1` (brokerage, STT sell, exchange, GST) |

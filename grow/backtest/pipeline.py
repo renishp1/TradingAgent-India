@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 
 from grow.backtest.calendar import SQUARE_OFF, at_session
@@ -40,6 +41,34 @@ def _find_contract(contracts: tuple[OptionContract, ...], candidate: OptionCandi
         ):
             return contract
     return None
+
+
+def historical_store_of(hub, chains):
+    store = getattr(chains, "store", None)
+    if store is not None:
+        return store
+    source = getattr(hub, "source", None)
+    return getattr(source, "store", None)
+
+
+def bind_execution_lot(candidate: OptionCandidate, *, store, fixture_lot_size: int) -> OptionCandidate | str:
+    """Historical P&L uses canonical contract lot_size. Fixture uses configured lot size."""
+    if store is None or getattr(getattr(store, "meta", None), "is_fixture", True):
+        lot = candidate.lot_size if candidate.lot_size is not None and candidate.lot_size >= 1 else fixture_lot_size
+        if lot < 1:
+            return "MISSING_LOT_SIZE"
+        return replace(candidate, lot_size=lot)
+    resolved = store.contract_for_candidate(
+        underlying=candidate.underlying,
+        expiry=candidate.expiry,
+        strike=candidate.strike,
+        option_type=candidate.option_type,
+        as_of=candidate.as_of,
+        provider_contract_id=candidate.contract_symbol,
+    )
+    if resolved is None or resolved.lot_size is None or resolved.lot_size < 1:
+        return "MISSING_LOT_SIZE"
+    return replace(candidate, lot_size=resolved.lot_size)
 
 
 def _path_exit(signal: StrategySignal, bars, decision_as_of: datetime) -> tuple[datetime | None, str]:
@@ -131,6 +160,17 @@ class DecisionPipeline:
             )
             return
         candidate = options.candidate
+        bound = bind_execution_lot(
+            candidate,
+            store=historical_store_of(self.hub, self.chains),
+            fixture_lot_size=self.lot_size,
+        )
+        if isinstance(bound, str):
+            self.ledger.record_decision(
+                DecisionRow(as_of, ticker, "NO_TRADE", bound, signal.signal_id, candidate.candidate_id, None, self.ablation)
+            )
+            return
+        candidate = bound
         if signal.direction == "BULLISH" and candidate.option_type != "CE":
             self.ledger.record_decision(
                 DecisionRow(as_of, ticker, "NO_TRADE", "BULLISH_PE", signal.signal_id, candidate.candidate_id, None, self.ablation)
@@ -205,8 +245,14 @@ class DecisionPipeline:
             )
             return
         lots = entry.quantity
-        gross = contract_pnl(entry=entry.price, exit=filled.price, lots=lots, lot_size=self.lot_size)
-        cost = self.costs.round_trip(entry=entry.price, exit=filled.price, quantity=lots, lot_size=self.lot_size)
+        lot = candidate.lot_size
+        if lot is None or lot < 1:
+            self.ledger.record_decision(
+                DecisionRow(as_of, ticker, "NO_TRADE", "MISSING_LOT_SIZE", signal.signal_id, candidate.candidate_id, decision_id, self.ablation)
+            )
+            return
+        gross = contract_pnl(entry=entry.price, exit=filled.price, lots=lots, lot_size=lot)
+        cost = self.costs.round_trip(entry=entry.price, exit=filled.price, quantity=lots, lot_size=lot)
         net = round(gross - cost, 4)
         trade = BacktestTrade(
             trade_id=f"{self.run_id}:{ticker}:{as_of.isoformat()}:{candidate.candidate_id[:8]}",
@@ -223,7 +269,7 @@ class DecisionPipeline:
             entry_reference=entry.reference,
             entry_fill=entry.price,
             quantity=lots,
-            lot_size=self.lot_size,
+            lot_size=lot,
             exit_reason=reason,
             exit_timestamp=exit_at,
             exit_fill=filled.price,

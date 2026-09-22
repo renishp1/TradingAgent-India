@@ -465,6 +465,7 @@ class QualificationAndFlowTests(unittest.TestCase):
         self.assertEqual(kept.status, DecisionStatus.CANDIDATE)
         self.assertNotIn(MISSING_LOT_SIZE, kept.diagnostics)
         self.assertEqual(kept.candidate.contract_symbol, provider_id)
+        self.assertEqual(kept.candidate.lot_size, 75)
 
 
 if __name__ == "__main__":
