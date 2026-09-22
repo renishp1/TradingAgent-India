@@ -84,20 +84,36 @@ Previous-connection ids (e.g. `101` after a reconnect that mapped `201`) are rej
 
 ## Expiry class
 
-TrueData symbol lists do not carry `expiry_class`. Grow does not invent one.
+TrueData symbol lists usually omit `expiry_class`. Grow never infers WEEKLY
+from option-ness.
 
-| Provider value | Stored class | Eligible for 2I selection / trading |
-|---|---|---|
-| `WEEKLY` | `WEEKLY` | yes |
-| `MONTHLY` | `MONTHLY` | yes |
-| missing / anything else | `UNKNOWN` | **no** |
+Milestone 3C.1 adds `grow.live_data.expiry_class.ExpiryClassifier`
+(`expiry.class.nse.v1`) on top of the 2026 cash session calendar
+(`nse.session.cash.2026.v1`).
 
-`UNKNOWN` is never coerced to `WEEKLY` in catalog normalization, snapshot
-`contract_master`, or `_expiry_records()`. 2I profiles (`WEEKLY_PREFERRED`,
-`MONTHLY_ONLY`, `WEEKLY_THEN_MONTHLY`) therefore cannot treat an unknown
-contract as weekly or monthly. The adapter records `UNKNOWN_EXPIRY_CLASS`
-on the subscription log. There is no NSE expiry-calendar classifier in this
-tree; adding one is a later milestone, not a silent fallback.
+Precedence:
+
+1. Explicit provider `WEEKLY` / `MONTHLY` that **agrees** with the calendar.
+2. Otherwise the versioned weekday calendar (weekly weekday, last monthly
+   weekday of the month, holiday-adjusted to the previous session).
+3. Provider vs calendar disagreement → `UNKNOWN` + `CLASSIFICATION_CONFLICT`.
+4. No schedule for the underlying → `UNKNOWN` + `CLASSIFIER_NOT_READY`.
+5. Anything else → `UNKNOWN` + `UNKNOWN_EXPIRY_CLASS`.
+
+| Result | Eligible for 2I selection / live subscription |
+|---|---|
+| `WEEKLY` | yes |
+| `MONTHLY` | yes |
+| `UNKNOWN` | **no** |
+
+The classifier is keyed by provider symbol + expiry + policy/calendar
+versions. A reconnect recomputes when those versions change; it does not
+reuse a stale class. 2I profiles (`WEEKLY_PREFERRED`, `MONTHLY_ONLY`,
+`WEEKLY_THEN_MONTHLY`) are unchanged — they only see classified contracts.
+
+Default weekday schedules are a versioned policy overlay (not a hard-coded
+NIFTY/BANKNIFTY universe). An index without a schedule stays UNKNOWN even
+if the 2I overlay would otherwise allow it.
 
 ## Catalog discovery
 

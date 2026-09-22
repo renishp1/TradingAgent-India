@@ -29,6 +29,7 @@ from grow.live_data.catalog import (
     normalize_catalog_row,
     parse_catalog_text,
 )
+from grow.live_data.expiry_class import ExpiryClassifier, classification_counts
 from grow.live_data.protocol import (
     AUTH,
     CATALOG,
@@ -304,10 +305,12 @@ class TrueDataAdapter:
         as_of: datetime | None = None,
         socket_factory: Any | None = None,
         catalog_loader: Any | None = None,
+        classifier: ExpiryClassifier | None = None,
     ) -> None:
         self.settings = settings or TrueDataSettings()
         self.clock = clock or FrozenClock(datetime.now(tz=IST))
         self.registry = registry or default_index_registry()
+        self.classifier = classifier or ExpiryClassifier(clock=self.clock)
         self._as_of = as_of
         self._state = SessionHealth.DISCONNECTED
         self._error: str | None = None
@@ -363,10 +366,37 @@ class TrueDataAdapter:
 
     def _upsert_instrument(self, row: Mapping[str, Any]) -> dict[str, Any]:
         item = normalize_catalog_row(row)
+        raw_class = _raw_provider_class(row)
+        item["provider_expiry_class"] = raw_class
+        if item.get("option_type") in {"CE", "PE"} and item.get("expiry") is not None:
+            expiry = item["expiry"] if isinstance(item["expiry"], date) else date.fromisoformat(str(item["expiry"]))
+            classified = self.classifier.classify(
+                provider_symbol=str(item["provider_symbol"]),
+                canonical_symbol=str(item["canonical_symbol"]),
+                expiry=expiry,
+                option_type=str(item["option_type"]),
+                provider_class=raw_class,
+                as_of=self.clock.now(),
+            )
+            item["expiry_class"] = classified.expiry_class
+            item["classification"] = classified.to_dict()
         existing = {rec["provider_symbol"]: rec for rec in self._instruments}
         existing[item["provider_symbol"]] = item
         self._instruments = list(existing.values())
         return item
+
+    def _reclassify_instruments(self) -> None:
+        rows = list(self._instruments)
+        self._instruments = []
+        for row in rows:
+            payload = dict(row)
+            raw = row.get("provider_expiry_class")
+            if raw in (None, ""):
+                payload.pop("expiry_class", None)
+                payload.pop("class", None)
+            else:
+                payload["expiry_class"] = raw
+            self._upsert_instrument(payload)
 
     def _seed_catalog_from_events(self, events: Sequence[Mapping[str, Any]]) -> None:
         for event in events:
@@ -454,6 +484,7 @@ class TrueDataAdapter:
             self._note("DEGRADED", "METADATA_UNAVAILABLE")
             raise GrowConfigError("METADATA_UNAVAILABLE")
         self._clear_symbol_map()
+        self._reclassify_instruments()
         self._note_unknown_expiry_classes()
         self._state = SessionHealth.READY
         self._note("READY", "authenticated")
@@ -489,6 +520,9 @@ class TrueDataAdapter:
             "reconnect_count": self.reconnect_count,
             "subscribed": list(self._desired),
             "mapping_ready": self._mapping_ready,
+            "classification": classification_counts(self._instruments),
+            "classifier_policy_version": self.classifier.policy_version,
+            "classifier_calendar_version": self.classifier.calendar_version,
             "live_trading": False,
         }
 
@@ -747,6 +781,9 @@ class TrueDataAdapter:
                         "instrument_type": "OPTIDX",
                         "lot_size": row.get("lot_size"),
                         "expiry_class": str(klass).upper(),
+                        "classification_rule_id": (row.get("classification") or {}).get("rule_id") if isinstance(row.get("classification"), dict) else None,
+                        "classification_evidence_source": (row.get("classification") or {}).get("evidence_source") if isinstance(row.get("classification"), dict) else None,
+                        "classification_policy_version": (row.get("classification") or {}).get("policy_version") if isinstance(row.get("classification"), dict) else None,
                     }
                 )
                 quote = self._quotes.get(row["provider_symbol"])
@@ -769,6 +806,9 @@ class TrueDataAdapter:
             "option_quotes": quotes,
             "is_fixture": False,
             "snapshot_id": f"td-{self._adapter_seq}-{uuid4().hex[:8]}",
+            "classification": classification_counts(self._instruments),
+            "classifier_policy_version": self.classifier.policy_version,
+            "classifier_calendar_version": self.classifier.calendar_version,
         }
         if self._state is SessionHealth.READY:
             self._state = SessionHealth.RUNNING
@@ -824,6 +864,9 @@ class TrueDataAdapter:
                     "type": "PLAN",
                     "symbols": list(planned),
                     "policy_fingerprint": self.registry.fingerprint,
+                    "classifier_policy_version": self.classifier.policy_version,
+                    "classifier_calendar_version": self.classifier.calendar_version,
+                    "classification": classification_counts(self._instruments),
                     "timestamp": as_of.isoformat(),
                 }
             )
@@ -883,6 +926,7 @@ class TrueDataAdapter:
         self._attempts += 1
         self.reconnect_count += 1
         self._clear_symbol_map()
+        self._reclassify_instruments()
         try:
             self.transport.resubscribe(self._desired)
         except GrowConfigError as exc:
@@ -931,3 +975,14 @@ def settings_from_live_config(live: Any) -> TrueDataSettings:
         mode=str(getattr(live, "mode", "replay")),
         max_staleness_seconds=int(getattr(live, "max_staleness_seconds", 30)),
     )
+
+
+def _raw_provider_class(row: Mapping[str, Any] | str) -> str | None:
+    if not isinstance(row, Mapping):
+        return None
+    if "expiry_class" not in row and "class" not in row:
+        return None
+    value = row.get("expiry_class") if "expiry_class" in row else row.get("class")
+    if value in (None, ""):
+        return None
+    return str(value).strip().upper()

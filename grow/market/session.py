@@ -16,6 +16,7 @@ from grow.types import SessionState
 
 # NSE cash holidays 2026 — short seed list, not the official circular.
 # Replace with an official calendar in a later data milestone.
+CALENDAR_VERSION = "nse.session.cash.2026.v1"
 _HOLIDAYS_2026 = frozenset(
     {
         date(2026, 1, 26),  # Republic Day
@@ -30,6 +31,7 @@ _HOLIDAYS_2026 = frozenset(
         date(2026, 12, 25),  # Christmas
     }
 )
+CASH_HOLIDAYS_2026 = _HOLIDAYS_2026
 
 
 def _parse_hhmm(value: str) -> time:

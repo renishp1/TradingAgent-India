@@ -895,31 +895,45 @@ class ExpiryClassTests(unittest.TestCase):
         )
         self.assertEqual(row["expiry_class"], "MONTHLY")
 
-    def test_missing_expiry_class_is_unknown_not_weekly(self) -> None:
+    def test_missing_expiry_class_is_unknown_at_parse(self) -> None:
         row = normalize_catalog_row({"provider_symbol": "NIFTY26092225000CE", "lot_size": 75})
         self.assertEqual(row["expiry_class"], UNKNOWN_EXPIRY_CLASS)
         self.assertNotEqual(row["expiry_class"], "WEEKLY")
+
+    def test_calendar_classifies_missing_weekly_and_keeps_unscheduled_unknown(self) -> None:
+        weekly = {
+            "provider_symbol": "NIFTY26092225000CE",
+            "lot_size": 75,
+            "expiry": date(2026, 9, 22),
+            "option_type": "CE",
+        }
+        unscheduled = {
+            "provider_symbol": "NIFTY26092125000CE",
+            "lot_size": 75,
+            "expiry": date(2026, 9, 21),
+            "option_type": "CE",
+        }
         adapter = TrueDataAdapter(
             events=(),
-            catalog=[row, {"provider_symbol": "NIFTY 50", "lot_size": None}],
+            catalog=[weekly, unscheduled, {"provider_symbol": "NIFTY 50", "lot_size": None}],
             settings=_settings(),
             clock=FrozenClock(AS_OF),
         )
         adapter._spots["NIFTY"] = 25000.0
         adapter.connect()
-        classes = {item["expiry_class"] for item in adapter.instrument_catalog() if item.get("option_type") == "CE"}
-        self.assertEqual(classes, {UNKNOWN_EXPIRY_CLASS})
-        self.assertNotIn("WEEKLY", classes)
-        self.assertTrue(any(ev.get("reason") == "UNKNOWN_EXPIRY_CLASS" for ev in adapter.subscription_events))
-        self.assertFalse(any(symbol.endswith("CE") for symbol in adapter._desired))
-        records = adapter._expiry_records("NIFTY")
-        self.assertTrue(records)
-        self.assertTrue(all(rec.expiry_class == UNKNOWN_EXPIRY_CLASS for rec in records))
+        by_symbol = {item["provider_symbol"]: item for item in adapter.instrument_catalog()}
+        self.assertEqual(by_symbol["NIFTY26092225000CE"]["expiry_class"], "WEEKLY")
+        self.assertEqual(by_symbol["NIFTY26092225000CE"]["classification"]["evidence_source"], "CALENDAR")
+        self.assertEqual(by_symbol["NIFTY26092125000CE"]["expiry_class"], UNKNOWN_EXPIRY_CLASS)
+        self.assertNotEqual(by_symbol["NIFTY26092125000CE"]["expiry_class"], "WEEKLY")
+        self.assertTrue(any("NIFTY26092225000CE" in symbol for symbol in adapter._desired))
+        self.assertFalse(any("NIFTY26092125000CE" in symbol for symbol in adapter._desired))
 
-    def test_monthly_only_rejects_unknown_class(self) -> None:
+    def test_monthly_only_rejects_unknown_and_weekly(self) -> None:
         catalog = [
             {"provider_symbol": "NIFTY 50", "lot_size": None},
             {"provider_symbol": "NIFTY26092225000CE", "lot_size": 75, "expiry": date(2026, 9, 22), "option_type": "CE"},
+            {"provider_symbol": "NIFTY26092125000CE", "lot_size": 75, "expiry": date(2026, 9, 21), "option_type": "CE"},
         ]
         policies = tuple(
             replace(policy, expiry_policy_profile=MONTHLY_ONLY) if policy.canonical_symbol == "NIFTY" else policy
@@ -933,23 +947,22 @@ class ExpiryClassTests(unittest.TestCase):
             registry=IndexUniverseRegistry(policies),
         )
         records = adapter._expiry_records("NIFTY")
-        self.assertTrue(all(rec.expiry_class == UNKNOWN_EXPIRY_CLASS for rec in records))
+        by_day = {rec.expiry: rec.expiry_class for rec in records}
+        self.assertEqual(by_day[date(2026, 9, 22)], "WEEKLY")
+        self.assertEqual(by_day[date(2026, 9, 21)], UNKNOWN_EXPIRY_CLASS)
         resolved = resolve_nearest_expiry("NIFTY", AS_OF, records, MONTHLY_ONLY, allow_same_day=False)
         self.assertIsNone(resolved.selected_expiry)
         self.assertIsNone(resolved.selected_expiry_class)
         self.assertTrue(any(DISALLOWED_CLASS in reason or NO_ELIGIBLE_EXPIRY in reason for reason in resolved.exclusion_reasons))
-        self.assertNotEqual(resolved.selected_expiry_class, "MONTHLY")
-        self.assertNotEqual(resolved.selected_expiry_class, "WEEKLY")
 
     def test_weekly_preferred_does_not_treat_unknown_as_weekly(self) -> None:
         catalog = [
             {"provider_symbol": "NIFTY 50", "lot_size": None},
             {
-                "provider_symbol": "NIFTY26092225000CE",
+                "provider_symbol": "NIFTY26092125000CE",
                 "lot_size": 75,
-                "expiry": date(2026, 9, 22),
+                "expiry": date(2026, 9, 21),
                 "option_type": "CE",
-                "expiry_class": UNKNOWN_EXPIRY_CLASS,
             },
             {
                 "provider_symbol": "NIFTY26092425000CE",
@@ -964,18 +977,12 @@ class ExpiryClassTests(unittest.TestCase):
         adapter.connect()
         records = adapter._expiry_records("NIFTY")
         by_class = {rec.expiry.isoformat(): rec.expiry_class for rec in records}
-        self.assertEqual(by_class["2026-09-22"], UNKNOWN_EXPIRY_CLASS)
+        self.assertEqual(by_class["2026-09-21"], UNKNOWN_EXPIRY_CLASS)
         self.assertEqual(by_class["2026-09-24"], "MONTHLY")
         resolved = resolve_nearest_expiry("NIFTY", AS_OF, records, WEEKLY_PREFERRED, allow_same_day=False)
         self.assertIsNone(resolved.selected_expiry)
         self.assertNotEqual(resolved.selected_expiry_class, "WEEKLY")
-        self.assertFalse(any("NIFTY26092225000CE" in symbol for symbol in adapter._desired))
-        snap_classes = [
-            row.get("expiry_class")
-            for row in adapter._instruments
-            if row["provider_symbol"] == "NIFTY26092225000CE"
-        ]
-        self.assertEqual(snap_classes, [UNKNOWN_EXPIRY_CLASS])
+        self.assertFalse(any("NIFTY26092125000CE" in symbol for symbol in adapter._desired))
 
 
 class SymbolMapReconnectTests(unittest.TestCase):
