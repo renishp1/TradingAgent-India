@@ -271,6 +271,28 @@ class ChainFilterUnitTests(unittest.TestCase):
         self.assertNotIn("if raw is None:\n        return ExpiryClass.WEEKLY", source)
         self.assertNotIn("except ValueError:\n        return ExpiryClass.WEEKLY", source)
         self.assertIn('UNKNOWN_EXPIRY_CLASS = "UNKNOWN_EXPIRY_CLASS"', source)
+        # Allowlist lookup only — no direct fabricate return of WEEKLY for bad inputs.
+        self.assertIn("_ALLOWED_EXPIRY_CLASS", source)
+
+    def test_unclassified_expiry_cannot_produce_eligible_candidate(self) -> None:
+        """Option chain with None/invalid expiry_class must not yield an eligible instrument."""
+        for bad in (None, "UNKNOWN", "INVALID"):
+            with self.subTest(expiry_class=bad):
+                snap = _snapshot(quotes=(_quote(expiry_class=bad),))
+                filtered = filter_campaign_chain(snap, underlying="RELIANCE", direction="BULLISH")
+                self.assertEqual(filtered.reason_codes, (UNKNOWN_EXPIRY_CLASS,))
+                self.assertEqual(filtered.eligible_instruments, ())
+                self.assertEqual(filtered.eligible_quotes, ())
+                self.assertIsNone(filtered.selected_expiry)
+                code, again = allow_campaign_candidate(snap, _candidate())
+                self.assertEqual(code, UNKNOWN_EXPIRY_CLASS)
+                self.assertFalse(again.ok)
+                decision = _engine().decide(
+                    snapshot=snap,
+                    package=_package(snap, _result(snap)),
+                )
+                self.assertEqual(decision.status, IntegratedDecisionStatus.NO_TRADE)
+                self.assertIn(UNKNOWN_EXPIRY_CLASS, decision.reason_codes)
 
 
 class DecisionEngineChainFilterTests(unittest.TestCase):

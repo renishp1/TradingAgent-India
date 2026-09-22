@@ -15,9 +15,7 @@ from grow.clock import IST
 from grow.config import GrowConfig, OptionsConfig, load_config
 from grow.decision.integration.contract import StrategyCandidate
 from grow.live_data.catalog import (
-    KNOWN_EXPIRY_CLASSES,
     UNKNOWN_EXPIRY_CLASS as CATALOG_UNKNOWN_EXPIRY,
-    is_tradable_expiry_class,
 )
 from grow.market_data.normalized.models import AgentMarketSnapshot, DataQualityStatus, OptionQuoteView
 from grow.options.models import ExpiryClass, OptionExpiry, OptionType
@@ -347,30 +345,29 @@ def _expiries(quotes: tuple[OptionQuoteView, ...]) -> tuple[OptionExpiry, ...] |
     return tuple(OptionExpiry(day, klass) for day, klass in sorted(seen.items(), key=lambda item: item[0]))
 
 
-def _expiry_class(raw: str | None) -> ExpiryClass | None:
-    """Map raw expiry_class to WEEKLY/MONTHLY only.
+# Strict allowlist only. Missing keys (None/UNKNOWN/invalid) → None. Never default to WEEKLY.
+_ALLOWED_EXPIRY_CLASS: Mapping[str, ExpiryClass] = {
+    ExpiryClass.WEEKLY.value: ExpiryClass.WEEKLY,
+    ExpiryClass.MONTHLY.value: ExpiryClass.MONTHLY,
+}
 
-    Required mapping (fail closed — never invent WEEKLY):
-      WEEKLY  -> ExpiryClass.WEEKLY
-      MONTHLY -> ExpiryClass.MONTHLY
-      UNKNOWN -> None (reject)
-      None    -> None (reject)
-      invalid -> None (reject)
+
+def _expiry_class(raw: str | None) -> ExpiryClass | None:
+    """Fail-closed expiry classification for the campaign chain filter.
+
+    WEEKLY / weekly   → ExpiryClass.WEEKLY
+    MONTHLY / monthly → ExpiryClass.MONTHLY
+    None / UNKNOWN / any other string → None (caller rejects with UNKNOWN_EXPIRY_CLASS)
     """
     if raw is None:
         return None
     text = str(raw).strip().upper()
     if not text:
         return None
+    # Explicit reject of catalog UNKNOWN and this module's reject token.
     if text in {CATALOG_UNKNOWN_EXPIRY, UNKNOWN_EXPIRY_CLASS, "UNKNOWN"}:
         return None
-    if text not in KNOWN_EXPIRY_CLASSES or not is_tradable_expiry_class(text):
-        return None
-    if text == ExpiryClass.WEEKLY.value:
-        return ExpiryClass.WEEKLY
-    if text == ExpiryClass.MONTHLY.value:
-        return ExpiryClass.MONTHLY
-    return None
+    return _ALLOWED_EXPIRY_CLASS.get(text)
 
 
 def _options_config(config: GrowConfig | OptionsConfig | None) -> OptionsConfig:
