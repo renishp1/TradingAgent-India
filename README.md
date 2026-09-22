@@ -31,7 +31,10 @@ Milestone 2D is AI research / CEODecision ([`docs/research.md`](docs/research.md
 Milestone 2E is fixture backtest + walk-forward ([`docs/backtest.md`](docs/backtest.md)).
 Milestone 2F is the research director ([`docs/director.md`](docs/director.md)).
 Milestone 2G is point-in-time historical data ([`docs/history.md`](docs/history.md)).
-Do not attach a vendor feed, live option chain, or broker.
+Milestone 2H is provider evaluation ([`docs/provider.md`](docs/provider.md)).
+Milestone 2I is dynamic index/expiry discovery ([`docs/dynamic.md`](docs/dynamic.md)).
+Milestone 2J is recorded historical provider integration ([`docs/integrate.md`](docs/integrate.md)).
+Do not attach a live vendor feed, live option chain, or broker.
 
 
 ## Layout

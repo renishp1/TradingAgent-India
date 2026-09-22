@@ -18,6 +18,7 @@ HistoricalMarketSource / HistoricalOptionSource / ExplicitSessionCalendar
 No broker. No live feed. No PaperLedger. No Risk Guard writes.
 
 2H evaluation: [`docs/provider.md`](provider.md).
+2J recorded provider: [`docs/integrate.md`](integrate.md).
 ```
 
 ## v1 locks
