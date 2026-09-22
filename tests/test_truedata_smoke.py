@@ -5,6 +5,7 @@ import json
 import pathlib
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import date
 
 from grow.clock import FrozenClock
@@ -20,6 +21,7 @@ from grow.live_data.smoke import (
     PASS,
     PASS_WITH_NO_TRADE,
     SMOKE_SCHEMA,
+    assess_option_ticks,
     build_smoke_report,
     classification_by_underlying,
     classify_smoke_result,
@@ -141,7 +143,7 @@ class SmokeReportTests(unittest.TestCase):
                 authenticated=True,
                 catalog_ok=True,
                 mapping_ready=True,
-                snapshot_ok=True,
+                option_tick_ok=True,
                 paper_fill=True,
                 hard_fail=False,
                 fixture_fallback=False,
@@ -153,7 +155,7 @@ class SmokeReportTests(unittest.TestCase):
                 authenticated=True,
                 catalog_ok=True,
                 mapping_ready=True,
-                snapshot_ok=True,
+                option_tick_ok=True,
                 paper_fill=False,
                 hard_fail=False,
                 fixture_fallback=False,
@@ -165,7 +167,7 @@ class SmokeReportTests(unittest.TestCase):
                 authenticated=True,
                 catalog_ok=True,
                 mapping_ready=False,
-                snapshot_ok=False,
+                option_tick_ok=False,
                 paper_fill=False,
                 hard_fail=False,
                 fixture_fallback=False,
@@ -177,12 +179,24 @@ class SmokeReportTests(unittest.TestCase):
                 authenticated=True,
                 catalog_ok=True,
                 mapping_ready=True,
-                snapshot_ok=True,
+                option_tick_ok=True,
                 paper_fill=True,
                 hard_fail=False,
                 fixture_fallback=True,
             ),
             HARD_FAIL,
+        )
+        self.assertEqual(
+            classify_smoke_result(
+                authenticated=True,
+                catalog_ok=True,
+                mapping_ready=True,
+                option_tick_ok=False,
+                paper_fill=False,
+                hard_fail=False,
+                fixture_fallback=False,
+            ),
+            FAIL,
         )
 
     def test_redacts_secrets(self) -> None:
@@ -212,6 +226,13 @@ class SmokeReportTests(unittest.TestCase):
         self.assertEqual(report["first_tick"]["provider_id"], loop.provider.identity)
         self.assertIsNotNone(report["first_tick"]["provider_symbol_id"])
         self.assertIsNotNone(report["first_tick"]["canonical_id"])
+        self.assertTrue(report["option_tick_ok"])
+        self.assertIsNotNone(report["first_option_tick"])
+        self.assertIn(report["first_option_tick"]["option_type"], {"CE", "PE"})
+        self.assertEqual(
+            report["first_option_tick"]["provider_symbol_id"],
+            report["first_tick"]["provider_symbol_id"],
+        )
         self.assertIn("2b_strategy", report["pipeline"]["stages"])
         self.assertTrue(report["safety"]["paper_only"])
         self.assertFalse(report["safety"]["broker"])
@@ -250,6 +271,8 @@ class SmokeReportTests(unittest.TestCase):
         self.assertEqual(report["result"], FAIL)
         self.assertFalse(report["connection"]["authenticated"])
         self.assertIsNone(report["first_tick"])
+        self.assertIsNone(report["first_option_tick"])
+        self.assertFalse(report["option_tick_ok"])
         self.assertFalse(report["subscription"]["mapping_ready"])
 
     def test_live_execution_error_is_hard_fail(self) -> None:
@@ -305,3 +328,210 @@ class SmokeScriptProcessTests(unittest.TestCase):
             code = mod.main({"PATH": "/usr/bin"})
         self.assertEqual(code, 2)
         self.assertIn("SMOKE_DISABLED", buf.getvalue())
+
+
+def _start_smoke(incoming, catalog):
+    adapter, _sock = _real_adapter(incoming, catalog)
+    cfg = _live_config(provider="truedata", snapshot_interval_seconds=0, session_timeout_seconds=86400)
+    loop = LivePaperLoop(cfg, adapter, clock=FrozenClock(AS_OF), risk_secret=TEST_RISK_SECRET)
+    loop.start()
+    return loop
+
+
+def _first_ce(catalog):
+    quotes_by = {
+        (q["underlying"], q["expiry"], float(q["strike"]), q["option_type"]): q for q in catalog["quotes"]
+    }
+    instruments = {row["provider_symbol"]: row for row in catalog["instruments"]}
+    for name, ident in catalog["mapping"]:
+        row = instruments.get(name)
+        if row is None or row.get("option_type") != "CE":
+            continue
+        expiry = row["expiry"]
+        expiry_s = expiry.isoformat() if hasattr(expiry, "isoformat") else str(expiry)
+        quote = quotes_by.get(("NIFTY", expiry_s, float(row["strike"]), "CE"))
+        if quote is None:
+            continue
+        return name, ident, quote
+    raise AssertionError("nifty catalog has no mapped CE quote")
+
+
+def _index_then_ce_incoming(catalog):
+    _index_name, index_id = catalog["mapping"][0]
+    ce_name, ce_id, quote = _first_ce(catalog)
+    incoming = [
+        _auth_ok(),
+        _symbolsadded(catalog["mapping"]),
+        _trade(index_id, float(catalog["spots"]["NIFTY"]), seq=1),
+        _trade(
+            ce_id,
+            float(quote["ltp"]),
+            bid=quote["bid"],
+            ask=quote["ask"],
+            seq=2,
+            oi=quote["oi"],
+            volume=quote["volume"],
+        ),
+    ]
+    return incoming, (ce_name, ce_id, quote)
+
+
+class OptionTickSmokeRegressionTests(unittest.TestCase):
+    def test_a_index_tick_without_option_quote_stays_fail_and_loop_continues(self) -> None:
+        catalog = _nifty_catalog()
+        index_name, index_id = catalog["mapping"][0]
+        self.assertEqual(index_name, "NIFTY 50")
+        incoming = [
+            _auth_ok(),
+            _symbolsadded(catalog["mapping"]),
+            _trade(index_id, float(catalog["spots"]["NIFTY"]), seq=1),
+        ]
+        loop = _start_smoke(incoming, catalog)
+        max_cycles = 6
+        reports = drain_smoke_loop(loop, max_cycles=max_cycles)
+        report = build_smoke_report(loop, reports, root=ROOT)
+        self.assertEqual(len(reports), max_cycles)
+        self.assertIsNotNone(loop.last_snapshot)
+        self.assertTrue(report["connection"]["authenticated"])
+        self.assertTrue(report["catalog"]["ok"])
+        self.assertTrue(report["subscription"]["mapping_ready"])
+        self.assertFalse(report["option_tick_ok"])
+        self.assertIsNone(report["first_option_tick"])
+        self.assertIsNone(report["first_tick"])
+        self.assertEqual(report["result"], FAIL)
+        self.assertNotIn(report["result"], {PASS, PASS_WITH_NO_TRADE, HARD_FAIL})
+        loop.stop()
+
+    def test_b_index_then_ce_quote_is_a_live_option_tick(self) -> None:
+        catalog = _nifty_catalog()
+        incoming, (ce_name, ce_id, quote) = _index_then_ce_incoming(catalog)
+        loop = _start_smoke(incoming, catalog)
+        reports = drain_smoke_loop(loop, max_cycles=16)
+        self.assertLess(len(reports), 16)
+        self.assertGreaterEqual(len(loop.snapshots), 2)
+        self.assertFalse(assess_option_ticks(loop.snapshots[0], loop.provider._symbol_ids).ok)
+        report = build_smoke_report(loop, reports, root=ROOT)
+        self.assertIn(report["result"], {PASS, PASS_WITH_NO_TRADE})
+        tick = report["first_option_tick"]
+        self.assertIsNotNone(tick)
+        self.assertEqual(tick["option_type"], "CE")
+        self.assertEqual(tick["provider_symbol"], ce_name)
+        self.assertEqual(tick["provider_symbol_id"], str(ce_id))
+        self.assertEqual(tick["underlying"], "NIFTY")
+        self.assertEqual(tick["expiry"], quote["expiry"])
+        self.assertEqual(float(tick["strike"]), float(quote["strike"]))
+        self.assertEqual(tick["bid"], float(quote["bid"]))
+        self.assertEqual(tick["ask"], float(quote["ask"]))
+        self.assertEqual(tick["ltp"], float(quote["ltp"]))
+        self.assertTrue(tick["quote_freshness"])
+        self.assertIn("-CE", tick["canonical_id"])
+        self.assertTrue(tick["snapshot_id"])
+        self.assertTrue(tick["event_time"])
+        self.assertTrue(tick["received_time"])
+        self.assertEqual(tick["sequence"], loop.last_snapshot.sequence)
+        self.assertNotEqual(tick["provider_symbol"], "NIFTY 50")
+        self.assertFalse(report["safety"]["fixture_fallback"])
+        loop.stop()
+
+    def test_c_contract_master_without_option_quotes_is_not_a_tick(self) -> None:
+        catalog = _nifty_catalog()
+        _index_name, index_id = catalog["mapping"][0]
+        incoming = [
+            _auth_ok(),
+            _symbolsadded(catalog["mapping"]),
+            _trade(index_id, float(catalog["spots"]["NIFTY"]), seq=1),
+        ]
+        loop = _start_smoke(incoming, catalog)
+        reports = drain_smoke_loop(loop, max_cycles=3)
+        snapshot = loop.last_snapshot
+        self.assertIsNotNone(snapshot)
+        contracts = snapshot.chains["NIFTY"].contracts
+        self.assertGreater(len(contracts), 0)
+        self.assertEqual(loop.provider._quotes, {})
+        for contract in contracts:
+            self.assertIn(str(getattr(contract.option_type, "value", contract.option_type)), {"CE", "PE"})
+            self.assertIsNone(contract.bid)
+            self.assertIsNone(contract.ask)
+            self.assertIsNone(contract.last_price)
+        check = assess_option_ticks(snapshot, loop.provider._symbol_ids)
+        self.assertFalse(check.ok)
+        self.assertEqual(check.quotes, ())
+        self.assertFalse(check.fixture_rejected)
+        report = build_smoke_report(loop, reports, root=ROOT)
+        self.assertIsNone(report["first_option_tick"])
+        self.assertFalse(report["option_tick_ok"])
+        self.assertEqual(report["result"], FAIL)
+        loop.stop()
+
+    def test_d_heartbeat_does_not_count_as_option_tick(self) -> None:
+        catalog = _nifty_catalog()
+        heartbeat = json.dumps({"HeartBeat": {"timestamp": AS_OF.isoformat(), "message": "heartbeat"}})
+        incoming = [_auth_ok(), _symbolsadded(catalog["mapping"]), heartbeat]
+        loop = _start_smoke(incoming, catalog)
+        reports = drain_smoke_loop(loop, max_cycles=5)
+        self.assertEqual(len(reports), 5)
+        self.assertTrue(any(row.reason == "FEED_HEARTBEAT" for row in reports))
+        self.assertIsNone(loop.last_snapshot)
+        report = build_smoke_report(loop, reports, root=ROOT)
+        self.assertIsNone(report["first_option_tick"])
+        self.assertIsNone(report["first_tick"])
+        self.assertFalse(report["option_tick_ok"])
+        self.assertEqual(report["result"], FAIL)
+        self.assertNotIn(report["result"], {PASS, PASS_WITH_NO_TRADE})
+        loop.stop()
+
+    def test_e_option_quote_missing_provider_symbol_id_does_not_count(self) -> None:
+        catalog = _nifty_catalog()
+        incoming, (ce_name, _ce_id, _quote) = _index_then_ce_incoming(catalog)
+        loop = _start_smoke(incoming, catalog)
+        reports = drain_smoke_loop(loop, max_cycles=8)
+        self.assertTrue(assess_option_ticks(loop.last_snapshot, loop.provider._symbol_ids).ok)
+        loop.provider._symbol_ids = {
+            ident: name for ident, name in loop.provider._symbol_ids.items() if name != ce_name
+        }
+        report = build_smoke_report(loop, reports, root=ROOT)
+        self.assertTrue(report["connection"]["authenticated"])
+        self.assertTrue(report["catalog"]["ok"])
+        self.assertTrue(report["subscription"]["mapping_ready"])
+        self.assertFalse(report["option_tick_ok"])
+        self.assertIsNone(report["first_option_tick"])
+        self.assertIsNone(report["first_tick"])
+        self.assertEqual(report["result"], FAIL)
+        loop.stop()
+
+    def test_f_fixture_option_quote_is_hard_fail(self) -> None:
+        catalog = _nifty_catalog()
+        fixture = bullish_event(underlyings=("NIFTY",))
+        fixture["is_fixture"] = True
+        self.assertTrue(fixture["option_quotes"])
+        incoming = [_auth_ok(), _symbolsadded(catalog["mapping"]), json.dumps(fixture)]
+        loop = _start_smoke(incoming, catalog)
+        reports = drain_smoke_loop(loop, max_cycles=6)
+        self.assertLess(len(reports), 6)
+        self.assertTrue(any("FIXTURE_FALLBACK" in row.reason for row in reports))
+        report = build_smoke_report(loop, reports, root=ROOT)
+        self.assertEqual(report["result"], HARD_FAIL)
+        self.assertTrue(report["safety"]["fixture_fallback"])
+        self.assertIsNone(report["first_option_tick"])
+        self.assertFalse(report["option_tick_ok"])
+        loop.stop()
+
+        incoming, _ce = _index_then_ce_incoming(catalog)
+        loop = _start_smoke(incoming, catalog)
+        reports = drain_smoke_loop(loop, max_cycles=8)
+        self.assertTrue(loop.provider._quotes)
+        for quote in loop.provider._quotes.values():
+            quote["is_fixture"] = True
+        report = build_smoke_report(loop, reports, root=ROOT)
+        self.assertEqual(report["result"], HARD_FAIL)
+        self.assertIsNone(report["first_option_tick"])
+        self.assertFalse(report["option_tick_ok"])
+        for quote in loop.provider._quotes.values():
+            quote["is_fixture"] = False
+        chain = loop.last_snapshot.chains["NIFTY"]
+        loop.last_snapshot = replace(loop.last_snapshot, chains={"NIFTY": replace(chain, is_fixture=True)})
+        report = build_smoke_report(loop, reports, root=ROOT)
+        self.assertEqual(report["result"], HARD_FAIL)
+        self.assertIsNone(report["first_option_tick"])
+        self.assertTrue(report["safety"]["fixture_fallback"])
+        loop.stop()
