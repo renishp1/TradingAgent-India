@@ -41,6 +41,7 @@ REQUIRED_DECISION_FIELDS = (
     "status",
     "action",
     "trade_candidate",
+    "campaign_signal",
     "reason_codes",
     "risk_guard_result",
     "risk_guard_reason",
@@ -333,6 +334,7 @@ class IntegratedDecision:
     risk_rule_results: tuple[tuple[str, bool, str], ...] = ()
     action: DecisionAction = DecisionAction.NO_TRADE
     trade_candidate: TradeCandidate | None = None
+    campaign_signal: Mapping[str, Any] | None = None
     schema_version: str = DECISION_SCHEMA
     paper_mode: bool = True
     live_trading: bool = False
@@ -358,6 +360,8 @@ class IntegratedDecision:
         if self.trade_candidate is not None and self.action is not self.trade_candidate.action:
             raise ValueError("decision action must match TradeCandidate option_type")
         object.__setattr__(self, "calculated_evidence", MappingProxyType(dict(self.calculated_evidence)))
+        if self.campaign_signal is not None:
+            object.__setattr__(self, "campaign_signal", MappingProxyType(dict(self.campaign_signal)))
 
     @property
     def paper_trade_candidate(self) -> bool:
@@ -385,6 +389,7 @@ class IntegratedDecision:
             "trade_candidate": None
             if self.trade_candidate is None
             else self.trade_candidate.to_dict(),
+            "campaign_signal": plain_data(self.campaign_signal) if self.campaign_signal is not None else None,
             "paper_trade_candidate": self.paper_trade_candidate,
             "reason_codes": list(self.reason_codes),
             "risk_guard_result": self.risk_guard_result,
