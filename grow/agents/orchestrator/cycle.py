@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-import uuid
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable
@@ -57,7 +57,18 @@ class OrchestratorDecision:
 
 
 class AgentCycleOrchestrator:
-    """Run one paper decision cycle over a shared immutable snapshot."""
+    """Run one paper decision cycle over a shared immutable snapshot.
+
+    Specialists consume the same ``AgentMarketSnapshot`` concurrently. Each
+    specialist is bounded by ``agent_timeout_seconds`` wall-clock time so one
+    slow agent cannot hang the cycle.
+
+    Second pass is **opt-in** (``allow_second_pass=False`` by default). A future
+    second pass must supply explicit context — for example first-pass conflict
+    → targeted re-evaluation → same immutable snapshot → conflict context to
+    the agents. Simply re-running the same agents twice without a reason is not
+    a valid second-pass policy.
+    """
 
     def __init__(
         self,
@@ -73,10 +84,13 @@ class AgentCycleOrchestrator:
         live_trading: bool = False,
     ) -> None:
         assert_paper_runtime(execution_mode, live_trading, "PAPER")
+        if agent_timeout_seconds <= 0:
+            raise ValueError("agent_timeout_seconds must be positive")
         self.risk_guard = risk_guard or AgentRiskGuard()
         self.auditor = auditor or AuditorAgent()
         self.journal: JournalStore = self.auditor.store
         self.agent_timeout_seconds = agent_timeout_seconds
+        # Opt-in only. Default remains disabled; see class docstring.
         self.allow_second_pass = allow_second_pass
         self.second_pass_rule = second_pass_rule
         if specialists is None:
@@ -91,7 +105,7 @@ class AgentCycleOrchestrator:
 
     def run(self, snapshot: AgentMarketSnapshot) -> OrchestratorDecision:
         assert_paper_runtime("paper", False, "PAPER")
-        cycle_id = f"cycle-{uuid.uuid4().hex[:12]}"
+        cycle_id = stable_cycle_id(snapshot.snapshot_id, snapshot.decision_timestamp)
         quality = gate_snapshot_quality(snapshot)
         if quality.value in {"INSUFFICIENT", "REJECTED", "STALE"}:
             empty = ()
@@ -123,8 +137,14 @@ class AgentCycleOrchestrator:
 
         results = self._run_specialists(snapshot)
         debate = summarize_debate(results)
-        if self.allow_second_pass and self.second_pass_rule is not None and self.second_pass_rule(results, debate):
-            # One optional second pass only when an explicit rule permits it.
+        # Second pass stays opt-in and must be justified by second_pass_rule.
+        # Future work must pass conflict context into a targeted re-evaluation
+        # of the same immutable snapshot — not a blind identical re-run.
+        if (
+            self.allow_second_pass
+            and self.second_pass_rule is not None
+            and self.second_pass_rule(results, debate)
+        ):
             results = self._run_specialists(snapshot)
             debate = summarize_debate(results)
 
@@ -171,31 +191,112 @@ class AgentCycleOrchestrator:
         )
 
     def _run_specialists(self, snapshot: AgentMarketSnapshot) -> tuple[AgentResult, ...]:
-        out: list[AgentResult] = []
-        for agent in self.specialists:
-            try:
-                result = agent.analyze(snapshot)
-                if result.snapshot_id != snapshot.snapshot_id:
-                    raise ValueError("snapshot_id_mismatch")
-            except Exception as exc:  # one failed specialist must not crash the cycle
-                result = AgentResult(
-                    agent_name=getattr(agent, "agent_name", type(agent).__name__),
-                    agent_version=getattr(agent, "agent_version", "unknown"),
-                    snapshot_id=snapshot.snapshot_id,
-                    decision_timestamp=snapshot.decision_timestamp,
-                    status=AgentStatus.ERROR,
-                    observations=(f"agent_failure:{type(exc).__name__}",),
-                    metrics_used=(),
-                    candidate_action=CandidateAction.NONE,
-                    candidate_instrument=None,
-                    entry_reason=None,
-                    invalidation_reason=str(exc)[:200],
-                    risk_flags=("AGENT_FAILURE",),
-                    missing_data=(),
-                    confidence=None,
-                )
-            out.append(result)
-        return tuple(out)
+        """Run specialists concurrently with a shared per-cycle timeout budget.
+
+        Result tuple order matches ``self.specialists`` registration order.
+        Timed-out specialists become ERROR with risk flag AGENT_TIMEOUT.
+        """
+        if not self.specialists:
+            return ()
+
+        workers = len(self.specialists)
+        out: list[AgentResult | None] = [None] * workers
+        pool = ThreadPoolExecutor(max_workers=workers)
+        try:
+            future_to_index: dict[Future[AgentResult], int] = {}
+            for index, agent in enumerate(self.specialists):
+                future = pool.submit(self._analyze_one, agent, snapshot)
+                future_to_index[future] = index
+
+            done, pending = wait(
+                future_to_index.keys(),
+                timeout=self.agent_timeout_seconds,
+            )
+            for future in done:
+                index = future_to_index[future]
+                agent = self.specialists[index]
+                out[index] = self._result_from_future(future, agent, snapshot)
+            for future in pending:
+                index = future_to_index[future]
+                agent = self.specialists[index]
+                future.cancel()
+                out[index] = self._timeout_result(agent, snapshot)
+        finally:
+            # Do not wait for timed-out workers; the cycle must return promptly.
+            pool.shutdown(wait=False, cancel_futures=True)
+
+        return tuple(out)  # type: ignore[arg-type]
+
+    def _analyze_one(self, agent: SpecialistAgent, snapshot: AgentMarketSnapshot) -> AgentResult:
+        result = agent.analyze(snapshot)
+        if result.snapshot_id != snapshot.snapshot_id:
+            raise ValueError("snapshot_id_mismatch")
+        return result
+
+    def _result_from_future(
+        self,
+        future: Future[AgentResult],
+        agent: SpecialistAgent,
+        snapshot: AgentMarketSnapshot,
+    ) -> AgentResult:
+        exc = future.exception()
+        if exc is not None:
+            return self._error_result(agent, snapshot, exc, risk_flag="AGENT_FAILURE")
+        result = future.result()
+        if result.snapshot_id != snapshot.snapshot_id:
+            return self._error_result(
+                agent,
+                snapshot,
+                ValueError("snapshot_id_mismatch"),
+                risk_flag="AGENT_FAILURE",
+            )
+        return result
+
+    def _timeout_result(self, agent: SpecialistAgent, snapshot: AgentMarketSnapshot) -> AgentResult:
+        return AgentResult(
+            agent_name=getattr(agent, "agent_name", type(agent).__name__),
+            agent_version=getattr(agent, "agent_version", "unknown"),
+            snapshot_id=snapshot.snapshot_id,
+            decision_timestamp=snapshot.decision_timestamp,
+            status=AgentStatus.ERROR,
+            observations=(
+                f"agent_timeout:{self.agent_timeout_seconds}s",
+                "fail_closed: timed-out specialist cannot contribute a recommendation",
+            ),
+            metrics_used=(),
+            candidate_action=CandidateAction.NONE,
+            candidate_instrument=None,
+            entry_reason=None,
+            invalidation_reason=f"specialist exceeded {self.agent_timeout_seconds}s timeout",
+            risk_flags=("AGENT_TIMEOUT",),
+            missing_data=(),
+            confidence=None,
+        )
+
+    def _error_result(
+        self,
+        agent: SpecialistAgent,
+        snapshot: AgentMarketSnapshot,
+        exc: BaseException,
+        *,
+        risk_flag: str,
+    ) -> AgentResult:
+        return AgentResult(
+            agent_name=getattr(agent, "agent_name", type(agent).__name__),
+            agent_version=getattr(agent, "agent_version", "unknown"),
+            snapshot_id=snapshot.snapshot_id,
+            decision_timestamp=snapshot.decision_timestamp,
+            status=AgentStatus.ERROR,
+            observations=(f"agent_failure:{type(exc).__name__}",),
+            metrics_used=(),
+            candidate_action=CandidateAction.NONE,
+            candidate_instrument=None,
+            entry_reason=None,
+            invalidation_reason=str(exc)[:200],
+            risk_flags=(risk_flag,),
+            missing_data=(),
+            confidence=None,
+        )
 
     def _synthesize(
         self,
@@ -262,5 +363,6 @@ class AgentCycleOrchestrator:
 
 
 def stable_cycle_id(snapshot_id: str, as_of: datetime) -> str:
+    """Deterministic cycle ID from snapshot identity and decision timestamp."""
     raw = f"{snapshot_id}:{as_of.isoformat()}"
     return "cycle-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]

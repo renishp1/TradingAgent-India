@@ -5,6 +5,7 @@ from grow.market_data.snapshots.builder import (
     build_agent_snapshot,
     build_fixture_snapshot,
     gate_snapshot_quality,
+    option_contract_quality,
 )
 
 __all__ = [
@@ -12,4 +13,5 @@ __all__ = [
     "build_agent_snapshot",
     "build_fixture_snapshot",
     "gate_snapshot_quality",
+    "option_contract_quality",
 ]

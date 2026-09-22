@@ -24,7 +24,11 @@ class SnapshotBuildError(GrowConfigError):
 
 
 def gate_snapshot_quality(snapshot: AgentMarketSnapshot) -> DataQualityStatus:
-    """Fail closed when required point-in-time data is missing or stale."""
+    """Fail closed when required *snapshot-level* point-in-time data is unusable.
+
+    Per-option STALE markers do not by themselves fail this gate. Callers that
+    need option-level freshness must inspect ``OptionQuoteView.quality``.
+    """
     if snapshot.data_quality in {
         DataQualityStatus.INSUFFICIENT,
         DataQualityStatus.REJECTED,
@@ -38,6 +42,17 @@ def gate_snapshot_quality(snapshot: AgentMarketSnapshot) -> DataQualityStatus:
     return snapshot.data_quality
 
 
+def option_contract_quality(
+    *,
+    age_seconds: float,
+    max_quote_age_seconds: float | None,
+) -> DataQualityStatus:
+    """3C.2-aligned per-option freshness: age beyond the limit → STALE."""
+    if max_quote_age_seconds is not None and age_seconds > max_quote_age_seconds:
+        return DataQualityStatus.STALE
+    return DataQualityStatus.OK
+
+
 def build_agent_snapshot(
     live: LiveSnapshot,
     *,
@@ -45,7 +60,15 @@ def build_agent_snapshot(
     exchange: str = "NSE",
     max_quote_age_seconds: float | None = None,
 ) -> AgentMarketSnapshot:
-    """Map a validated LiveSnapshot into the common agent snapshot contract."""
+    """Map a validated LiveSnapshot into the common agent snapshot contract.
+
+    Individual stale option contracts keep ``OptionQuoteView.quality=STALE`` and
+    never become trade candidates. They do **not** automatically promote the
+    whole snapshot to STALE when other contracts (and underlyings) remain usable.
+    Snapshot-level STALE/REJECTED is reserved for required snapshot-level data
+    that is actually unusable (for example stream freshness failure or missing
+    underlyings).
+    """
     decision_ts = decision_timestamp.astimezone(IST)
     if live.event_time.astimezone(IST) > decision_ts:
         raise SnapshotBuildError("FUTURE_SNAPSHOT")
@@ -56,17 +79,26 @@ def build_agent_snapshot(
 
     options: list[OptionQuoteView] = []
     notes: list[str] = list(live.diagnostics)
+    # Snapshot-level quality tracks required shared data, not a single option.
     quality = DataQualityStatus.OK if live.freshness_ok else DataQualityStatus.STALE
     if not live.freshness_ok:
         notes.append("LIVE_FRESHNESS_FAIL")
 
+    if max_quote_age_seconds is not None:
+        for symbol, quote in underlyings.items():
+            age = quote.quote_age_seconds
+            if age is not None and age > max_quote_age_seconds:
+                quality = DataQualityStatus.STALE
+                notes.append(f"STALE_UNDERLYING:{symbol}")
+
     for underlying, chain in live.chains.items():
         for contract in chain.contracts:
             age = (decision_ts - contract.timestamp.astimezone(IST)).total_seconds()
-            contract_quality = DataQualityStatus.OK
-            if max_quote_age_seconds is not None and age > max_quote_age_seconds:
-                contract_quality = DataQualityStatus.STALE
-                quality = DataQualityStatus.STALE
+            contract_quality = option_contract_quality(
+                age_seconds=age,
+                max_quote_age_seconds=max_quote_age_seconds,
+            )
+            if contract_quality is DataQualityStatus.STALE:
                 notes.append(f"STALE_OPTION:{contract.provider_contract_id}")
             options.append(_option_from_contract(contract, age, contract_quality))
 
@@ -105,6 +137,12 @@ def build_agent_snapshot(
             "sequence": live.sequence,
             "adapter_version": live.adapter_version,
             "freshness_ok": live.freshness_ok,
+            "stale_option_count": sum(
+                1 for row in options if row.quality is DataQualityStatus.STALE
+            ),
+            "fresh_option_count": sum(
+                1 for row in options if row.quality is DataQualityStatus.OK
+            ),
         },
     )
 
@@ -121,25 +159,28 @@ def build_fixture_snapshot(
     notes: tuple[str, ...] = (),
     market: MarketSnapshot | None = None,
     chain: OptionChainSnapshot | None = None,
+    include_underlying: bool = True,
 ) -> AgentMarketSnapshot:
     """Deterministic fixture snapshot for unit tests and offline cycles."""
     decision_ts = as_of.astimezone(IST)
-    underlyings = {
-        underlying: UnderlyingQuoteView(
-            underlying=underlying,
-            exchange=exchange,
-            spot=spot,
-            ltp=spot,
-            open=spot,
-            high=spot,
-            low=spot,
-            close=spot,
-            volume=0,
-            quote_timestamp=decision_ts,
-            quote_age_seconds=0.0,
-        )
-    }
+    underlyings: dict[str, UnderlyingQuoteView] = {}
     source_ids: dict[str, str] = {"fixture": "fixture"}
+    if include_underlying:
+        underlyings = {
+            underlying: UnderlyingQuoteView(
+                underlying=underlying,
+                exchange=exchange,
+                spot=spot,
+                ltp=spot,
+                open=spot,
+                high=spot,
+                low=spot,
+                close=spot,
+                volume=0,
+                quote_timestamp=decision_ts,
+                quote_age_seconds=0.0,
+            )
+        }
     if market is not None:
         underlyings[underlying] = _underlying_from_market(market, decision_ts, exchange)
         source_ids["market"] = market.snapshot_id
@@ -153,6 +194,9 @@ def build_fixture_snapshot(
             for contract in chain.contracts
         )
         source_ids["chain"] = chain.snapshot_id
+    if not include_underlying and market is None:
+        quality = DataQualityStatus.INSUFFICIENT
+        notes = tuple(dict.fromkeys((*notes, "NO_UNDERLYINGS")))
     version = snapshot_digest(
         {
             "as_of": decision_ts.isoformat(),
@@ -160,6 +204,7 @@ def build_fixture_snapshot(
             "spot": spot,
             "options": [c.to_dict() for c in option_contracts],
             "quality": quality.value,
+            "include_underlying": include_underlying,
         }
     )
     return AgentMarketSnapshot(
@@ -176,7 +221,15 @@ def build_fixture_snapshot(
         data_quality=quality,
         quality_notes=notes,
         source_snapshot_ids=source_ids,
-        diagnostics={"fixture": True},
+        diagnostics={
+            "fixture": True,
+            "stale_option_count": sum(
+                1 for row in option_contracts if row.quality is DataQualityStatus.STALE
+            ),
+            "fresh_option_count": sum(
+                1 for row in option_contracts if row.quality is DataQualityStatus.OK
+            ),
+        },
     )
 
 
