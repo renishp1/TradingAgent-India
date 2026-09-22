@@ -124,6 +124,9 @@ class MarkEvent:
 class SessionSummary:
     starting_cash: float
     realized_pnl: float
+    gross_realized_pnl: float
+    total_costs: float
+    net_realized_pnl: float
     unrealized_pnl: float
     total_pnl: float
     open_exposure: float
@@ -135,11 +138,15 @@ class SessionSummary:
     no_trade_count: int
     valuation_gaps: int
     halted: bool
+    unresolved_close: bool
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "starting_cash": self.starting_cash,
             "realized_pnl": self.realized_pnl,
+            "gross_realized_pnl": self.gross_realized_pnl,
+            "total_costs": self.total_costs,
+            "net_realized_pnl": self.net_realized_pnl,
             "unrealized_pnl": self.unrealized_pnl,
             "total_pnl": self.total_pnl,
             "open_exposure": self.open_exposure,
@@ -151,8 +158,10 @@ class SessionSummary:
             "no_trade_count": self.no_trade_count,
             "valuation_gaps": self.valuation_gaps,
             "halted": self.halted,
+            "unresolved_close": self.unresolved_close,
             "paper_only": True,
             "live_trading": False,
+            "pnl_identity": "net_realized_pnl == gross_realized_pnl - total_costs",
         }
 
 
@@ -434,9 +443,34 @@ class PositionRegistry:
         )
         return position
 
+    def halt_for_timeout(self) -> None:
+        """Fail closed on session timeout with inventory. Never fabricate a close price."""
+        self.halted = True
+        self.unresolved_close = True
+        for position in self.open_positions():
+            position.diagnostics.append("SESSION_TIMEOUT_WITH_OPEN_POSITION")
+            self.events.append(
+                {
+                    "type": "SAFETY",
+                    "position_id": position.position_id,
+                    "session_id": position.session_id,
+                    "contract_id": position.contract_id,
+                    "state": position.state.value,
+                    "reason": "SESSION_TIMEOUT_WITH_OPEN_POSITION",
+                    "provider_id": position.provider_id,
+                    "snapshot_id": position.snapshot_id,
+                    "timestamp": self.clock.now().isoformat(),
+                    "current_price": position.current_price,
+                    "last_valued_at": None if position.last_valued_at is None else position.last_valued_at.isoformat(),
+                }
+            )
+
     def summary(self) -> SessionSummary:
+        closed = tuple(p for p in self._positions.values() if p.state is PositionState.CLOSED)
         unrealized = round(sum(p.unrealized_pnl for p in self.open_positions()), 4)
-        realized = round(sum(p.realized_pnl for p in self._positions.values() if p.state is PositionState.CLOSED), 4)
+        gross = round(sum(p.realized_gross for p in closed), 4)
+        costs = round(sum(p.total_costs for p in closed), 4)
+        net = round(sum(p.realized_pnl for p in closed), 4)
         exposure = 0.0
         gaps = 0
         for pos in self.open_positions():
@@ -447,9 +481,12 @@ class PositionRegistry:
                 exposure += value
         return SessionSummary(
             starting_cash=self.starting_cash,
-            realized_pnl=realized,
+            realized_pnl=net,
+            gross_realized_pnl=gross,
+            total_costs=costs,
+            net_realized_pnl=net,
             unrealized_pnl=unrealized,
-            total_pnl=round(realized + unrealized, 4),
+            total_pnl=round(net + unrealized, 4),
             open_exposure=round(exposure, 4),
             opens=self.opens,
             closes=self.closes,
@@ -459,6 +496,7 @@ class PositionRegistry:
             no_trade_count=self.no_trade_count,
             valuation_gaps=self.valuation_gaps + gaps,
             halted=self.halted,
+            unresolved_close=self.unresolved_close,
         )
 
     def note_no_trade(self) -> None:

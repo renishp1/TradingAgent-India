@@ -36,3 +36,13 @@ Existing 3A new-entry path (only if session/feed remain safe)
 
 Missing or stale/future/out-of-order quotes do not update marks and cannot fabricate an exit.
 A SESSION_CLOSE without a valid quote records `UNRESOLVED_CLOSE`, halts new entries, and degrades the session.
+A session timeout with OPEN inventory records `SESSION_TIMEOUT_WITH_OPEN_POSITION`, preserves last valuation, does not fabricate a close, stops the provider, and blocks new entries.
+
+## P&L accounting
+
+| Metric | Source |
+|---|---|
+| `gross_realized_pnl` | Fill-price P&L (`(exit − entry) × quantity`); matches PaperLedger `realized_pnl` |
+| `total_costs` | Existing `CostModel.round_trip` (not embedded in the ledger book) |
+| `net_realized_pnl` | `gross_realized_pnl − total_costs` |
+| Risk Guard `daily_pnl` | **net** realized P&L for the paper session, never ledger gross |

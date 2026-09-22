@@ -279,6 +279,77 @@ class PositionLoopTests(unittest.TestCase):
         self.assertEqual(summary.total_pnl, pos.realized_pnl)
         self.assertEqual(summary.open_exposure, 0.0)
         self.assertEqual(summary.stop_loss_exits, 1)
+        self.assertEqual(summary.net_realized_pnl, round(summary.gross_realized_pnl - summary.total_costs, 4))
+        self.assertEqual(summary.net_realized_pnl, pos.realized_pnl)
+        self.assertAlmostEqual(loop.ledger.book.realized_pnl, summary.gross_realized_pnl, places=4)
+
+    def test_gross_costs_and_net_pnl_reconcile_with_ledger(self) -> None:
+        loop = _loop(
+            [bullish_event(sequence=1), _set_quotes(bullish_event(sequence=2), bid=10.0, ask=11.0)],
+            config=_cfg(),
+        )
+        loop.run_once("NIFTY")
+        closed = loop.run_once("NIFTY")[0]
+        self.assertEqual(closed.status, CycleStatus.PAPER_CLOSE)
+        summary = loop.positions.summary()
+        dumped = summary.to_dict()
+        self.assertEqual(dumped["net_realized_pnl"], round(dumped["gross_realized_pnl"] - dumped["total_costs"], 4))
+        self.assertEqual(summary.net_realized_pnl, summary.realized_pnl)
+        self.assertAlmostEqual(loop.ledger.book.realized_pnl, summary.gross_realized_pnl, places=4)
+        self.assertNotEqual(summary.total_costs, 0.0)
+        self.assertNotEqual(summary.gross_realized_pnl, summary.net_realized_pnl)
+        self.assertEqual(closed.extras["session_summary"]["net_realized_pnl"], summary.net_realized_pnl)
+
+    def test_timeout_with_no_open_position(self) -> None:
+        loop = _loop([bullish_event()], config=_cfg(session_timeout_seconds=30))
+        loop.clock.advance(timedelta(seconds=30))
+        report = loop.run_once("NIFTY")[0]
+        self.assertEqual(report.status, CycleStatus.NO_TRADE)
+        self.assertEqual(report.reason, "SESSION_TIMEOUT")
+        self.assertEqual(loop.health.state, SessionHealth.STOPPED)
+        self.assertEqual(loop.positions.open_positions(), ())
+        self.assertEqual(loop.ledger.book.fills, [])
+        later = loop.run_once("NIFTY")[0]
+        self.assertIn("STOPPED", later.reason)
+        self.assertEqual(loop.ledger.book.fills, [])
+
+    def test_timeout_with_open_position_is_unresolved(self) -> None:
+        loop = _loop(
+            [
+                bullish_event(sequence=1),
+                _set_quotes(bullish_event(sequence=2), bid=90.0, ask=91.0, ltp=90.0),
+                bullish_event(sequence=3),
+            ],
+            config=_cfg(session_timeout_seconds=30),
+        )
+        opened = loop.run_once("NIFTY")[0]
+        self.assertEqual(opened.status, CycleStatus.PAPER_FILL, opened.reason)
+        loop.run_once("NIFTY")
+        pos = loop.positions.open_positions()[0]
+        mark = pos.current_price
+        valued_at = pos.last_valued_at
+        self.assertEqual(pos.price_source, "BID")
+        fills = list(loop.ledger.book.fills)
+        loop.clock.advance(timedelta(seconds=30))
+        report = loop.run_once("NIFTY")[0]
+        self.assertEqual(report.status, CycleStatus.NO_TRADE)
+        self.assertEqual(report.reason, "SESSION_TIMEOUT_WITH_OPEN_POSITION")
+        self.assertEqual(loop.health.state, SessionHealth.STOPPED)
+        self.assertTrue(loop.positions.halted)
+        self.assertTrue(loop.positions.unresolved_close)
+        self.assertEqual(pos.state, PositionState.OPEN)
+        self.assertEqual(pos.current_price, mark)
+        self.assertEqual(pos.last_valued_at, valued_at)
+        self.assertEqual(loop.ledger.book.fills, fills)
+        self.assertEqual(len([f for f in loop.ledger.book.fills if f.side is Side.SELL]), 0)
+        self.assertIn("SESSION_TIMEOUT_WITH_OPEN_POSITION", pos.diagnostics)
+        later = loop.run_once("NIFTY")[0]
+        self.assertEqual(later.status, CycleStatus.NO_TRADE)
+        self.assertIn("STOPPED", later.reason)
+        self.assertEqual(len(loop.ledger.book.fills), len(fills))
+        self.assertEqual(loop.positions.open_positions()[0].state, PositionState.OPEN)
+        self.assertEqual(loop.positions.closes, 0)
+
 
     def test_invalid_provider_cannot_fabricate_exit(self) -> None:
         loop = _loop(

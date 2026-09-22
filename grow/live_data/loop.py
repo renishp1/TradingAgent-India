@@ -174,6 +174,20 @@ class LivePaperLoop:
             self.cycles.append(report)
             return [report]
         if self._session_timed_out():
+            open_positions = self.positions.open_positions()
+            if open_positions:
+                self.positions.halt_for_timeout()
+                self._transition(SessionHealth.DEGRADED)
+                reason = "SESSION_TIMEOUT_WITH_OPEN_POSITION"
+                extras = {
+                    "open_positions": len(open_positions),
+                    "unresolved_close": True,
+                    "halted": True,
+                    "session_summary": self.positions.summary().to_dict(),
+                }
+            else:
+                reason = "SESSION_TIMEOUT"
+                extras = {}
             self.stop()
             report = _no_trade(
                 session_id=self.session.session_id,
@@ -181,11 +195,13 @@ class LivePaperLoop:
                 sequence=self._last_sequence or 0,
                 as_of=self.clock.now(),
                 underlying=underlying or "*",
-                reason="SESSION_TIMEOUT",
+                reason=reason,
                 provider_id=self.provider.identity,
                 health=self._state,
+                extras=extras,
             )
             self.cycles.append(report)
+            self.positions.note_no_trade()
             return [report]
         if self._interval_pending():
             report = _no_trade(
@@ -450,7 +466,7 @@ class LivePaperLoop:
             brief,
             cash=book.cash,
             gross_notional=book.gross_notional,
-            daily_pnl=book.realized_pnl,
+            daily_pnl=self.positions.summary().net_realized_pnl,
             symbol_notional=book.symbol_notional(ticker),
         )
         if not verdict.approved:
@@ -613,7 +629,7 @@ class LivePaperLoop:
             brief,
             cash=book.cash,
             gross_notional=book.gross_notional,
-            daily_pnl=book.realized_pnl,
+            daily_pnl=self.positions.summary().net_realized_pnl,
             symbol_notional=book.symbol_notional(ticker),
         )
         if not verdict.approved:
