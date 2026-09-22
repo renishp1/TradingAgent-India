@@ -285,10 +285,55 @@ def _snapshot_marked_fixture(snapshot: Any) -> bool:
     return False
 
 
+def _option_quote_is_fresh(
+    quote_time: Any,
+    event_time: Any,
+    now: Any,
+    max_staleness_seconds: int | None,
+) -> bool:
+    """Per-contract freshness. Snapshot freshness_ok is not a substitute."""
+    if max_staleness_seconds is None:
+        return False
+    if not all(_valid_timestamp(item) for item in (quote_time, event_time, now)):
+        return False
+    try:
+        limit = float(max_staleness_seconds)
+    except (TypeError, ValueError):
+        return False
+    if quote_time > now or quote_time > event_time:
+        return False
+    age = (now - quote_time).total_seconds()
+    return age <= limit
+
+
+def _staleness_limit(loop: Any) -> int | None:
+    live = getattr(getattr(loop, "config", None), "live_data", None)
+    raw = getattr(live, "max_staleness_seconds", None)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _evaluation_now(loop: Any) -> datetime | None:
+    clock = getattr(loop, "clock", None)
+    if clock is None or not hasattr(clock, "now"):
+        return None
+    now = clock.now()
+    if _valid_timestamp(now):
+        return now
+    return None
+
+
 def _live_option_quote(
     snapshot: Any,
     contract: Any,
     reverse: Mapping[str, str],
+    *,
+    now: datetime | None,
+    max_staleness_seconds: int | None,
 ) -> dict[str, Any] | None:
     option_type = str(_scalar(getattr(contract, "option_type", "")) or "")
     if option_type not in {"CE", "PE"}:
@@ -322,7 +367,10 @@ def _live_option_quote(
     event_time = getattr(snapshot, "event_time", None)
     received_time = getattr(snapshot, "received_time", None)
     quote_time = getattr(contract, "timestamp", None)
-    if not all(_valid_timestamp(item) for item in (event_time, received_time, quote_time)):
+    if not _valid_timestamp(received_time):
+        return None
+    fresh = _option_quote_is_fresh(quote_time, event_time, now, max_staleness_seconds)
+    if not fresh:
         return None
     return {
         "snapshot_id": snapshot.snapshot_id,
@@ -338,13 +386,19 @@ def _live_option_quote(
         "bid": bid,
         "ask": ask,
         "ltp": ltp,
-        "quote_freshness": True,
+        "quote_freshness": fresh,
         "sequence": snapshot.sequence,
     }
 
 
-def assess_option_ticks(snapshot: Any, symbol_ids: Mapping[str, str] | None = None) -> OptionTickCheck:
-    """A first live tick is one CE/PE contract with a real quote, not merely a snapshot."""
+def assess_option_ticks(
+    snapshot: Any,
+    symbol_ids: Mapping[str, str] | None = None,
+    *,
+    max_staleness_seconds: int | None = None,
+    now: datetime | None = None,
+) -> OptionTickCheck:
+    """A first live tick is one CE/PE contract with a fresh quote, not merely a snapshot."""
     if snapshot is None:
         return OptionTickCheck()
     if _snapshot_marked_fixture(snapshot):
@@ -357,7 +411,13 @@ def assess_option_ticks(snapshot: Any, symbol_ids: Mapping[str, str] | None = No
     quotes: list[dict[str, Any]] = []
     for chain in (getattr(snapshot, "chains", {}) or {}).values():
         for contract in getattr(chain, "contracts", ()) or ():
-            row = _live_option_quote(snapshot, contract, reverse)
+            row = _live_option_quote(
+                snapshot,
+                contract,
+                reverse,
+                now=now,
+                max_staleness_seconds=max_staleness_seconds,
+            )
             if row is not None:
                 quotes.append(row)
     return OptionTickCheck(tuple(quotes))
@@ -368,7 +428,12 @@ def _loop_option_check(loop: Any) -> OptionTickCheck:
     if _provider_quotes_marked_fixture(provider):
         return OptionTickCheck(fixture_rejected=True)
     symbol_ids = dict(getattr(provider, "_symbol_ids", {}) or {})
-    return assess_option_ticks(getattr(loop, "last_snapshot", None), symbol_ids)
+    return assess_option_ticks(
+        getattr(loop, "last_snapshot", None),
+        symbol_ids,
+        max_staleness_seconds=_staleness_limit(loop),
+        now=_evaluation_now(loop),
+    )
 
 
 _SMOKE_STOP_REASONS = frozenset(
@@ -503,7 +568,12 @@ def build_smoke_report(
         authenticated = False
     catalog_ok = bool(catalog)
     quote_fixture = _provider_quotes_marked_fixture(provider)
-    tick_check = assess_option_ticks(snapshot, symbol_ids)
+    tick_check = assess_option_ticks(
+        snapshot,
+        symbol_ids,
+        max_staleness_seconds=_staleness_limit(loop),
+        now=_evaluation_now(loop),
+    )
     if quote_fixture or tick_check.fixture_rejected:
         fixture_fallback = True
     option_tick_ok = tick_check.ok and not fixture_fallback

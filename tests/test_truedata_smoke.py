@@ -6,7 +6,7 @@ import pathlib
 import tempfile
 import unittest
 from dataclasses import replace
-from datetime import date
+from datetime import date, timedelta
 
 from grow.clock import FrozenClock
 from grow.errors import GrowConfigError, GrowLiveTradingDisabled
@@ -376,6 +376,35 @@ def _index_then_ce_incoming(catalog):
     return incoming, (ce_name, ce_id, quote)
 
 
+def _assess(loop, snapshot=None):
+    snap = loop.last_snapshot if snapshot is None else snapshot
+    return assess_option_ticks(
+        snap,
+        loop.provider._symbol_ids,
+        max_staleness_seconds=loop.config.live_data.max_staleness_seconds,
+        now=loop.clock.now(),
+    )
+
+
+def _retimed_ce(snapshot, quote_time):
+    chain = snapshot.chains["NIFTY"]
+    updated = []
+    found = False
+    for contract in chain.contracts:
+        kind = str(getattr(contract.option_type, "value", contract.option_type))
+        priced = contract.bid is not None or contract.ask is not None or contract.last_price is not None
+        if kind == "CE" and priced and not found:
+            updated.append(replace(contract, timestamp=quote_time))
+            found = True
+        else:
+            updated.append(contract)
+    if not found:
+        raise AssertionError("priced CE quote missing")
+    chains = dict(snapshot.chains)
+    chains["NIFTY"] = replace(chain, contracts=tuple(updated))
+    return replace(snapshot, chains=chains)
+
+
 class OptionTickSmokeRegressionTests(unittest.TestCase):
     def test_a_index_tick_without_option_quote_stays_fail_and_loop_continues(self) -> None:
         catalog = _nifty_catalog()
@@ -409,7 +438,7 @@ class OptionTickSmokeRegressionTests(unittest.TestCase):
         reports = drain_smoke_loop(loop, max_cycles=16)
         self.assertLess(len(reports), 16)
         self.assertGreaterEqual(len(loop.snapshots), 2)
-        self.assertFalse(assess_option_ticks(loop.snapshots[0], loop.provider._symbol_ids).ok)
+        self.assertFalse(_assess(loop, loop.snapshots[0]).ok)
         report = build_smoke_report(loop, reports, root=ROOT)
         self.assertIn(report["result"], {PASS, PASS_WITH_NO_TRADE})
         tick = report["first_option_tick"]
@@ -453,7 +482,7 @@ class OptionTickSmokeRegressionTests(unittest.TestCase):
             self.assertIsNone(contract.bid)
             self.assertIsNone(contract.ask)
             self.assertIsNone(contract.last_price)
-        check = assess_option_ticks(snapshot, loop.provider._symbol_ids)
+        check = _assess(loop, snapshot)
         self.assertFalse(check.ok)
         self.assertEqual(check.quotes, ())
         self.assertFalse(check.fixture_rejected)
@@ -485,7 +514,7 @@ class OptionTickSmokeRegressionTests(unittest.TestCase):
         incoming, (ce_name, _ce_id, _quote) = _index_then_ce_incoming(catalog)
         loop = _start_smoke(incoming, catalog)
         reports = drain_smoke_loop(loop, max_cycles=8)
-        self.assertTrue(assess_option_ticks(loop.last_snapshot, loop.provider._symbol_ids).ok)
+        self.assertTrue(_assess(loop).ok)
         loop.provider._symbol_ids = {
             ident: name for ident, name in loop.provider._symbol_ids.items() if name != ce_name
         }
@@ -535,3 +564,77 @@ class OptionTickSmokeRegressionTests(unittest.TestCase):
         self.assertIsNone(report["first_option_tick"])
         self.assertTrue(report["safety"]["fixture_fallback"])
         loop.stop()
+
+
+class OptionQuoteFreshnessTests(unittest.TestCase):
+    def setUp(self) -> None:
+        catalog = _nifty_catalog()
+        incoming, _ce = _index_then_ce_incoming(catalog)
+        self.loop = _start_smoke(incoming, catalog)
+        self.reports = drain_smoke_loop(self.loop, max_cycles=8)
+        self.limit = self.loop.config.live_data.max_staleness_seconds
+        self.fresh = self.loop.last_snapshot
+        self.assertIsNotNone(self.fresh)
+        self.assertTrue(self.fresh.freshness_ok)
+
+    def tearDown(self) -> None:
+        self.loop.stop()
+
+    def _report_for(self, snapshot):
+        self.loop.last_snapshot = snapshot
+        return build_smoke_report(self.loop, self.reports, root=ROOT)
+
+    def test_a_fresh_ce_quote_counts(self) -> None:
+        check = _assess(self.loop, self.fresh)
+        self.assertTrue(check.ok)
+        self.assertTrue(check.quotes[0]["quote_freshness"])
+        report = self._report_for(self.fresh)
+        self.assertTrue(report["option_tick_ok"])
+        self.assertIsNotNone(report["first_option_tick"])
+        self.assertTrue(report["first_option_tick"]["quote_freshness"])
+        self.assertEqual(report["first_option_tick"]["option_type"], "CE")
+
+    def test_b_stale_ce_quote_does_not_count(self) -> None:
+        quote_time = AS_OF - timedelta(seconds=self.limit + 60)
+        stale = _retimed_ce(self.fresh, quote_time)
+        self.assertTrue(stale.freshness_ok)
+        check = _assess(self.loop, stale)
+        self.assertFalse(check.ok)
+        self.assertEqual(check.quotes, ())
+        report = self._report_for(stale)
+        self.assertFalse(report["option_tick_ok"])
+        self.assertIsNone(report["first_option_tick"])
+        self.assertEqual(report["result"], FAIL)
+        priced = next(
+            contract
+            for contract in stale.chains["NIFTY"].contracts
+            if contract.bid is not None and str(getattr(contract.option_type, "value", contract.option_type)) == "CE"
+        )
+        self.assertEqual(priced.timestamp, quote_time)
+
+    def test_c_future_ce_quote_does_not_count(self) -> None:
+        future = _retimed_ce(self.fresh, AS_OF + timedelta(seconds=1))
+        self.assertTrue(future.freshness_ok)
+        self.assertFalse(_assess(self.loop, future).ok)
+        report = self._report_for(future)
+        self.assertFalse(report["option_tick_ok"])
+        self.assertIsNone(report["first_option_tick"])
+        self.assertEqual(report["result"], FAIL)
+
+    def test_d_ce_quote_at_staleness_boundary_counts(self) -> None:
+        boundary = _retimed_ce(self.fresh, AS_OF - timedelta(seconds=self.limit))
+        check = _assess(self.loop, boundary)
+        self.assertTrue(check.ok)
+        self.assertTrue(check.quotes[0]["quote_freshness"])
+        report = self._report_for(boundary)
+        self.assertTrue(report["option_tick_ok"])
+        self.assertTrue(report["first_option_tick"]["quote_freshness"])
+
+    def test_e_ce_quote_beyond_staleness_boundary_does_not_count(self) -> None:
+        beyond = _retimed_ce(self.fresh, AS_OF - timedelta(seconds=self.limit + 1))
+        self.assertTrue(beyond.freshness_ok)
+        self.assertFalse(_assess(self.loop, beyond).ok)
+        report = self._report_for(beyond)
+        self.assertFalse(report["option_tick_ok"])
+        self.assertIsNone(report["first_option_tick"])
+        self.assertEqual(report["result"], FAIL)
