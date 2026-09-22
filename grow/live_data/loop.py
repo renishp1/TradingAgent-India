@@ -766,5 +766,7 @@ def open_loop(config: GrowConfig, *, clock: Clock | None = None, risk_secret: st
         kwargs["settings"] = settings_from_live_config(config.live_data)
         kwargs["clock"] = clock
         kwargs["live_config"] = config.live_data
+    elif config.live_data.provider == "kite_market":
+        kwargs["clock"] = clock
     provider = open_provider(config.live_data.provider, **kwargs)
     return LivePaperLoop(config, provider, clock=clock, risk_secret=risk_secret)

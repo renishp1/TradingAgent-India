@@ -16,7 +16,8 @@ SCHEMA = "grow.stream.snapshot.v1"
 ADAPTER_VERSION = "live_data.adapter.v1"
 MOCK_PROVIDER_ID = "grow.stream.mock.v1"
 TRUEDATA_PROVIDER_ID = "grow.stream.truedata.v1"
-APPROVED_STREAM_IDS = frozenset({MOCK_PROVIDER_ID, TRUEDATA_PROVIDER_ID})
+KITE_MARKET_PROVIDER_ID = "grow.stream.kite.market.v1"
+APPROVED_STREAM_IDS = frozenset({MOCK_PROVIDER_ID, TRUEDATA_PROVIDER_ID, KITE_MARKET_PROVIDER_ID})
 
 
 class SessionHealth(str, Enum):

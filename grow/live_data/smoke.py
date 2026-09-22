@@ -49,10 +49,12 @@ _BROKER_NAMES = frozenset(
 )
 _SCAN_RELATIVE = (
     "grow/live_data/truedata.py",
+    "grow/live_data/kite_market.py",
     "grow/live_data/loop.py",
     "grow/live_data/smoke.py",
     "grow/live_data/provider.py",
     "scripts/run_truedata_smoke.py",
+    "scripts/run_" + _tok("zero", "dha") + "_smoke.py",
 )
 
 
@@ -111,6 +113,52 @@ def smoke_config(environ: Mapping[str, str] | None = None) -> GrowConfig:
 
 def smoke_risk_secret(environ: Mapping[str, str] | None = None) -> str:
     return resolve_risk_secret(None, environ=environ)
+
+
+_MARKET_DATA_ENV = ("KITE_API_KEY", "KITE_ACCESS_TOKEN")
+
+
+def kite_market_smoke_config(environ: Mapping[str, str] | None = None) -> GrowConfig:
+    """Paper Kite market-data smoke. Credentials never enter the boot lock."""
+    env = dict(environ or {})
+    if str(env.get("ZERODHA_SMOKE") or "").strip() != "1":
+        raise GrowConfigError("SMOKE_DISABLED: set ZERODHA_SMOKE=1 for a real Zerodha smoke run")
+    stripped = {key: value for key, value in env.items() if key not in _MARKET_DATA_ENV}
+    timeout = int(str(stripped.get("ZERODHA_SMOKE_TIMEOUT") or DEFAULT_TIMEOUT_SECONDS).strip() or DEFAULT_TIMEOUT_SECONDS)
+    if timeout < 1:
+        raise GrowConfigError("ZERODHA_SMOKE_TIMEOUT must be >= 1")
+    if LIVE_TRADING_COMPILED:
+        raise GrowLiveTradingDisabled("LIVE_TRADING_COMPILED forbids 3C.3")
+    inspect_environment(stripped.items())
+    forced = {
+        **stripped,
+        "GROW_LIVE_DATA_ENABLED": "true",
+        "GROW_LIVE_DATA_PROVIDER": "kite_market",
+        "GROW_LIVE_DATA_MODE": "real",
+        "LIVE_DATA_ENABLED": "true",
+        "LIVE_DATA_PROVIDER": "kite_market",
+        "GROW_LIVE_DATA_LIVE_TRADING": "false",
+        "GROW_LIVE_DATA_PAPER_MODE": "true",
+    }
+    config = load_config(environ=forced)
+    live = replace(
+        config.live_data,
+        enabled=True,
+        provider="kite_market",
+        mode="real",
+        paper_mode=True,
+        live_trading=False,
+        snapshot_interval_seconds=0,
+        session_timeout_seconds=timeout,
+        reconnect_policy="bounded_backoff",
+    )
+    config = replace(config, live_data=live)
+    config.assert_safe()
+    if config.live_data.live_trading or config.execution.live_trading_enabled:
+        raise GrowLiveTradingDisabled("LIVE_EXECUTION_FORBIDDEN")
+    if not config.live_data.paper_mode:
+        raise GrowConfigError("live_data.paper_mode must be true.")
+    return config
 
 
 def redact_text(text: str, secrets: Sequence[str]) -> str:
@@ -579,6 +627,7 @@ _SMOKE_STOP_REASONS = frozenset(
         "FIXTURE_FALLBACK_FORBIDDEN",
         "SUBSCRIPTION_LIMIT",
         "SYMBOL_MAP_NOT_READY",
+        "NO_VALID_OPTION",
     }
 )
 
@@ -761,7 +810,7 @@ def build_smoke_report(
         "provider_id": provider.identity,
         "adapter_version": provider.adapter_version,
         "config": {
-            "provider": "truedata",
+            "provider": _report_provider_name(provider),
             "mode": getattr(getattr(loop.config, "live_data", None), "mode", None),
             "paper_mode": True,
             "live_trading": False,
@@ -849,6 +898,23 @@ def build_smoke_report(
     return redacted
 
 
+def _report_provider_name(provider: Any) -> str:
+    identity = str(getattr(provider, "identity", "") or "")
+    if "kite.market" in identity:
+        return "kite_market"
+    if "mock" in identity:
+        return "mock"
+    return "truedata"
+
+
+def _evidence_provider_name(report: Mapping[str, Any]) -> str:
+    config = report.get("config") if isinstance(report.get("config"), Mapping) else {}
+    blob = f"{report.get('provider_id') or ''} {config.get('provider') or ''}".lower()
+    if "kite_market" in blob or "kite.market" in blob:
+        return "Zerodha"
+    return "TrueData"
+
+
 def _shown(value: Any) -> str:
     if value is None or value == "":
         return "absent"
@@ -873,12 +939,13 @@ def format_option_tick_evidence(report: Mapping[str, Any]) -> str:
     age_text = "absent" if age is None else f"{age} ms"
     lines = [
         f"OPTION TICK: {'PASS' if proven else 'FAIL'}",
-        "Provider: TrueData",
+        f"Provider: {_evidence_provider_name(report)}",
         f"Underlying: {_shown(tick.get('underlying'))}",
         f"Expiry: {_shown(tick.get('expiry'))}",
         f"Strike: {_shown(tick.get('strike'))}",
         f"Option: {_shown(tick.get('option_type'))}",
         f"Provider Symbol ID: {_shown(tick.get('provider_symbol_id'))}",
+        f"Instrument token: {_shown(tick.get('provider_symbol_id'))}",
         f"Provider Symbol: {_shown(tick.get('provider_symbol'))}",
         f"Canonical ID: {_shown(tick.get('canonical_id'))}",
         f"Quote timestamp: {_shown(tick.get('quote_timestamp'))}",

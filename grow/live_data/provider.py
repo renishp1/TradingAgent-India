@@ -7,7 +7,7 @@ from typing import Any, Mapping, Protocol
 from grow.errors import GrowConfigError
 from grow.live_data.models import ADAPTER_VERSION, APPROVED_STREAM_IDS, MOCK_PROVIDER_ID, TRUEDATA_PROVIDER_ID, LiveHealth
 
-APPROVED_PROVIDERS = frozenset({"mock", "truedata"})
+APPROVED_PROVIDERS = frozenset({"mock", "truedata", "kite_market"})
 _FORBIDDEN_FALLBACK = frozenset(
     {
         "fixture",
@@ -53,6 +53,13 @@ def open_provider(provider_id: str, **kwargs: Any) -> LiveDataProvider:
         if settings is None and live is not None:
             settings = settings_from_live_config(live)
         return TrueDataAdapter(settings=settings, **kwargs)
+    if name == "kite_market":
+        from grow.live_data.kite_market import KiteMarketProvider
+
+        kwargs.pop("settings", None)
+        kwargs.pop("live_config", None)
+        kwargs.pop("events", None)
+        return KiteMarketProvider(**kwargs)
     from grow.live_data.mock import MockStreamProvider
 
     return MockStreamProvider(**kwargs)
