@@ -1,4 +1,4 @@
-"""3C.2 TrueData smoke evidence. Paper only. No secrets. No broker."""
+"""3C.3 TrueData option-tick evidence. Paper only. No secrets. No broker."""
 
 from __future__ import annotations
 
@@ -372,6 +372,7 @@ def _live_option_quote(
     fresh = _option_quote_is_fresh(quote_time, event_time, now, max_staleness_seconds)
     if not fresh:
         return None
+    age_seconds = (now - quote_time).total_seconds()
     return {
         "snapshot_id": snapshot.snapshot_id,
         "event_time": event_time.isoformat(),
@@ -386,6 +387,9 @@ def _live_option_quote(
         "bid": bid,
         "ask": ask,
         "ltp": ltp,
+        "quote_timestamp": quote_time.isoformat(),
+        "quote_age_seconds": age_seconds,
+        "quote_age_ms": int(round(age_seconds * 1000)),
         "quote_freshness": fresh,
         "sequence": snapshot.sequence,
     }
@@ -639,6 +643,9 @@ def build_smoke_report(
             "canonical_id": first["canonical_id"],
             "sequence": first["sequence"],
             "freshness_ok": True,
+            "quote_timestamp": first["quote_timestamp"],
+            "quote_age_seconds": first["quote_age_seconds"],
+            "quote_age_ms": first["quote_age_ms"],
             "quote_freshness": first["quote_freshness"],
             "underlyings": list(snapshot.underlyings),
             "contracts": [
@@ -676,6 +683,54 @@ def build_smoke_report(
         redacted["safety"]["secrets_redacted"] = not contains_secret(redacted, secrets)
         redacted["safety"]["broker"] = bool(broker_hits or loaded)
     return redacted
+
+
+def _shown(value: Any) -> str:
+    if value is None or value == "":
+        return "absent"
+    return str(value)
+
+
+def format_option_tick_evidence(report: Mapping[str, Any]) -> str:
+    """Auditable 3C.3 lines. Does not decide freshness or rewrite timestamps."""
+    raw_tick = report.get("first_option_tick")
+    tick = raw_tick if isinstance(raw_tick, Mapping) else {}
+    result = str(report.get("result") or FAIL)
+    option_ok = report.get("option_tick_ok") is True
+    subscription = report.get("subscription")
+    safety = report.get("safety")
+    sub = subscription if isinstance(subscription, Mapping) else {}
+    safe = safety if isinstance(safety, Mapping) else {}
+    mapped = bool(sub.get("mapping_ready")) and bool(tick.get("provider_symbol_id"))
+    fixture_clean = safe.get("fixture_fallback") is False
+    fresh = tick.get("quote_freshness") is True
+    proven = option_ok and result in {PASS, PASS_WITH_NO_TRADE} and fresh and mapped and fixture_clean
+    age = tick.get("quote_age_ms")
+    age_text = "absent" if age is None else f"{age} ms"
+    lines = [
+        f"OPTION TICK: {'PASS' if proven else 'FAIL'}",
+        "Provider: TrueData",
+        f"Underlying: {_shown(tick.get('underlying'))}",
+        f"Expiry: {_shown(tick.get('expiry'))}",
+        f"Strike: {_shown(tick.get('strike'))}",
+        f"Option: {_shown(tick.get('option_type'))}",
+        f"Provider Symbol ID: {_shown(tick.get('provider_symbol_id'))}",
+        f"Provider Symbol: {_shown(tick.get('provider_symbol'))}",
+        f"Canonical ID: {_shown(tick.get('canonical_id'))}",
+        f"Quote timestamp: {_shown(tick.get('quote_timestamp'))}",
+        f"Snapshot timestamp: {_shown(tick.get('event_time'))}",
+        f"Received timestamp: {_shown(tick.get('received_time'))}",
+        f"Quote age: {age_text}",
+        f"LTP: {_shown(tick.get('ltp'))}",
+        f"Bid: {_shown(tick.get('bid'))}",
+        f"Ask: {_shown(tick.get('ask'))}",
+        f"Quote freshness: {'PASS' if fresh else 'FAIL'}",
+        f"Symbol mapping: {'PASS' if mapped else 'FAIL'}",
+        f"Fixture detection: {'PASS' if fixture_clean else 'FAIL'}",
+        f"Option tick: {'PASS' if option_ok else 'FAIL'}",
+        f"Smoke result: {result}",
+    ]
+    return "\n".join(lines)
 
 
 def write_smoke_report(report: Mapping[str, Any], path: Path) -> Path:
