@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime
+from datetime import date, datetime
 
 from grow.clock import IST
 from grow.config import GrowConfig, load_config
 from grow.data.schema import Bar, BarSeries, MarketSnapshot, SnapshotQuality, SourceMeta, Timeframe
 from grow.errors import GrowConfigError
+from grow.history.calendar import session_state_at
 from grow.history.models import HistoricalBar
 from grow.history.store import CanonicalStore
-from grow.market.session import SessionCalendar
 from grow.options.models import ExpiryClass, FieldSource, OptionChainSnapshot, OptionContract, OptionExpiry, OptionType
 from grow.types import Symbol
 
@@ -40,7 +40,6 @@ class HistoricalMarketSource:
     def __init__(self, store: CanonicalStore, config: GrowConfig | None = None) -> None:
         self.store = store
         self.config = config or load_config()
-        self.calendar = SessionCalendar(self.config.market)
 
     def meta(self) -> SourceMeta:
         return SourceMeta(
@@ -48,7 +47,7 @@ class HistoricalMarketSource:
             vendor=self.store.meta.provider_name,
             license=self.store.meta.license_status,
             is_live=False,
-            is_fixture=False,
+            is_fixture=self.store.meta.is_fixture,
             schema=self.store.meta.schema_version,
         )
 
@@ -84,7 +83,7 @@ class HistoricalMarketSource:
             snapshot_id=_digest(f"{ticker}:{moment.isoformat()}:{self.store.meta.fingerprint}")[:16],
             symbol=symbol,
             as_of=moment,
-            session=self.calendar.state(moment),
+            session=session_state_at(self.store, moment),
             last_price=last,
             currency="INR",
             series=series,
@@ -131,7 +130,7 @@ class HistoricalOptionSource:
             vendor=self.store.meta.provider_name,
             license=self.store.meta.license_status,
             is_live=False,
-            is_fixture=False,
+            is_fixture=self.store.meta.is_fixture,
             schema="grow.options.chain.v1",
         )
 
@@ -180,7 +179,7 @@ class HistoricalOptionSource:
             expiries=tuple(expiries.values()),
             contracts=tuple(mapped),
             source_id=self.store.meta.version,
-            is_fixture=False,
+            is_fixture=self.store.meta.is_fixture,
             provider_metadata={
                 "dataset_id": self.store.meta.dataset_id,
                 "dataset_version": self.store.meta.version,

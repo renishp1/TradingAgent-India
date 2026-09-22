@@ -35,6 +35,8 @@ class ApprovedDataSource:
     licensing_status: str
     dataset_version: str
     provenance: str
+    usage_scope: str
+    is_fixture: bool
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -56,6 +58,8 @@ class ApprovedDataSource:
             "licensing_status": self.licensing_status,
             "dataset_version": self.dataset_version,
             "provenance": self.provenance,
+            "usage_scope": self.usage_scope,
+            "is_fixture": self.is_fixture,
         }
 
 
@@ -79,6 +83,8 @@ def _base_catalog() -> dict[str, ApprovedDataSource]:
         licensing_status=APPROVED,
         dataset_version=FIXTURE_DATASET,
         provenance="grow.data.fixture + grow.options.fixture",
+        usage_scope="FRAMEWORK_TEST_ONLY",
+        is_fixture=True,
     )
     stub = ApprovedDataSource(
         dataset_id=UNAPPROVED_STUB,
@@ -99,6 +105,8 @@ def _base_catalog() -> dict[str, ApprovedDataSource]:
         licensing_status=NOT_APPROVED,
         dataset_version=UNAPPROVED_STUB,
         provenance="rejection-stub",
+        usage_scope="FRAMEWORK_TEST_ONLY",
+        is_fixture=True,
     )
     return {fixture.dataset_id: fixture, stub.dataset_id: stub}
 
@@ -127,6 +135,8 @@ def default_catalog() -> dict[str, ApprovedDataSource]:
             licensing_status=row["licensing_status"],
             dataset_version=row["dataset_version"],
             provenance=row["provenance"],
+            usage_scope=row.get("usage_scope", "FRAMEWORK_TEST_ONLY"),
+            is_fixture=bool(row.get("is_fixture", True)),
         )
     return cat
 
@@ -137,4 +147,13 @@ def require_approved(catalog: Mapping[str, ApprovedDataSource], dataset_id: str)
         raise GrowConfigError(f"UNKNOWN_DATASET:{dataset_id}")
     if source.licensing_status != APPROVED:
         raise GrowConfigError(f"DATASET_NOT_APPROVED:{dataset_id}")
+    return source
+
+
+def require_historical_research(catalog: Mapping[str, ApprovedDataSource], dataset_id: str) -> ApprovedDataSource:
+    source = require_approved(catalog, dataset_id)
+    if source.usage_scope != "HISTORICAL_RESEARCH" or source.is_fixture:
+        raise GrowConfigError(f"DATASET_FRAMEWORK_ONLY:{dataset_id}")
+    if source.quality_status in {"SYNTHETIC", "REJECTED", "DRAFT", "RETIRED"}:
+        raise GrowConfigError(f"DATASET_FRAMEWORK_ONLY:{dataset_id}")
     return source

@@ -9,6 +9,11 @@ from grow.errors import GrowConfigError
 from grow.history.fingerprint import fingerprint
 from grow.history.models import (
     ALLOWED_UNDERLYINGS,
+    APPROVED,
+    APPROVED_WITH_WARNINGS,
+    FRAMEWORK_TEST_ONLY,
+    REJECTED,
+    SYNTHETIC,
     CoverageReport,
     DatasetVersion,
     HistoricalBar,
@@ -72,8 +77,9 @@ class CanonicalStore:
     def publish(self) -> DatasetVersion:
         self._guard()
         report = self.coverage()
+        gated = apply_quality_gate(self.meta, report)
         payload = {
-            "meta": {k: v for k, v in self.meta.to_dict().items() if k != "fingerprint"},
+            "meta": {k: v for k, v in gated.to_dict().items() if k != "fingerprint"},
             "sessions": [self._sessions[d].to_dict() for d in sorted(self._sessions)],
             "bars": [self._bars[k].to_dict() for k in sorted(self._bars, key=lambda i: (i[0], i[1], i[2].isoformat()))],
             "contracts": [self._contracts[k].to_dict() for k in sorted(self._contracts)],
@@ -84,32 +90,59 @@ class CanonicalStore:
             "coverage": report.to_dict(),
         }
         fp = fingerprint(payload)
-        self.meta = replace(self.meta, fingerprint=fp)
+        self.meta = replace(gated, fingerprint=fp)
         self._published = True
         return self.meta
 
     def coverage(self) -> CoverageReport:
-        open_days = [s for s in self._sessions.values() if s.status == "OPEN"]
-        quotes = self._quotes
-        n = max(len(quotes), 1)
-        bid_ask = sum(1 for q in quotes if q.bid is not None and q.ask is not None)
-        oi = sum(1 for q in quotes if q.open_interest >= 0)
-        vol = sum(1 for q in quotes if q.volume >= 0)
-        iv = sum(1 for q in quotes if q.implied_volatility is not None)
-        greeks = sum(1 for q in quotes if q.delta is not None)
+        open_days = [s.session_date for s in self._sessions.values() if s.status == "OPEN"]
+        days_with_bars = {bar.timestamp.date() for bar in self._bars.values()}
+        missing_sessions = tuple(day.isoformat() for day in sorted(open_days) if day not in days_with_bars)
+        expected_quotes = 0
+        observed_quotes = 0
+        missing_snaps: list[str] = []
+        quotes_by_key: dict[tuple[str, date], list[HistoricalOptionQuote]] = {}
+        for quote in self._quotes:
+            quotes_by_key.setdefault((quote.contract_id, quote.timestamp.date()), []).append(quote)
+        for day in open_days:
+            for contract in self._contracts.values():
+                if not (contract.first_seen_at.date() <= day <= contract.last_seen_at.date()):
+                    continue
+                expected_quotes += 1
+                rows = quotes_by_key.get((contract.contract_id, day), [])
+                if rows:
+                    observed_quotes += 1
+                else:
+                    missing_snaps.append(f"{contract.contract_id}:{day.isoformat()}")
+        denom = max(expected_quotes, 1) if expected_quotes else 1
+        observed_rows = self._quotes
+        n_obs = len(observed_rows)
+
+        def _ratio(count: int, total: int) -> float:
+            if total <= 0:
+                return 0.0
+            return round(count / total, 4)
+
+        bid_ask = sum(1 for q in observed_rows if q.bid is not None and q.ask is not None)
+        oi = sum(1 for q in observed_rows if q.open_interest is not None)
+        vol = sum(1 for q in observed_rows if q.volume is not None)
+        iv = sum(1 for q in observed_rows if q.implied_volatility is not None)
+        greeks = sum(1 for q in observed_rows if q.delta is not None)
         return CoverageReport(
             dataset_version=self.meta.version,
-            expected_sessions=len(self._sessions),
-            actual_sessions=len(open_days),
-            missing_sessions=(),
+            expected_sessions=len(open_days),
+            actual_sessions=len({d for d in open_days if d in days_with_bars}),
+            missing_sessions=missing_sessions,
             missing_bar_intervals=(),
-            missing_option_snapshots=(),
-            quote_completeness=round(len(quotes) / n, 4),
-            bid_ask_completeness=round(bid_ask / n, 4),
-            oi_completeness=round(oi / n, 4),
-            volume_completeness=round(vol / n, 4),
-            iv_completeness=round(iv / n, 4),
-            greek_completeness=round(greeks / n, 4),
+            missing_option_snapshots=tuple(missing_snaps[:20]),
+            expected_quotes=expected_quotes,
+            observed_quotes=observed_quotes,
+            quote_completeness=_ratio(observed_quotes, expected_quotes),
+            bid_ask_completeness=_ratio(bid_ask, n_obs),
+            oi_completeness=_ratio(oi, n_obs),
+            volume_completeness=_ratio(vol, n_obs),
+            iv_completeness=_ratio(iv, n_obs),
+            greek_completeness=_ratio(greeks, n_obs),
         )
 
     def sessions(self, start: date, end: date) -> tuple[HistoricalSession, ...]:
@@ -148,10 +181,14 @@ class CanonicalStore:
                 if q.contract_id == contract.contract_id
                 and q.as_of_available_at <= as_of
                 and q.timestamp <= as_of
+                and contract.first_seen_at <= q.timestamp <= contract.last_seen_at
             ]
             if eligible:
                 quotes.append(max(eligible, key=lambda item: item.timestamp))
         return tuple(live), tuple(quotes)
+
+    def session_on(self, day: date) -> HistoricalSession | None:
+        return self._sessions.get(day)
 
     def has_contract(self, contract_id: str) -> bool:
         return contract_id in self._contracts
@@ -170,3 +207,27 @@ class CanonicalStore:
     def _guard(self) -> None:
         if self._published:
             raise GrowConfigError("DATASET_IMMUTABLE")
+
+
+def apply_quality_gate(meta: DatasetVersion, report: CoverageReport) -> DatasetVersion:
+    if meta.usage_scope == FRAMEWORK_TEST_ONLY or meta.is_fixture:
+        return replace(meta, quality_status=SYNTHETIC, license_status="NOT_APPROVED")
+    status = meta.quality_status
+    required_ok = not report.missing_sessions and report.expected_quotes > 0 and report.quote_completeness == 1.0
+    if meta.bid_ask_available and report.bid_ask_completeness < 1.0:
+        required_ok = False
+    if meta.oi_available and report.oi_completeness < 1.0:
+        required_ok = False
+    if meta.volume_available and report.volume_completeness < 1.0:
+        required_ok = False
+    if not required_ok:
+        if report.observed_quotes == 0 or report.actual_sessions == 0:
+            status = REJECTED
+        else:
+            status = APPROVED_WITH_WARNINGS
+        if meta.quality_status == APPROVED:
+            status = status
+    elif status == APPROVED:
+        status = APPROVED
+    return replace(meta, quality_status=status)
+

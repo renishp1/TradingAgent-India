@@ -7,12 +7,16 @@ from grow.backtest.calendar import WeekdayFixtureCalendar
 from grow.backtest.runner import BacktestRunner
 from grow.clock import IST
 from grow.config import load_config
-from grow.director.catalog import default_catalog
+from grow.director.catalog import default_catalog, require_historical_research
 from grow.errors import GrowConfigError
-from grow.history.adapter import load_payload
+from grow.history.adapter import _dt, load_payload
 from grow.history.bridge import HistoricalMarketSource, HistoricalOptionSource
-from grow.history.calendar import calendar_for
+from grow.history.calendar import calendar_for, session_state_at
 from grow.history.models import (
+    APPROVED_WITH_WARNINGS,
+    FRAMEWORK_TEST_ONLY,
+    REJECTED,
+    SYNTHETIC,
     DatasetVersion,
     HistoricalBar,
     HistoricalOptionContract,
@@ -21,8 +25,9 @@ from grow.history.models import (
 )
 from grow.history.quality import validate_bar, validate_quote
 from grow.history.registry import default_registry
-from grow.history.sample import SAMPLE_ID, SAMPLE_VERSION, build_sample_store
+from grow.history.sample import HOLIDAY, SAMPLE_ID, SAMPLE_VERSION, build_sample_store
 from grow.history.store import CanonicalStore
+from grow.types import SessionState
 
 
 def _meta(**kwargs) -> DatasetVersion:
@@ -52,6 +57,8 @@ def _meta(**kwargs) -> DatasetVersion:
         option_depth="atm_pm2",
         provenance="test",
         timezone="Asia/Kolkata",
+        usage_scope="HISTORICAL_RESEARCH",
+        is_fixture=False,
     )
     base.update(kwargs)
     return DatasetVersion(**base)
@@ -341,9 +348,21 @@ class HistorySampleTests(unittest.TestCase):
         self.assertEqual(a.meta.fingerprint, b.meta.fingerprint)
         self.assertEqual(a.meta.dataset_id, SAMPLE_ID)
         self.assertEqual(a.meta.version, SAMPLE_VERSION)
+        self.assertEqual(a.meta.usage_scope, FRAMEWORK_TEST_ONLY)
+        self.assertTrue(a.meta.is_fixture)
+        self.assertEqual(a.meta.quality_status, SYNTHETIC)
+        self.assertEqual(a.meta.license_status, "NOT_APPROVED")
         cat = default_catalog()
         self.assertIn(SAMPLE_ID, cat)
-        self.assertEqual(cat[SAMPLE_ID].licensing_status, "APPROVED")
+        self.assertEqual(cat[SAMPLE_ID].licensing_status, "NOT_APPROVED")
+        self.assertEqual(cat[SAMPLE_ID].usage_scope, FRAMEWORK_TEST_ONLY)
+        self.assertTrue(cat[SAMPLE_ID].is_fixture)
+        with self.assertRaises(GrowConfigError) as ctx:
+            require_historical_research(cat, SAMPLE_ID)
+        self.assertIn("DATASET", str(ctx.exception))
+        with self.assertRaises(GrowConfigError) as ctx:
+            default_registry().require_approved(SAMPLE_ID, SAMPLE_VERSION)
+        self.assertIn("DATASET_FRAMEWORK_ONLY", str(ctx.exception))
         self.assertIn(a.meta.fingerprint, cat[SAMPLE_ID].provenance)
         days = [s.session_date for s in a.sessions(date(2026, 9, 7), date(2026, 9, 9))]
         self.assertNotIn(date(2026, 9, 8), days)
@@ -356,6 +375,8 @@ class HistorySampleTests(unittest.TestCase):
         src = HistoricalMarketSource(store)
         snap = src.snapshot("NIFTY", as_of=as_of)
         self.assertEqual(snap.as_of, as_of)
+        self.assertTrue(src.meta().is_fixture)
+        self.assertTrue(HistoricalOptionSource(store).meta().is_fixture)
         for series in snap.series.values():
             if series.bars:
                 self.assertLessEqual(series.bars[-1].end, as_of)
@@ -397,5 +418,199 @@ class HistorySampleTests(unittest.TestCase):
         self.assertEqual(loaded.meta.fingerprint, again.meta.fingerprint)
 
 
-if __name__ == "__main__":
-    unittest.main()
+class HistoryHardeningTests(unittest.TestCase):
+    def test_dataset_closed_day_not_config_calendar(self) -> None:
+        store = default_registry().get(SAMPLE_ID, SAMPLE_VERSION)
+        as_of = datetime.combine(HOLIDAY, time(11, 0), tzinfo=IST)
+        snap = HistoricalMarketSource(store).snapshot("NIFTY", as_of=as_of)
+        self.assertEqual(snap.session, SessionState.HOLIDAY)
+        self.assertEqual(session_state_at(store, as_of), SessionState.HOLIDAY)
+
+    def test_adapter_rejects_naive_timestamp(self) -> None:
+        with self.assertRaises(GrowConfigError) as ctx:
+            _dt("2026-09-21T11:00:00")
+        self.assertIn("NAIVE_TIMESTAMP", str(ctx.exception))
+        aware = _dt("2026-09-21T11:00:00+05:30")
+        self.assertEqual(aware.tzinfo.utcoffset(aware), IST.utcoffset(aware))
+        declared = _dt("2026-09-21T11:00:00", source_tz="Asia/Kolkata")
+        self.assertIsNotNone(declared.tzinfo)
+
+    def test_pre_listing_quote_never_selected(self) -> None:
+        store = CanonicalStore(_meta())
+        store.add_session(_session())
+        listed = datetime(2026, 9, 21, 11, 0, tzinfo=IST)
+        store.add_contract(
+            HistoricalOptionContract(
+                underlying="NIFTY",
+                expiry=date(2026, 9, 22),
+                strike=25000,
+                option_type="CE",
+                contract_id="late",
+                provider_contract_id="late",
+                lot_size=75,
+                expiry_class="WEEKLY",
+                first_seen_at=listed,
+                last_seen_at=datetime(2026, 9, 22, 15, 30, tzinfo=IST),
+                listing_status="ACTIVE",
+                source_id="t",
+                dataset_version="v1",
+            )
+        )
+        early = datetime(2026, 9, 21, 10, 0, tzinfo=IST)
+        store.add_quote(
+            HistoricalOptionQuote(
+                contract_id="late",
+                timestamp=early,
+                bid=1,
+                ask=2,
+                ltp=1.5,
+                volume=1,
+                open_interest=1,
+                previous_open_interest=None,
+                implied_volatility=None,
+                delta=None,
+                gamma=None,
+                theta=None,
+                vega=None,
+                greek_source=None,
+                iv_source=None,
+                source_id="t",
+                dataset_version="v1",
+                as_of_available_at=early,
+                quality_flags=(),
+            )
+        )
+        later = datetime(2026, 9, 21, 12, 0, tzinfo=IST)
+        _, quotes = store.snapshot_quotes("NIFTY", later)
+        self.assertEqual(quotes, ())
+
+    def test_real_dataset_is_not_fixture(self) -> None:
+        store = CanonicalStore(_meta())
+        store.add_session(_session())
+        ts = datetime(2026, 9, 21, 11, 0, tzinfo=IST)
+        end = ts + timedelta(minutes=15)
+        store.add_bar(
+            HistoricalBar(
+                symbol="NIFTY",
+                timeframe="M15",
+                timestamp=ts,
+                end=end,
+                open=10,
+                high=11,
+                low=9,
+                close=10,
+                volume=1,
+                source_id="t",
+                dataset_version="v1",
+                as_of_available_at=end,
+                corporate_action_adjustment_version="u",
+                quality_flags=(),
+            )
+        )
+        store.add_contract(
+            HistoricalOptionContract(
+                underlying="NIFTY",
+                expiry=date(2026, 9, 22),
+                strike=25000,
+                option_type="CE",
+                contract_id="c1",
+                provider_contract_id="c1",
+                lot_size=75,
+                expiry_class="WEEKLY",
+                first_seen_at=datetime(2026, 9, 21, 9, 15, tzinfo=IST),
+                last_seen_at=datetime(2026, 9, 22, 15, 30, tzinfo=IST),
+                listing_status="ACTIVE",
+                source_id="t",
+                dataset_version="v1",
+            )
+        )
+        store.add_quote(
+            HistoricalOptionQuote(
+                contract_id="c1",
+                timestamp=ts,
+                bid=10,
+                ask=11,
+                ltp=10.5,
+                volume=1,
+                open_interest=1,
+                previous_open_interest=None,
+                implied_volatility=None,
+                delta=None,
+                gamma=None,
+                theta=None,
+                vega=None,
+                greek_source=None,
+                iv_source=None,
+                source_id="t",
+                dataset_version="v1",
+                as_of_available_at=ts,
+                quality_flags=(),
+            )
+        )
+        store.publish()
+        self.assertFalse(store.meta.is_fixture)
+        self.assertFalse(HistoricalMarketSource(store).meta().is_fixture)
+        self.assertFalse(HistoricalOptionSource(store).meta().is_fixture)
+
+    def test_incomplete_data_cannot_stay_approved(self) -> None:
+        store = CanonicalStore(_meta(quality_status="APPROVED"))
+        store.add_session(_session())
+        report = store.coverage()
+        self.assertEqual(report.quote_completeness, 0.0)
+        self.assertEqual(report.oi_completeness, 0.0)
+        published = store.publish()
+        self.assertEqual(published.quality_status, REJECTED)
+        self.assertNotEqual(published.quality_status, "APPROVED")
+
+    def test_missing_oi_not_counted_as_present_zero(self) -> None:
+        store = CanonicalStore(_meta())
+        store.add_session(_session())
+        ts = datetime(2026, 9, 21, 11, 0, tzinfo=IST)
+        store.add_contract(
+            HistoricalOptionContract(
+                underlying="NIFTY",
+                expiry=date(2026, 9, 22),
+                strike=25000,
+                option_type="CE",
+                contract_id="c1",
+                provider_contract_id="c1",
+                lot_size=75,
+                expiry_class="WEEKLY",
+                first_seen_at=datetime(2026, 9, 21, 9, 15, tzinfo=IST),
+                last_seen_at=datetime(2026, 9, 22, 15, 30, tzinfo=IST),
+                listing_status="ACTIVE",
+                source_id="t",
+                dataset_version="v1",
+            )
+        )
+        store.add_quote(
+            HistoricalOptionQuote(
+                contract_id="c1",
+                timestamp=ts,
+                bid=10,
+                ask=11,
+                ltp=10.5,
+                volume=0,
+                open_interest=None,
+                previous_open_interest=None,
+                implied_volatility=None,
+                delta=None,
+                gamma=None,
+                theta=None,
+                vega=None,
+                greek_source=None,
+                iv_source=None,
+                source_id="t",
+                dataset_version="v1",
+                as_of_available_at=ts,
+                quality_flags=(),
+            )
+        )
+        report = store.coverage()
+        self.assertEqual(report.volume_completeness, 1.0)
+        self.assertEqual(report.oi_completeness, 0.0)
+        self.assertEqual(report.observed_quotes, 1)
+        published = store.publish()
+        self.assertIn(published.quality_status, {APPROVED_WITH_WARNINGS, REJECTED})
+        self.assertNotEqual(published.quality_status, "APPROVED")
+

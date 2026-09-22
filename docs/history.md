@@ -23,6 +23,8 @@ No broker. No live feed. No PaperLedger. No Risk Guard writes.
 | Knob | Value |
 |---|---|
 | Vendor | none — file adapter + `grow.history.sample.v1` |
+| Sample usage | `FRAMEWORK_TEST_ONLY` / `SYNTHETIC` — not historical research |
+| Calendar | dataset `HistoricalSession` for snapshot state; **not** config SessionCalendar |
 | Universe | NIFTY / BANKNIFTY only |
 | Availability | `as_of_available_at`; sample uses observation timestamp |
 | Calendar | dataset sessions, **not** weekday inference |

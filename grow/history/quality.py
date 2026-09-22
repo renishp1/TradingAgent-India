@@ -64,9 +64,9 @@ def validate_quote(quote: HistoricalOptionQuote) -> None:
         raise GrowConfigError("NEGATIVE_ASK")
     if quote.bid is not None and quote.ask is not None and quote.bid > quote.ask:
         raise GrowConfigError("CROSSED_QUOTE")
-    if quote.volume < 0:
+    if quote.volume is not None and quote.volume < 0:
         raise GrowConfigError("NEGATIVE_VOLUME")
-    if quote.open_interest < 0:
+    if quote.open_interest is not None and quote.open_interest < 0:
         raise GrowConfigError("NEGATIVE_OI")
 
 

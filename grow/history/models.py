@@ -17,6 +17,9 @@ APPROVED = "APPROVED"
 APPROVED_WITH_WARNINGS = "APPROVED_WITH_WARNINGS"
 REJECTED = "REJECTED"
 RETIRED = "RETIRED"
+SYNTHETIC = "SYNTHETIC"
+FRAMEWORK_TEST_ONLY = "FRAMEWORK_TEST_ONLY"
+HISTORICAL_RESEARCH = "HISTORICAL_RESEARCH"
 
 
 @dataclass(frozen=True)
@@ -121,8 +124,8 @@ class HistoricalOptionQuote:
     bid: float | None
     ask: float | None
     ltp: float | None
-    volume: int
-    open_interest: int
+    volume: int | None
+    open_interest: int | None
     previous_open_interest: int | None
     implied_volatility: float | None
     delta: float | None
@@ -187,6 +190,8 @@ class DatasetVersion:
     option_depth: str
     provenance: str
     timezone: str
+    usage_scope: str
+    is_fixture: bool
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -215,6 +220,8 @@ class DatasetVersion:
             "option_depth": self.option_depth,
             "provenance": self.provenance,
             "timezone": self.timezone,
+            "usage_scope": self.usage_scope,
+            "is_fixture": self.is_fixture,
             "label": "HISTORICAL DATA / RESEARCH ONLY",
         }
 
@@ -227,6 +234,8 @@ class CoverageReport:
     missing_sessions: tuple[str, ...]
     missing_bar_intervals: tuple[str, ...]
     missing_option_snapshots: tuple[str, ...]
+    expected_quotes: int
+    observed_quotes: int
     quote_completeness: float
     bid_ask_completeness: float
     oi_completeness: float
@@ -242,6 +251,8 @@ class CoverageReport:
             "missing_sessions": list(self.missing_sessions),
             "missing_bar_intervals": list(self.missing_bar_intervals),
             "missing_option_snapshots": list(self.missing_option_snapshots),
+            "expected_quotes": self.expected_quotes,
+            "observed_quotes": self.observed_quotes,
             "quote_completeness": self.quote_completeness,
             "bid_ask_completeness": self.bid_ask_completeness,
             "oi_completeness": self.oi_completeness,

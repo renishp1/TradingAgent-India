@@ -8,8 +8,10 @@ from grow.clock import IST
 from grow.data.schedule import bar_duration, expected_starts
 from grow.data.schema import Timeframe
 from grow.history.models import (
+    FRAMEWORK_TEST_ONLY,
     NORM,
     SCHEMA,
+    SYNTHETIC,
     DatasetVersion,
     HistoricalBar,
     HistoricalOptionContract,
@@ -57,8 +59,8 @@ def build_sample_store() -> CanonicalStore:
         coverage_end=END,
         fingerprint="pending",
         published_at="2026-01-01T08:00:00+05:30",
-        quality_status="APPROVED",
-        license_status="APPROVED",
+        quality_status=SYNTHETIC,
+        license_status="NOT_APPROVED",
         source_id=SOURCE,
         provider_name="grow-sample",
         granularity=("M5", "M15", "D1"),
@@ -70,8 +72,10 @@ def build_sample_store() -> CanonicalStore:
         greeks_available=False,
         contract_metadata_available=True,
         option_depth="atm_pm2",
-        provenance="synthetic-historical-sample",
+        provenance="SYNTHETIC FRAMEWORK_TEST_ONLY — not historical research",
         timezone="Asia/Kolkata",
+        usage_scope=FRAMEWORK_TEST_ONLY,
+        is_fixture=True,
     )
     store = CanonicalStore(meta)
     for day in _weekdays(START, END):

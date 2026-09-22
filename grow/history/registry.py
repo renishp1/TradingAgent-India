@@ -33,6 +33,8 @@ class DatasetRegistry:
 
     def require_approved(self, dataset_id: str, version: str) -> CanonicalStore:
         store = self.get(dataset_id, version)
+        if store.meta.usage_scope != "HISTORICAL_RESEARCH" or store.meta.is_fixture:
+            raise GrowConfigError(f"DATASET_FRAMEWORK_ONLY:{dataset_id}")
         if store.meta.license_status not in {"APPROVED", "APPROVED_WITH_WARNINGS"}:
             raise GrowConfigError(f"DATASET_NOT_APPROVED:{dataset_id}")
         if store.meta.quality_status in {"REJECTED", "RETIRED", "DRAFT"}:
@@ -65,6 +67,8 @@ class DatasetRegistry:
                     "dataset_version": meta.version,
                     "fingerprint": meta.fingerprint,
                     "provenance": f"{meta.provenance}|fp={meta.fingerprint}",
+                    "usage_scope": meta.usage_scope,
+                    "is_fixture": meta.is_fixture,
                 }
             )
         return tuple(rows)
