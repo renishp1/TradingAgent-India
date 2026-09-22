@@ -1,4 +1,8 @@
-"""Decision-cycle contracts, debate aggregation, and audit journal."""
+"""Decision-cycle contracts, debate aggregation, and audit journal.
+
+4C integration lives in ``grow.decision.integration`` and is not imported here.
+Importing it from this package would cycle through orchestration and the agents.
+"""
 
 from grow.decision.aggregation.debate import DebateSummary, summarize_debate
 from grow.decision.contracts.agent_result import (

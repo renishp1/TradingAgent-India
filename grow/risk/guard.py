@@ -64,6 +64,7 @@ class RiskGuard:
         gross_notional: float,
         daily_pnl: float,
         symbol_notional: float,
+        open_positions: int = 0,
     ) -> RiskVerdict:
         assert_paper_runtime(
             self.config.execution.mode,
@@ -171,6 +172,40 @@ class RiskGuard:
 
         high_vol_block = brief.regime.value == "HIGH_VOLATILITY" and proposal.intent is Intent.OPEN
         rule("regime.volatility", not high_vol_block, f"regime={brief.regime.value}")
+
+        # 4C: position count and per-trade planned loss. Appended after the
+        # existing rules so a previously failing rule stays the reported reason.
+        # Unset caps do not loosen notional, stop, or daily-loss checks.
+        max_positions = self.config.risk.max_open_positions
+        if proposal.intent is Intent.OPEN and max_positions is not None:
+            rule(
+                "positions.count",
+                open_positions >= 0 and open_positions < max_positions,
+                f"open={open_positions} max={max_positions}",
+            )
+        elif open_positions < 0:
+            rule("positions.count", False, f"open={open_positions} invalid")
+        else:
+            detail = "not an open" if max_positions is not None else "not configured"
+            rule("positions.count", True, detail)
+
+        max_trade_risk = self.config.risk.max_per_trade_risk
+        if proposal.intent is Intent.OPEN and max_trade_risk is not None:
+            if proposal.stop_loss is None or proposal.stop_loss <= 0:
+                rule("risk.per_trade", False, "stop missing; planned loss unknown")
+            else:
+                planned = abs(proposal.limit_price - proposal.stop_loss) * proposal.quantity
+                rule(
+                    "risk.per_trade",
+                    planned <= float(max_trade_risk) + 1e-9,
+                    f"planned={planned:.2f} cap={float(max_trade_risk):.2f}",
+                )
+        else:
+            rule(
+                "risk.per_trade",
+                True,
+                "not configured" if max_trade_risk is None else "not an open",
+            )
 
         failed = [(rid, detail) for rid, passed, detail in results if not passed]
         if failed:

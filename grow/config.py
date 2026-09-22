@@ -104,6 +104,18 @@ def _as_float(value: Any, key: str) -> float:
         raise GrowConfigError(f"{key} must be a number") from exc
 
 
+def _as_optional_int(value: Any, key: str) -> int | None:
+    if value is None or value == "":
+        return None
+    return _as_int(value, key)
+
+
+def _as_optional_float(value: Any, key: str) -> float | None:
+    if value is None or value == "":
+        return None
+    return _as_float(value, key)
+
+
 def _as_int(value: Any, key: str) -> int:
     try:
         return int(value)
@@ -138,6 +150,11 @@ class RiskConfig:
     ruleset: str
     allow_short: bool
     concentration_basis: str
+    # Optional caps. None keeps the historical guard behavior (notional, stop,
+    # and daily-loss rules still apply). When set, Risk Guard enforces them
+    # and agent outputs cannot raise the cap.
+    max_open_positions: int | None = None
+    max_per_trade_risk: float | None = None
 
 
 @dataclass(frozen=True)
@@ -327,6 +344,10 @@ class GrowConfig:
             raise GrowConfigError("Milestone 1 cash book forbids shorts. allow_short must be false.")
         if self.risk.concentration_basis != "cost_notional":
             raise GrowConfigError("Milestone 1 concentration_basis must be cost_notional until MTM exists.")
+        if self.risk.max_open_positions is not None and self.risk.max_open_positions < 1:
+            raise GrowConfigError("risk.max_open_positions must be >= 1 when set.")
+        if self.risk.max_per_trade_risk is not None and self.risk.max_per_trade_risk < 0:
+            raise GrowConfigError("risk.max_per_trade_risk must be >= 0 when set.")
         if self.data.provider != "fixture":
             raise GrowConfigError(
                 "Milestone 2A data.provider must be 'fixture' until a licensed feed is reviewed."
@@ -758,6 +779,10 @@ def _build(raw: dict[str, Any], source_path: str) -> GrowConfig:
             ruleset=str(risk.get("ruleset", "grow.risk.v1")),
             allow_short=_as_bool(risk.get("allow_short", False), "allow_short"),
             concentration_basis=str(risk.get("concentration_basis", "cost_notional")),
+            max_open_positions=_as_optional_int(risk.get("max_open_positions"), "risk.max_open_positions"),
+            max_per_trade_risk=_as_optional_float(
+                risk.get("max_per_trade_risk"), "risk.max_per_trade_risk"
+            ),
         ),
         paper=PaperConfig(
             starting_cash=_as_float(paper.get("starting_cash", 1_000_000), "starting_cash"),
