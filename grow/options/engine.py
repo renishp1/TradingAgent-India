@@ -39,10 +39,10 @@ SELECTION_VERSION = "options.select.v1"
 class IndexOptionsEngine:
     def __init__(self, config: GrowConfig | None = None) -> None:
         self.config = config or load_config()
-        if self.config.options.allow_live_chain:
+        if self.config.options.allow_live_chain or self.config.options.provider == "live":
             raise GrowConfigError("Live option chains are not attached.")
-        if self.config.options.provider != "fixture":
-            raise GrowConfigError("2C only evaluates fixture chains.")
+        if self.config.options.provider not in {"fixture", "historical"}:
+            raise GrowConfigError("2C only evaluates fixture or historical chains.")
 
     def evaluate(
         self,
@@ -50,6 +50,7 @@ class IndexOptionsEngine:
         underlying_snapshot: MarketSnapshot,
         option_chain: OptionChainSnapshot,
         config: GrowConfig | None = None,
+        registry=None,
     ) -> OptionsDecision:
         cfg = (config or self.config).options
         as_of = underlying_snapshot.as_of
@@ -73,11 +74,11 @@ class IndexOptionsEngine:
             return empty((str(exc),))
         if signal.direction in {"LONG", "SHORT", "SELL", "BUY", "OPTION_SELL"}:
             return empty((f"EXECUTION_LANGUAGE:{signal.direction}",))
-        from grow.history.universe import default_index_registry
+        from grow.history.universe import default_index_registry, is_forbidden_instrument
 
-        registry = default_index_registry()
+        overlay = registry or default_index_registry()
         ticker = signal.symbol.ticker
-        if not registry.allows(ticker, as_of.date()):
+        if is_forbidden_instrument(ticker) or not overlay.allows(ticker, as_of.date()):
             return empty((f"UNSUPPORTED_UNDERLYING:{ticker}",))
         if option_chain.underlying != ticker:
             return empty(("UNDERLYING_CHAIN_MISMATCH",))
@@ -100,11 +101,12 @@ class IndexOptionsEngine:
         kept, rejected, notes = validate_chain(option_chain, as_of=as_of, config=cfg)
         if not kept and any(n.startswith("STALE") or n in {"CHAIN_FROM_FUTURE", "LIVE_CHAIN_FORBIDDEN"} for n in notes):
             return empty(notes, rejected)
+        policy = overlay.policy(ticker, as_of.date())
         expiry, expiry_why = choose_expiry(
             option_chain,
             as_of,
             cfg,
-            policy_profile=registry.policy(ticker, as_of.date()).expiry_policy_profile,
+            policy_profile=None if policy is None else policy.expiry_policy_profile,
         )
         if expiry is None:
             return empty((expiry_why, *notes), rejected)

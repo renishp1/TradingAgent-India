@@ -8,8 +8,9 @@ from dataclasses import dataclass
 from datetime import date, datetime
 
 from grow.clock import IST
+from grow.errors import GrowConfigError
 from grow.history.models import HistoricalExpiryRecord
-from grow.history.universe import MONTHLY_ONLY, WEEKLY_PREFERRED, WEEKLY_THEN_MONTHLY
+from grow.history.universe import CUSTOM_HISTORICAL, MONTHLY_ONLY, WEEKLY_PREFERRED, WEEKLY_THEN_MONTHLY
 
 RESOLVER_VERSION = "expiry.resolver.v1"
 NO_ELIGIBLE_EXPIRY = "NO_ELIGIBLE_EXPIRY"
@@ -59,7 +60,11 @@ def _classes_for(profile: str) -> tuple[str, ...]:
         return ("MONTHLY",)
     if profile == WEEKLY_THEN_MONTHLY:
         return ("WEEKLY", "MONTHLY")
-    return ("WEEKLY",)
+    if profile == WEEKLY_PREFERRED:
+        return ("WEEKLY",)
+    if profile == CUSTOM_HISTORICAL:
+        raise GrowConfigError("CUSTOM_HISTORICAL_UNIMPLEMENTED")
+    raise GrowConfigError(f"UNKNOWN_EXPIRY_PROFILE:{profile}")
 
 
 def resolve_nearest_expiry(

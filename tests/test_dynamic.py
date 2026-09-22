@@ -194,6 +194,138 @@ class QualificationAndFlowTests(unittest.TestCase):
         r2 = resolve_nearest_expiry("NIFTY", as_of, vis, WEEKLY_PREFERRED)
         self.assertEqual(r1.resolution_id, r2.resolution_id)
 
+    def test_new_optidx_is_discoverable_via_policy_overlay(self) -> None:
+        from grow.history.models import HistoricalOptionContract
+        from grow.history.store import CanonicalStore
+        from grow.history.universe import IndexUniverseRegistry, _policy, default_index_policies
+        from tests.test_history import _meta, _session
+
+        store = CanonicalStore(_meta(instrument_scope=("FINNIFTY",)))
+        store.add_session(_session())
+        first = datetime(2026, 9, 21, 9, 15, tzinfo=IST)
+        last = datetime(2026, 9, 29, 15, 30, tzinfo=IST)
+        store.add_contract(
+            HistoricalOptionContract(
+                underlying="FINNIFTY",
+                expiry=date(2026, 9, 29),
+                strike=25000,
+                option_type="CE",
+                contract_id="FINNIFTY-25000-CE",
+                provider_contract_id="FINNIFTY-25000-CE",
+                lot_size=40,
+                expiry_class="WEEKLY",
+                first_seen_at=first,
+                last_seen_at=last,
+                listing_status="ACTIVE",
+                source_id="t",
+                dataset_version="v1",
+            )
+        )
+        as_of = _ts(date(2026, 9, 21))
+        unauthorized = {r.canonical_symbol: r for r in discover_underlyings(store, as_of)}
+        self.assertEqual(unauthorized["FINNIFTY"].status, "UNAUTHORIZED")
+        overlay = IndexUniverseRegistry(
+            default_index_policies()
+            + (_policy("FINNIFTY", name="Nifty Financial", profile=WEEKLY_PREFERRED, active_from=date(2021, 1, 1)),)
+        )
+        approved = {r.canonical_symbol: r for r in discover_underlyings(store, as_of, overlay)}
+        self.assertEqual(approved["FINNIFTY"].status, "ELIGIBLE")
+        self.assertEqual(approved["FINNIFTY"].expiry_policy_profile, WEEKLY_PREFERRED)
+
+    def test_custom_historical_and_unknown_profiles_fail_closed(self) -> None:
+        store = build_2i_store()
+        as_of = _ts(date(2026, 9, 14))
+        vis = universe_at(store, "NIFTY", as_of)
+        with self.assertRaises(GrowConfigError) as ctx:
+            resolve_nearest_expiry("NIFTY", as_of, vis, "CUSTOM_HISTORICAL")
+        self.assertIn("CUSTOM_HISTORICAL_UNIMPLEMENTED", str(ctx.exception))
+        with self.assertRaises(GrowConfigError) as ctx:
+            resolve_nearest_expiry("NIFTY", as_of, vis, "SILENT_WEEKLY")
+        self.assertIn("UNKNOWN_EXPIRY_PROFILE", str(ctx.exception))
+        from grow.history.bridge import HistoricalMarketSource, HistoricalOptionSource
+
+        snap = HistoricalMarketSource(store).snapshot("NIFTY", as_of)
+        chain = HistoricalOptionSource(store).snapshot("NIFTY", as_of, spot=snap.last_price)
+        none, why = choose_expiry(chain, as_of, load_config().options, policy_profile="CUSTOM_HISTORICAL")
+        self.assertIsNone(none)
+        self.assertEqual(why, "CUSTOM_HISTORICAL_UNIMPLEMENTED")
+        none, why = choose_expiry(chain, as_of, load_config().options, policy_profile="NOT_A_PROFILE")
+        self.assertEqual(why, "UNKNOWN_EXPIRY_PROFILE:NOT_A_PROFILE")
+
+    def test_historical_provider_mode_and_live_blocked(self) -> None:
+        cfg = replace(load_config(), options=replace(load_config().options, provider="historical"))
+        cfg.assert_safe()
+        engine = IndexOptionsEngine(cfg)
+        self.assertEqual(engine.config.options.provider, "historical")
+        live = replace(cfg, options=replace(cfg.options, provider="live"))
+        with self.assertRaises(GrowConfigError):
+            live.assert_safe()
+        with self.assertRaises(GrowConfigError):
+            IndexOptionsEngine(live)
+        store = build_2i_store()
+        store.meta = replace(store.meta, is_fixture=False)
+        flow = DynamicCandidateOrchestrator(store)
+        self.assertEqual(flow.engine.config.options.provider, "historical")
+        as_of = _ts(date(2026, 9, 14))
+        result = flow.evaluate(as_of, {"NIFTY": _signal("NIFTY", "BULLISH", as_of)})
+        self.assertTrue(any(row.underlying == "NIFTY" for row in result.contexts))
+
+    def test_expiry_resolution_mismatch_rewrites_no_trade(self) -> None:
+        from grow.history.candidate_flow import EXPIRY_RESOLUTION_MISMATCH, bind_resolution
+        from grow.history.resolver import ExpiryResolution
+        from grow.options.fixture import FixtureOptionChain
+        from tests.test_options_engine import _signal as opt_signal, _snapshot
+
+        as_of = datetime(2026, 9, 21, 11, 0, tzinfo=IST)
+        snap = _snapshot("NIFTY", as_of, 25000.0)
+        chain = FixtureOptionChain().snapshot("NIFTY", as_of, spot=25000.0)
+        signal = replace(opt_signal("NIFTY", "BULLISH", as_of, snap.snapshot_id), as_of=snap.as_of)
+        decision = IndexOptionsEngine(load_config()).evaluate(signal, snap, chain)
+        self.assertIsNotNone(decision.candidate)
+        wrong = ExpiryResolution(
+            resolution_id="x",
+            underlying="NIFTY",
+            as_of=as_of.isoformat(),
+            discovered_expiries=(),
+            excluded_expiries=(),
+            policy_profile=WEEKLY_PREFERRED,
+            selected_expiry="1999-01-01",
+            selected_expiry_class="WEEKLY",
+            exclusion_reasons=(),
+            dataset_id="",
+            dataset_version="",
+            dataset_fingerprint="",
+        )
+        bound = bind_resolution(decision, wrong)
+        self.assertIsNone(bound.candidate)
+        self.assertEqual(bound.status.value, "NO_TRADE")
+        self.assertIn(EXPIRY_RESOLUTION_MISMATCH, bound.diagnostics)
+        ok = bind_resolution(decision, replace(wrong, selected_expiry=decision.candidate.expiry.isoformat()))
+        self.assertIsNotNone(ok.candidate)
+
+    def test_candidateset_research_handoff_is_immutable(self) -> None:
+        store = build_2i_store()
+        as_of = _ts(date(2026, 9, 14))
+        result = DynamicCandidateOrchestrator(store).evaluate(
+            as_of, {"NIFTY": _signal("NIFTY", "BULLISH", as_of)}
+        )
+        payload = result.to_research_input()
+        self.assertEqual(payload["schema"], "research.candidateset.v1")
+        with self.assertRaises(TypeError):
+            payload["schema"] = "hacked"  # type: ignore[index]
+        none = result.pick(None)
+        self.assertEqual(none["verdict"], "NO_TRADE")
+        unknown = result.pick("not-a-candidate")
+        self.assertEqual(unknown["reason"], "UNKNOWN_CANDIDATE")
+        if result.candidates():
+            cid = result.candidates()[0].decision.candidate.candidate_id
+            picked = result.pick(cid)
+            self.assertEqual(picked["verdict"], "TRADE_APPROVE")
+            self.assertEqual(picked["candidate"]["candidate_id"], cid)
+            with self.assertRaises(TypeError):
+                picked["candidate"] = {}  # type: ignore[index]
+
 
 if __name__ == "__main__":
     unittest.main()
+

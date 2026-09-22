@@ -316,8 +316,10 @@ class GrowConfig:
             raise GrowConfigError("2B supported_timeframes must be M5, M15, D1.")
         if self.data.allow_options_chain or self.options.allow_live_chain:
             raise GrowConfigError("Live option chains are not attached.")
-        if self.options.provider != "fixture":
-            raise GrowConfigError("2C options.provider must be 'fixture'.")
+        if self.options.provider not in {"fixture", "historical"}:
+            raise GrowConfigError("2C options.provider must be 'fixture' or 'historical'.")
+        if self.options.provider == "live":
+            raise GrowConfigError("Live option chains are not attached.")
         if self.options.preferred_expiry_class != "weekly":
             raise GrowConfigError("2C preferred_expiry_class is weekly.")
         if self.options.allow_same_day:

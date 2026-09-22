@@ -55,10 +55,14 @@ def choose_expiry(
     )
     if profile == "MONTHLY_ONLY":
         order = (ExpiryClass.MONTHLY,)
+    elif profile == "WEEKLY_PREFERRED":
+        order = (ExpiryClass.WEEKLY,)
     elif profile == "WEEKLY_THEN_MONTHLY":
         order = (ExpiryClass.WEEKLY, ExpiryClass.MONTHLY)
+    elif profile == "CUSTOM_HISTORICAL":
+        return None, "CUSTOM_HISTORICAL_UNIMPLEMENTED"
     else:
-        order = (ExpiryClass.WEEKLY,)
+        return None, f"UNKNOWN_EXPIRY_PROFILE:{profile}"
     for preferred in order:
         eligible: list[OptionExpiry] = []
         for expiry in chain.expiries:

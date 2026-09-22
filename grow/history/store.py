@@ -32,7 +32,7 @@ from grow.history.models import (
     HistoricalSession,
 )
 from grow.history.quality import validate_bar, validate_contract, validate_quote, validate_session
-from grow.history.universe import is_supported_index
+from grow.history.universe import is_forbidden_instrument
 
 
 class CanonicalStore:
@@ -199,7 +199,7 @@ class CanonicalStore:
         )
 
     def bars_at(self, symbol: str, as_of: datetime, timeframe: str | None = None) -> tuple[HistoricalBar, ...]:
-        if not is_supported_index(symbol, as_of.date()):
+        if is_forbidden_instrument(symbol):
             raise GrowConfigError(f"UNSUPPORTED_UNDERLYING:{symbol}")
         out = []
         for bar in self._bars.values():
@@ -212,7 +212,7 @@ class CanonicalStore:
         return tuple(sorted(out, key=lambda b: (b.timeframe, b.timestamp)))
 
     def snapshot_quotes(self, underlying: str, as_of: datetime) -> tuple[HistoricalOptionContract, tuple[HistoricalOptionQuote, ...]]:
-        if not is_supported_index(underlying, as_of.date()):
+        if is_forbidden_instrument(underlying):
             raise GrowConfigError(f"UNSUPPORTED_UNDERLYING:{underlying}")
         live = [
             c
@@ -234,7 +234,7 @@ class CanonicalStore:
         return tuple(live), tuple(quotes)
 
     def contracts_at(self, underlying: str, as_of: datetime) -> tuple[HistoricalOptionContract, ...]:
-        if not is_supported_index(underlying, as_of.date()):
+        if is_forbidden_instrument(underlying):
             raise GrowConfigError(f"UNSUPPORTED_UNDERLYING:{underlying}")
         return tuple(
             c

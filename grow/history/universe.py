@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 
 from grow.clock import IST
+from grow.errors import GrowConfigError
 
 WEEKLY_PREFERRED = "WEEKLY_PREFERRED"
 MONTHLY_ONLY = "MONTHLY_ONLY"
@@ -20,6 +21,22 @@ KNOWN_EXPIRY_PROFILES = frozenset(
 )
 OPTIDX = "OPTIDX"
 REGISTRY_VERSION = "index.universe.v1"
+FORBIDDEN_UNDERLYINGS = frozenset(
+    {
+        "RELIANCE",
+        "TCS",
+        "HDFCBANK",
+        "INFY",
+        "ICICIBANK",
+        "SBIN",
+        "BHARTIARTL",
+        "ITC",
+        "LT",
+        "HINDUNILVR",
+        "FUT",
+        "FUTURES",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -108,9 +125,9 @@ class IndexUniverseRegistry:
         by_id: dict[str, IndexPolicy] = {}
         for policy in rows:
             if policy.instrument_type != OPTIDX:
-                continue
+                raise GrowConfigError(f"UNSUPPORTED_INSTRUMENT_TYPE:{policy.instrument_type}")
             if policy.expiry_policy_profile not in KNOWN_EXPIRY_PROFILES:
-                continue
+                raise GrowConfigError(f"UNKNOWN_EXPIRY_PROFILE:{policy.expiry_policy_profile}")
             by_id[policy.canonical_symbol] = policy
         self._policies = by_id
         self.version = REGISTRY_VERSION
@@ -144,12 +161,23 @@ def default_index_registry() -> IndexUniverseRegistry:
     return _DEFAULT
 
 
+def is_forbidden_instrument(symbol: str) -> bool:
+    name = symbol.upper()
+    if name in FORBIDDEN_UNDERLYINGS:
+        return True
+    if name.startswith("FUT") or name.endswith("FUT"):
+        return True
+    return False
+
+
 def is_supported_index(symbol: str, day: date | None = None) -> bool:
+    if is_forbidden_instrument(symbol):
+        return False
     return default_index_registry().allows(symbol, day)
 
 
 def discover_underlyings(store, as_of: datetime, registry: IndexUniverseRegistry | None = None) -> tuple[EligibleUnderlying, ...]:
-    """Historically listed OPTIDX names at as_of. Never invents a symbol."""
+    """Contracts are the listed universe. Registry is the approval overlay."""
     reg = registry or default_index_registry()
     moment = as_of.astimezone(IST)
     day = moment.date()
@@ -158,29 +186,43 @@ def discover_underlyings(store, as_of: datetime, registry: IndexUniverseRegistry
         if contract.first_seen_at <= moment <= contract.last_seen_at:
             listed.add(contract.underlying)
     rows: list[EligibleUnderlying] = []
+    seen: set[str] = set()
+    for symbol in sorted(listed):
+        if is_forbidden_instrument(symbol):
+            rows.append(
+                EligibleUnderlying(symbol, symbol, "", "UNAUTHORIZED", "FORBIDDEN_INSTRUMENT")
+            )
+            continue
+        pol = reg.policy(symbol, day)
+        if pol is None or not pol.option_supported:
+            rows.append(
+                EligibleUnderlying(symbol, symbol, "", "UNAUTHORIZED", "NOT_APPROVED")
+            )
+            continue
+        rows.append(
+            EligibleUnderlying(
+                index_id=pol.index_id,
+                canonical_symbol=pol.canonical_symbol,
+                expiry_policy_profile=pol.expiry_policy_profile,
+                status="ELIGIBLE",
+                reason="LISTED",
+            )
+        )
+        seen.add(symbol)
     for policy in sorted(reg.all_policies(), key=lambda p: p.canonical_symbol):
+        if policy.canonical_symbol in seen:
+            continue
         if not policy.active_on(day) or not policy.option_supported:
             continue
-        if policy.canonical_symbol in listed:
-            rows.append(
-                EligibleUnderlying(
-                    index_id=policy.index_id,
-                    canonical_symbol=policy.canonical_symbol,
-                    expiry_policy_profile=policy.expiry_policy_profile,
-                    status="ELIGIBLE",
-                    reason="LISTED",
-                )
+        rows.append(
+            EligibleUnderlying(
+                index_id=policy.index_id,
+                canonical_symbol=policy.canonical_symbol,
+                expiry_policy_profile=policy.expiry_policy_profile,
+                status="DATA_UNAVAILABLE",
+                reason="DATA_UNAVAILABLE",
             )
-        else:
-            rows.append(
-                EligibleUnderlying(
-                    index_id=policy.index_id,
-                    canonical_symbol=policy.canonical_symbol,
-                    expiry_policy_profile=policy.expiry_policy_profile,
-                    status="DATA_UNAVAILABLE",
-                    reason="DATA_UNAVAILABLE",
-                )
-            )
+        )
     return tuple(rows)
 
 

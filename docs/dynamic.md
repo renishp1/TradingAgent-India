@@ -39,8 +39,12 @@ NIFTY and BANKNIFTY stay weekly-preferred defaults. MIDCPNIFTY is registered
 as `MONTHLY_ONLY` for this sample period. RELIANCE/TCS/stock options and
 futures are rejected.
 
-Discovery at `as_of` uses contracts actually listed in the dataset. An
-index in the registry but absent from the contract master is
+Discovery at `as_of` uses contracts actually listed in the dataset. The
+`IndexUniverseRegistry` is a versioned **policy/approval overlay**, not the
+source of which symbols exist. A new OPTIDX name can appear in a provider
+sample and become eligible by adding a registry policy — without changing
+the provider adapter. Unapproved or stock/futures names stay rejected.
+An index in the registry but absent from the contract master is
 `DATA_UNAVAILABLE`, not invented.
 
 ## Expiry policy profiles
