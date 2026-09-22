@@ -44,6 +44,13 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.backtest.fill_model, "ask_plus_slippage")
         self.assertEqual(config.backtest.lot_size, 1)
         self.assertFalse(config.backtest.calibrate_on_test)
+        self.assertEqual(config.research_director.provider, "fixture")
+        self.assertTrue(config.research_director.blind_until_frozen)
+        self.assertFalse(config.research_director.allow_broker)
+        self.assertFalse(config.research_director.allow_live_trading)
+        self.assertFalse(config.research_director.allow_paper_execution)
+        self.assertFalse(config.research_director.allow_ledger_write)
+        self.assertFalse(config.research_director.allow_risk_config_write)
 
 
     def test_live_yaml_value_cannot_pass_through_env_truth(self) -> None:

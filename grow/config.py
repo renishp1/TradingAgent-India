@@ -246,6 +246,27 @@ class BacktestConfig:
 
 
 @dataclass(frozen=True)
+class ResearchDirectorConfig:
+    enabled: bool
+    provider: str
+    deterministic_mode: bool
+    allow_plan_creation: bool
+    allow_plan_freeze: bool
+    allow_result_review: bool
+    blind_until_frozen: bool
+    allow_broker: bool
+    allow_live_trading: bool
+    allow_paper_execution: bool
+    allow_ledger_write: bool
+    allow_risk_config_write: bool
+    require_approved_dataset: bool
+    require_versioned_config: bool
+    require_acceptance_rules: bool
+    require_test_freeze: bool
+    reject_test_window_tuning: bool
+
+
+@dataclass(frozen=True)
 class GrowConfig:
     version: str
     timezone: str
@@ -260,6 +281,7 @@ class GrowConfig:
     options: OptionsConfig
     ai: AIConfig
     backtest: BacktestConfig
+    research_director: ResearchDirectorConfig
     source_path: str
 
     def assert_safe(self) -> None:
@@ -318,6 +340,23 @@ class GrowConfig:
             raise GrowConfigError("2E quantity (lots) must be >= 1")
         if self.backtest.lot_size < 1:
             raise GrowConfigError("2E lot_size (contract multiplier) must be >= 1")
+        if self.research_director.provider != "fixture":
+            raise GrowConfigError("2F research_director.provider must be 'fixture'.")
+        if (
+            self.research_director.allow_broker
+            or self.research_director.allow_live_trading
+            or self.research_director.allow_paper_execution
+            or self.research_director.allow_ledger_write
+            or self.research_director.allow_risk_config_write
+        ):
+            raise GrowConfigError("2F director may not enable broker, live, paper, ledger, or Risk Guard writes.")
+        if not self.research_director.blind_until_frozen:
+            raise GrowConfigError("2F test_visibility.blind_until_frozen must be true.")
+        if not self.research_director.reject_test_window_tuning:
+            raise GrowConfigError("2F must reject test-window tuning.")
+        if not self.research_director.require_approved_dataset:
+            raise GrowConfigError("2F require_approved_dataset must be true.")
+
 
 
 
@@ -462,6 +501,32 @@ def _backtest_config(raw: dict[str, Any]) -> BacktestConfig:
     )
 
 
+def _director_config(raw: dict[str, Any], gov: dict[str, Any]) -> ResearchDirectorConfig:
+    if not isinstance(raw, dict):
+        raise GrowConfigError("grow.research_director must be a mapping")
+    vis = raw.get("test_visibility") or {}
+    perms = raw.get("permissions") or {}
+    return ResearchDirectorConfig(
+        enabled=_as_bool(raw.get("enabled", True), "research_director.enabled"),
+        provider=str(raw.get("provider", "fixture")).lower(),
+        deterministic_mode=_as_bool(raw.get("deterministic_mode", True), "research_director.deterministic_mode"),
+        allow_plan_creation=_as_bool(raw.get("allow_plan_creation", True), "research_director.allow_plan_creation"),
+        allow_plan_freeze=_as_bool(raw.get("allow_plan_freeze", True), "research_director.allow_plan_freeze"),
+        allow_result_review=_as_bool(raw.get("allow_result_review", True), "research_director.allow_result_review"),
+        blind_until_frozen=_as_bool(vis.get("blind_until_frozen", True), "research_director.test_visibility.blind_until_frozen"),
+        allow_broker=_as_bool(perms.get("broker", False), "research_director.permissions.broker"),
+        allow_live_trading=_as_bool(perms.get("live_trading", False), "research_director.permissions.live_trading"),
+        allow_paper_execution=_as_bool(perms.get("paper_execution", False), "research_director.permissions.paper_execution"),
+        allow_ledger_write=_as_bool(perms.get("ledger_write", False), "research_director.permissions.ledger_write"),
+        allow_risk_config_write=_as_bool(perms.get("risk_config_write", False), "research_director.permissions.risk_config_write"),
+        require_approved_dataset=_as_bool(gov.get("require_approved_dataset", True), "research_governance.require_approved_dataset"),
+        require_versioned_config=_as_bool(gov.get("require_versioned_config", True), "research_governance.require_versioned_config"),
+        require_acceptance_rules=_as_bool(gov.get("require_acceptance_rules", True), "research_governance.require_acceptance_rules"),
+        require_test_freeze=_as_bool(gov.get("require_test_freeze", True), "research_governance.require_test_freeze"),
+        reject_test_window_tuning=_as_bool(gov.get("reject_test_window_tuning", True), "research_governance.reject_test_window_tuning"),
+    )
+
+
 def _overlay_env(raw: dict[str, Any], environ: dict[str, str]) -> dict[str, Any]:
     grow = raw.setdefault("grow", {})
     execution = grow.setdefault("execution", {})
@@ -585,6 +650,7 @@ def _build(raw: dict[str, Any], source_path: str) -> GrowConfig:
         options=_options_config(g.get("options") or {}),
         ai=_ai_config(g.get("ai") or {}),
         backtest=_backtest_config(g.get("backtest") or {}),
+        research_director=_director_config(g.get("research_director") or {}, g.get("research_governance") or {}),
         source_path=source_path,
     )
     config.assert_safe()

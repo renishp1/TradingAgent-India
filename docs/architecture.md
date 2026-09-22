@@ -172,6 +172,16 @@ No broker. No PaperLedger. No Risk Guard mutation. No live trading.
 See [`backtest.md`](backtest.md). Fixture framework only — not a profitability claim.
 Real historical PIT datasets are required before performance conclusions.
 
+## Research director (Milestone 2F)
+
+```
+Catalog → ResearchPlan → freeze → 2E coordinator → review
+HOLD | REJECT | (ACCEPT_FOR_PAPER not issued on fixture)
+======== STOP 2F ========
+```
+
+Governance only. See [`director.md`](director.md).
+
 ## Modules
 
 | Path | Status | Responsibility |
@@ -183,6 +193,7 @@ Real historical PIT datasets are required before performance conclusions.
 | `grow/ceo/` | **implemented** | M1 cash TradeProposal; placeholder SL/TP |
 | `grow/research/` | **2D engine** | Fixture agents; TRADE_APPROVE or NO_TRADE |
 | `grow/backtest/` | **2E fixture framework** | Replay + costs + walk-forward. Not a profit study |
+| `grow/director/` | **2F research director** | Plan/freeze/review. Not execution |
 | `grow/market/` | **implemented (stub quotes)** | Brief + NSE session/square-off clock |
 | `grow/risk/` | **implemented** | Deterministic guard + HMAC stamp (secret required) |
 | `grow/paper/` | **implemented** | In-memory long-only ledger |

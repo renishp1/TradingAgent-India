@@ -170,3 +170,26 @@ grow:
       step_sessions: 2
       embargo_sessions: 1
       calibrate_on_test: false
+
+  research_director:
+    enabled: true
+    provider: fixture
+    deterministic_mode: true
+    allow_plan_creation: true
+    allow_plan_freeze: true
+    allow_result_review: true
+    test_visibility:
+      blind_until_frozen: true
+    permissions:
+      broker: false
+      live_trading: false
+      paper_execution: false
+      ledger_write: false
+      risk_config_write: false
+
+  research_governance:
+    require_approved_dataset: true
+    require_versioned_config: true
+    require_acceptance_rules: true
+    require_test_freeze: true
+    reject_test_window_tuning: true
