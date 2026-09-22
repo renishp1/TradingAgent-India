@@ -13,6 +13,7 @@ from grow.decision.contracts.agent_result import AgentResult, AgentStatus, Candi
 from grow.decision.integration.contract import AgentOutputRef, StrategyCandidate, plain_data
 from grow.market_data.normalized.models import AgentMarketSnapshot, DataQualityStatus
 from grow.market_data.snapshots.builder import gate_snapshot_quality
+from grow.market_data.provenance import MIXED_MARKET_DATA_SOURCE, reject_mixed_market_data
 from grow.orchestration.models import AggregateAnalysisPackage
 from grow.orchestration.validator import validate_agent_output
 
@@ -60,6 +61,24 @@ def evaluate_policy(
     package: AggregateAnalysisPackage,
 ) -> PolicyResult:
     gates: list[tuple[str, bool, str]] = []
+    mixed = reject_mixed_market_data(snapshot)
+    if mixed:
+        gates.append(("market_data_source", False, mixed))
+        return _closed(
+            terminal="BLOCKED",
+            reasons=(mixed,),
+            gates=tuple(gates),
+            quality=snapshot.data_quality.value,
+            package=package,
+            observations=tuple(snapshot.quality_notes),
+        )
+    gates.append(
+        (
+            "market_data_source",
+            True,
+            getattr(snapshot.market_data_source, "value", str(snapshot.market_data_source)),
+        )
+    )
     quality = gate_snapshot_quality(snapshot)
     gates.append(("data_quality", quality is DataQualityStatus.OK, quality.value))
     if quality is not DataQualityStatus.OK:
@@ -69,6 +88,8 @@ def evaluate_policy(
             DataQualityStatus.REJECTED: "DATA_REJECTED",
             DataQualityStatus.DEGRADED: "DATA_DEGRADED",
         }.get(quality, "DATA_UNUSABLE")
+        if MIXED_MARKET_DATA_SOURCE in snapshot.quality_notes:
+            code = MIXED_MARKET_DATA_SOURCE
         terminal = "BLOCKED" if quality is DataQualityStatus.REJECTED else "NO_TRADE"
         return _closed(
             terminal=terminal,

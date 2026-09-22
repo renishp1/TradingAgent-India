@@ -7,6 +7,7 @@ from typing import Any
 from grow.clock import IST
 from grow.live_data.models import SCHEMA, LiveSnapshot
 from grow.market_data.normalized.models import AgentMarketSnapshot, DataQualityStatus, OptionQuoteView
+from grow.market_data.provenance import MarketDataSource, classify_agent_snapshot
 from grow.options.models import ExpiryClass, OptionChainSnapshot, OptionContract, OptionExpiry, OptionType
 
 
@@ -41,10 +42,15 @@ def quote_known_at(quote: OptionQuoteView, as_of) -> bool:
 
 def source_is_fixture(snapshot: AgentMarketSnapshot) -> bool:
     """Paper execution is simulated; fixture vs live is about the market-data source."""
+    source = classify_agent_snapshot(snapshot)
+    if source is MarketDataSource.MIXED:
+        return False
+    if source is MarketDataSource.FIXTURE:
+        return True
     if snapshot.is_fixture:
         return True
     diagnostics = dict(snapshot.diagnostics or {})
-    if diagnostics.get("fixture") is True:
+    if diagnostics.get("fixture") is True and diagnostics.get("market_data_source") != MarketDataSource.MIXED.value:
         return True
     if diagnostics.get("fixture") is False:
         return False
@@ -55,12 +61,14 @@ def source_is_fixture(snapshot: AgentMarketSnapshot) -> bool:
 def live_snapshot_from_agent(snapshot: AgentMarketSnapshot, *, sequence: int) -> LiveSnapshot:
     """Quotes later than the snapshot decision time are omitted. Nothing is fabricated."""
     as_of = snapshot.decision_timestamp.astimezone(IST)
-    is_fixture = source_is_fixture(snapshot)
+    source = classify_agent_snapshot(snapshot)
+    is_fixture = source is MarketDataSource.FIXTURE
     diagnostics = dict(snapshot.diagnostics or {})
     adapter_version = str(diagnostics.get("adapter_version") or snapshot.provider or "paper.execution.v1")
     grouped: dict[str, list[OptionContract]] = {}
     expiries: dict[str, list[OptionExpiry]] = {}
     lot_sizes: dict[str, int] = {}
+    quote_fixture_flags: dict[str, dict[str, bool]] = {}
     for quote in snapshot.option_contracts:
         if quote.quality is not DataQualityStatus.OK or not quote_known_at(quote, as_of):
             continue
@@ -93,6 +101,7 @@ def live_snapshot_from_agent(snapshot: AgentMarketSnapshot, *, sequence: int) ->
         if quote.lot_size is not None and quote.lot_size >= 1:
             lot_sizes[quote.provider_contract_id] = int(quote.lot_size)
             lot_sizes[contract_id(quote)] = int(quote.lot_size)
+        quote_fixture_flags.setdefault(quote.underlying, {})[quote.provider_contract_id] = bool(quote.is_fixture)
     chains = {
         underlying: OptionChainSnapshot(
             snapshot_id=snapshot.snapshot_id,
@@ -103,7 +112,10 @@ def live_snapshot_from_agent(snapshot: AgentMarketSnapshot, *, sequence: int) ->
             contracts=tuple(contracts),
             source_id=snapshot.provider,
             is_fixture=is_fixture,
-            provider_metadata=_provider_metadata(snapshot, is_fixture=is_fixture),
+            provider_metadata={
+                **_provider_metadata(snapshot, is_fixture=is_fixture),
+                "quote_fixture_flags": dict(quote_fixture_flags.get(underlying, {})),
+            },
         )
         for underlying, contracts in grouped.items()
     }
@@ -126,12 +138,15 @@ def live_snapshot_from_agent(snapshot: AgentMarketSnapshot, *, sequence: int) ->
 
 
 def _provider_metadata(snapshot: AgentMarketSnapshot, *, is_fixture: bool) -> dict[str, Any]:
+    source = getattr(snapshot, "market_data_source", None)
+    source_value = getattr(source, "value", None) or ("FIXTURE" if is_fixture else "LIVE")
     return {
         "paper_execution": True,
         "live_trading": False,
         "broker_order_path": False,
         "source_snapshot_id": snapshot.snapshot_id,
         "is_fixture": is_fixture,
+        "market_data_source": source_value,
         "provider": snapshot.provider,
         "quote_timestamp": snapshot.decision_timestamp.astimezone(IST).isoformat(),
         "source_snapshot_ids": dict(snapshot.source_snapshot_ids),
