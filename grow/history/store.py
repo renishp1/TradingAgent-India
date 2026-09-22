@@ -17,7 +17,7 @@ from grow.history.models import (
     FRAMEWORK_TEST_ONLY,
     KNOWN_MAPPING_POLICIES,
     KNOWN_QUALITY_WARNINGS,
-    MAPPING_EXACT,
+    QUALIFICATION_STATES,
     MISSING_IV,
     MISSING_OI,
     MISSING_SESSIONS,
@@ -45,6 +45,8 @@ class CanonicalStore:
         unknown = [wid for wid in meta.quality_warnings if wid not in KNOWN_QUALITY_WARNINGS]
         if unknown:
             raise GrowConfigError(";".join(f"UNKNOWN_WARNING_ID:{wid}" for wid in unknown))
+        if meta.qualification_status not in QUALIFICATION_STATES:
+            raise GrowConfigError(f"UNKNOWN_QUALIFICATION:{meta.qualification_status}")
         self._sessions: dict[date, HistoricalSession] = {}
         self._bars: dict[tuple[str, str, datetime], HistoricalBar] = {}
         self._contracts: dict[str, HistoricalOptionContract] = {}
@@ -91,6 +93,24 @@ class CanonicalStore:
         if quote.dataset_version != self.meta.version:
             raise GrowConfigError("DATASET_VERSION")
         self._quotes.append(quote)
+
+    def dump(self) -> dict:
+        report = self.coverage()
+        meta = self.meta
+        return {
+            "meta": {k: v for k, v in meta.to_dict().items() if k != "fingerprint"},
+            "sessions": [self._sessions[d].to_dict() for d in sorted(self._sessions)],
+            "bars": [
+                self._bars[k].to_dict()
+                for k in sorted(self._bars, key=lambda key: (key[0], key[1], key[2].isoformat()))
+            ],
+            "contracts": [self._contracts[k].to_dict() for k in sorted(self._contracts)],
+            "quotes": [
+                q.to_dict()
+                for q in sorted(self._quotes, key=lambda item: (item.contract_id, item.timestamp.isoformat()))
+            ],
+            "coverage": report.to_dict(),
+        }
 
     def publish(self) -> DatasetVersion:
         self._guard()
@@ -212,6 +232,24 @@ class CanonicalStore:
             if eligible:
                 quotes.append(max(eligible, key=lambda item: item.timestamp))
         return tuple(live), tuple(quotes)
+
+    def contracts_at(self, underlying: str, as_of: datetime) -> tuple[HistoricalOptionContract, ...]:
+        if underlying not in ALLOWED_UNDERLYINGS:
+            raise GrowConfigError(f"UNSUPPORTED_UNDERLYING:{underlying}")
+        return tuple(
+            c
+            for c in self._contracts.values()
+            if c.underlying == underlying and c.first_seen_at <= as_of <= c.last_seen_at
+        )
+
+    def all_contracts(self) -> tuple[HistoricalOptionContract, ...]:
+        return tuple(self._contracts.values())
+
+    def all_quotes(self) -> tuple[HistoricalOptionQuote, ...]:
+        return tuple(self._quotes)
+
+    def all_bars(self) -> tuple[HistoricalBar, ...]:
+        return tuple(self._bars.values())
 
     def session_on(self, day: date) -> HistoricalSession | None:
         return self._sessions.get(day)

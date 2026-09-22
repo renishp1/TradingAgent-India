@@ -46,6 +46,8 @@ class ResearchPlanValidator:
             if source.licensing_status != APPROVED:
                 issues.append(f"DATASET_NOT_APPROVED:{plan.dataset_id}")
             if source.usage_scope == "HISTORICAL_RESEARCH":
+                if source.qualification_status not in {"QUALIFIED", "QUALIFIED_WITH_WARNINGS", "APPROVED_FOR_2E"}:
+                    issues.append(f"DATASET_NOT_QUALIFIED:{source.qualification_status or 'MISSING'}")
                 if source.quality_status == APPROVED_WITH_WARNINGS:
                     if not source.quality_warnings:
                         issues.append("WARNINGS_NOT_ACKNOWLEDGED")

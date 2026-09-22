@@ -85,6 +85,7 @@ class DatasetRegistry:
                     "quality_warnings": list(meta.quality_warnings),
                     "mapping_policy": meta.mapping_policy,
                     "slot_tolerance_seconds": meta.slot_tolerance_seconds,
+                    "qualification_status": meta.qualification_status,
                 }
             )
         return tuple(rows)

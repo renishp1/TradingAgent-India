@@ -653,6 +653,7 @@ class HistoryHardeningTests(unittest.TestCase):
             usage_scope="HISTORICAL_RESEARCH",
             is_fixture=False,
             quality_warnings=warnings,
+            qualification_status="QUALIFIED",
         )
         clean = replace(src, quality_status="APPROVED", dataset_id="hist.ok", quality_warnings=())
         cat = {src.dataset_id: src, clean.dataset_id: clean}

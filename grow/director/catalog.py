@@ -39,6 +39,7 @@ class ApprovedDataSource:
     usage_scope: str
     is_fixture: bool
     quality_warnings: tuple[str, ...] = ()
+    qualification_status: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -63,6 +64,7 @@ class ApprovedDataSource:
             "usage_scope": self.usage_scope,
             "is_fixture": self.is_fixture,
             "quality_warnings": list(self.quality_warnings),
+            "qualification_status": self.qualification_status,
         }
 
 
@@ -141,6 +143,7 @@ def default_catalog() -> dict[str, ApprovedDataSource]:
             usage_scope=row.get("usage_scope", "FRAMEWORK_TEST_ONLY"),
             is_fixture=bool(row.get("is_fixture", True)),
             quality_warnings=tuple(row.get("quality_warnings") or ()),
+            qualification_status=str(row.get("qualification_status") or ""),
         )
     return cat
 
@@ -197,3 +200,15 @@ def require_historical_research(
             raise GrowConfigError(";".join(issues))
         return source
     raise GrowConfigError(f"DATASET_FRAMEWORK_ONLY:{dataset_id}")
+
+
+def require_approved_for_2e(
+    catalog: Mapping[str, ApprovedDataSource],
+    dataset_id: str,
+    *,
+    accepted_warnings: tuple[str, ...] = (),
+) -> ApprovedDataSource:
+    source = require_historical_research(catalog, dataset_id, accepted_warnings=accepted_warnings)
+    if source.qualification_status != "APPROVED_FOR_2E":
+        raise GrowConfigError(f"NOT_APPROVED_FOR_2E:{dataset_id}")
+    return source

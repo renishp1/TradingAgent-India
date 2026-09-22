@@ -49,6 +49,10 @@ def build_manifest(
     calendar_version: str | None = None,
     dataset_id: str | None = None,
     dataset_version: str | None = None,
+    mapping_policy: str | None = None,
+    slot_tolerance_seconds: int | None = None,
+    dataset_fingerprint: str | None = None,
+    provider_name: str | None = None,
 ) -> BacktestRunManifest:
     bt = config.backtest
     required = {
@@ -70,8 +74,16 @@ def build_manifest(
         "strictness_mode": "strict" if bt.strict else "relaxed",
         "fill_model": bt.fill_model,
         "ablation": ablation,
+        "mapping_policy": mapping_policy or "EXACT",
+        "slot_tolerance_seconds": 0 if slot_tolerance_seconds is None else slot_tolerance_seconds,
+        "dataset_fingerprint": dataset_fingerprint or "",
+        "provider_name": provider_name or "fixture",
     }
-    missing = [key for key, value in required.items() if value in {None, ""}]
+    missing = [
+        key
+        for key, value in required.items()
+        if value in {None, ""} and key not in {"dataset_fingerprint"}
+    ]
     if missing:
         raise GrowConfigError(f"incomplete backtest manifest: {missing}")
     fp = fingerprint_for(required)

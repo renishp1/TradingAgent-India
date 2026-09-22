@@ -16,6 +16,8 @@ HistoricalMarketSource / HistoricalOptionSource / ExplicitSessionCalendar
 2E BacktestRunner (optional sources)
 ======== STOP 2G ========
 No broker. No live feed. No PaperLedger. No Risk Guard writes.
+
+2H evaluation: [`docs/provider.md`](provider.md).
 ```
 
 ## v1 locks

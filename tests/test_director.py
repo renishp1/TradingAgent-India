@@ -383,6 +383,7 @@ class DirectorWarningAckTests(unittest.TestCase):
             usage_scope="HISTORICAL_RESEARCH",
             is_fixture=False,
             quality_warnings=warnings,
+            qualification_status="QUALIFIED",
         )
         allowed = replace(hist, dataset_id="hist.ok", quality_status="APPROVED", quality_warnings=())
         cat = {**default_catalog(), hist.dataset_id: hist, allowed.dataset_id: allowed}
@@ -430,6 +431,7 @@ class DirectorWarningAckTests(unittest.TestCase):
             usage_scope="HISTORICAL_RESEARCH",
             is_fixture=False,
             quality_warnings=warnings,
+            qualification_status="QUALIFIED",
         )
         d.catalog = {**d.catalog, hist.dataset_id: hist}
         _, empty = _valid_plan(d, dataset_id=hist.dataset_id)

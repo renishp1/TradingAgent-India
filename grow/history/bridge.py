@@ -202,6 +202,9 @@ class HistoricalOptionSource:
         by_id = {c.contract_id: c for c in contracts}
         mapped: list[OptionContract] = []
         expiries: dict[date, OptionExpiry] = {}
+        for raw in contracts:
+            klass = ExpiryClass.WEEKLY if raw.expiry_class == "WEEKLY" else ExpiryClass.MONTHLY
+            expiries[raw.expiry] = OptionExpiry(raw.expiry, klass)
         for quote in quotes:
             raw = by_id[quote.contract_id]
             if raw.expiry < as_of.date():

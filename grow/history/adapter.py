@@ -71,6 +71,7 @@ def load_payload(raw: dict) -> CanonicalStore:
         quality_warnings=tuple(meta_raw.get("quality_warnings") or ()),
         mapping_policy=str(meta_raw.get("mapping_policy") or MAPPING_EXACT),
         slot_tolerance_seconds=int(meta_raw.get("slot_tolerance_seconds") or 0),
+        qualification_status=str(meta_raw.get("qualification_status") or "CANDIDATE"),
     )
     if meta.mapping_policy not in KNOWN_MAPPING_POLICIES:
         raise GrowConfigError(f"UNKNOWN_MAPPING_POLICY:{meta.mapping_policy}")

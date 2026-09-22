@@ -33,7 +33,16 @@ KNOWN_QUALITY_WARNINGS = frozenset(
 
 MAPPING_EXACT = "EXACT"
 MAPPING_NEAREST = "NEAREST_WITHIN_TOLERANCE"
-KNOWN_MAPPING_POLICIES = frozenset({MAPPING_EXACT, MAPPING_NEAREST})
+MAPPING_FORWARD = "FORWARD_ONLY_WITHIN_TOLERANCE"
+KNOWN_MAPPING_POLICIES = frozenset({MAPPING_EXACT, MAPPING_NEAREST, MAPPING_FORWARD})
+
+CANDIDATE = "CANDIDATE"
+QUALIFIED = "QUALIFIED"
+QUALIFIED_WITH_WARNINGS = "QUALIFIED_WITH_WARNINGS"
+APPROVED_FOR_2E = "APPROVED_FOR_2E"
+QUALIFICATION_STATES = frozenset(
+    {CANDIDATE, QUALIFIED, QUALIFIED_WITH_WARNINGS, REJECTED, APPROVED_FOR_2E, RETIRED}
+)
 
 
 @dataclass(frozen=True)
@@ -132,6 +141,30 @@ class HistoricalOptionContract:
 
 
 @dataclass(frozen=True)
+class HistoricalExpiryRecord:
+    underlying: str
+    expiry: date
+    expiry_class: str
+    first_seen_at: datetime
+    last_seen_at: datetime
+    listing_status: str
+    source_id: str
+    dataset_version: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "underlying": self.underlying,
+            "expiry": self.expiry.isoformat(),
+            "expiry_class": self.expiry_class,
+            "first_seen_at": self.first_seen_at.isoformat(),
+            "last_seen_at": self.last_seen_at.isoformat(),
+            "listing_status": self.listing_status,
+            "source_id": self.source_id,
+            "dataset_version": self.dataset_version,
+        }
+
+
+@dataclass(frozen=True)
 class HistoricalOptionQuote:
     contract_id: str
     timestamp: datetime
@@ -210,6 +243,7 @@ class DatasetVersion:
     quality_warnings: tuple[str, ...]
     mapping_policy: str
     slot_tolerance_seconds: int
+    qualification_status: str = "CANDIDATE"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -244,6 +278,7 @@ class DatasetVersion:
             "quality_warnings": list(self.quality_warnings),
             "mapping_policy": self.mapping_policy,
             "slot_tolerance_seconds": self.slot_tolerance_seconds,
+            "qualification_status": self.qualification_status,
             "label": "HISTORICAL DATA / RESEARCH ONLY",
         }
 

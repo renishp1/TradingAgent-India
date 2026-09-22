@@ -46,6 +46,10 @@ class BacktestRunManifest:
     fill_model: str
     ablation: str
     fingerprint: str
+    mapping_policy: str = "EXACT"
+    slot_tolerance_seconds: int = 0
+    dataset_fingerprint: str = ""
+    provider_name: str = "fixture"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -72,6 +76,10 @@ class BacktestRunManifest:
             "fill_model": self.fill_model,
             "ablation": self.ablation,
             "fingerprint": self.fingerprint,
+            "mapping_policy": self.mapping_policy,
+            "slot_tolerance_seconds": self.slot_tolerance_seconds,
+            "dataset_fingerprint": self.dataset_fingerprint,
+            "provider_name": self.provider_name,
             "schema": MANIFEST_SCHEMA,
             "live": False,
         }
