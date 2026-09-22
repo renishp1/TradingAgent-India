@@ -7,12 +7,12 @@ from datetime import datetime
 from grow.errors import GrowConfigError
 from grow.history.models import (
     ALLOWED_OPTION_TYPES,
-    ALLOWED_UNDERLYINGS,
     HistoricalBar,
     HistoricalOptionContract,
     HistoricalOptionQuote,
     HistoricalSession,
 )
+from grow.history.universe import is_supported_index
 
 
 def require_aware(ts: datetime, label: str) -> None:
@@ -24,7 +24,7 @@ def validate_bar(bar: HistoricalBar) -> None:
     require_aware(bar.timestamp, "bar.timestamp")
     require_aware(bar.end, "bar.end")
     require_aware(bar.as_of_available_at, "bar.available")
-    if bar.symbol not in ALLOWED_UNDERLYINGS:
+    if not is_supported_index(bar.symbol, bar.timestamp.date()):
         raise GrowConfigError(f"UNSUPPORTED_UNDERLYING:{bar.symbol}")
     if bar.volume < 0:
         raise GrowConfigError("NEGATIVE_VOLUME")
@@ -41,7 +41,7 @@ def validate_bar(bar: HistoricalBar) -> None:
 def validate_contract(contract: HistoricalOptionContract) -> None:
     require_aware(contract.first_seen_at, "contract.first_seen")
     require_aware(contract.last_seen_at, "contract.last_seen")
-    if contract.underlying not in ALLOWED_UNDERLYINGS:
+    if not is_supported_index(contract.underlying, contract.first_seen_at.date()):
         raise GrowConfigError(f"UNSUPPORTED_UNDERLYING:{contract.underlying}")
     if contract.option_type not in ALLOWED_OPTION_TYPES:
         raise GrowConfigError(f"UNSUPPORTED_OPTION_TYPE:{contract.option_type}")

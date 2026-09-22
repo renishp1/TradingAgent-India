@@ -63,23 +63,19 @@ def select_nearest_weekly_expiry(
     *,
     allow_same_day: bool = False,
 ) -> date | None:
-    today = as_of.astimezone(IST).date()
-    eligible: list[HistoricalExpiryRecord] = []
-    for rec in historical_expiries:
-        if rec.underlying != underlying:
-            continue
-        if rec.expiry < today:
-            continue
-        if rec.expiry == today and not allow_same_day:
-            continue
-        if rec.expiry_class != "WEEKLY":
-            continue
-        if rec.first_seen_at > as_of.astimezone(IST) or rec.last_seen_at < as_of.astimezone(IST):
-            continue
-        eligible.append(rec)
-    if not eligible:
+    from grow.history.resolver import resolve_nearest_expiry
+    from grow.history.universe import WEEKLY_PREFERRED
+
+    resolution = resolve_nearest_expiry(
+        underlying,
+        as_of,
+        historical_expiries,
+        WEEKLY_PREFERRED,
+        allow_same_day=allow_same_day,
+    )
+    if resolution.selected_expiry is None:
         return None
-    return min(eligible, key=lambda rec: rec.expiry).expiry
+    return date.fromisoformat(resolution.selected_expiry)
 
 
 def nearest_weekly_from_chain(chain: OptionChainSnapshot, as_of: datetime, config: OptionsConfig | None = None) -> date | None:

@@ -29,6 +29,7 @@ from grow.history.models import (
     HistoricalOptionQuote,
 )
 from grow.history.store import CanonicalStore
+from grow.history.universe import default_index_registry
 from grow.options.select import choose_expiry
 
 EVAL_SCHEMA = "provider.eval.v1"
@@ -187,15 +188,31 @@ class ProviderEvaluationRunner:
         checks.append(pit)
 
         cfg = load_config().options
+        registry = default_index_registry()
         expiry_ok = True
         match_ok = True
-        for underlying in ("NIFTY", "BANKNIFTY"):
-            if underlying not in meta.instrument_scope:
-                continue
+        monthly_ok = True
+        for underlying in meta.instrument_scope:
+            profile = "WEEKLY_PREFERRED"
+            pol = registry.policy(underlying)
+            if pol is not None:
+                profile = pol.expiry_policy_profile
             for as_of in sample_slots:
                 visible = universe_at(store, underlying, as_of)
-                selected = select_nearest_weekly_expiry(underlying, as_of, visible, allow_same_day=cfg.allow_same_day)
-                two_c = _two_c_expiry(store, underlying, as_of)
+                from grow.history.resolver import resolve_nearest_expiry
+
+                resolved = resolve_nearest_expiry(
+                    underlying,
+                    as_of,
+                    visible,
+                    profile,
+                    allow_same_day=cfg.allow_same_day,
+                    dataset_id=meta.dataset_id,
+                    dataset_version=meta.version,
+                    dataset_fingerprint=meta.fingerprint,
+                )
+                selected = None if resolved.selected_expiry is None else date.fromisoformat(resolved.selected_expiry)
+                two_c = _two_c_expiry(store, underlying, as_of, profile)
                 reconstructions.append(
                     ExpiryReconstruction(
                         as_of=as_of.isoformat(),
@@ -209,13 +226,19 @@ class ProviderEvaluationRunner:
                     match_ok = False
                 if not visible:
                     expiry_ok = False
+                if profile == "MONTHLY_ONLY" and selected is None and visible:
+                    monthly_ok = False
         checks.append(
             CheckResult("EXPIRY_RECONSTRUCTION", "PASS" if expiry_ok else "FAIL", "universe at as_of", True)
         )
         checks.append(
-            CheckResult("NEAREST_WEEKLY", "PASS" if match_ok else "FAIL", "2H helper matches 2C choose_expiry", True)
+            CheckResult("NEAREST_WEEKLY", "PASS" if match_ok else "FAIL", "resolver matches 2C choose_expiry", True)
+        )
+        checks.append(
+            CheckResult("MONTHLY_ONLY", "PASS" if monthly_ok else "FAIL", "monthly profile selects monthly", False)
         )
         checks.append(_same_day_excluded(store, reconstructions, cfg.allow_same_day))
+        checks.append(_index_discovery(store))
 
         mandatory_fail = any(c.mandatory and c.outcome == "FAIL" for c in checks)
         warning_fail = any(not c.mandatory and c.outcome != "PASS" for c in checks)
@@ -282,13 +305,34 @@ def _sample_slots(days: list[date], cadence: tuple[str, ...]) -> tuple[datetime,
 
 
 def _universe(store: CanonicalStore) -> CheckResult:
+    registry = default_index_registry()
     scope = set(store.meta.instrument_scope)
-    extra = scope - ALLOWED_UNDERLYINGS
-    missing = ALLOWED_UNDERLYINGS - scope
+    unsupported = sorted(sym for sym in scope if not registry.allows(sym))
     seen = {c.option_type for c in store.all_contracts()}
-    if extra or missing or seen != ALLOWED_OPTION_TYPES:
-        return CheckResult("UNIVERSE", "FAIL", f"scope={sorted(scope)} types={sorted(seen)}", True)
-    return CheckResult("UNIVERSE", "PASS", "NIFTY/BANKNIFTY CE/PE", True)
+    if unsupported:
+        return CheckResult("UNIVERSE", "FAIL", f"unsupported={unsupported}", True)
+    if len(scope) < 2:
+        return CheckResult("UNIVERSE", "FAIL", "need at least two index underlyings", True)
+    if seen != ALLOWED_OPTION_TYPES:
+        return CheckResult("UNIVERSE", "FAIL", f"types={sorted(seen)}", True)
+    return CheckResult("UNIVERSE", "PASS", ",".join(sorted(scope)), True)
+
+
+def _index_discovery(store: CanonicalStore) -> CheckResult:
+    from grow.history.universe import discover_underlyings
+
+    days = [s.session_date for s in store._sessions.values() if s.status == "OPEN"]
+    if not days:
+        return CheckResult("INDEX_DISCOVERY", "FAIL", "no session", True)
+    as_of = datetime.combine(days[0], time(11, 0), tzinfo=IST)
+    found = discover_underlyings(store, as_of)
+    eligible = [row.canonical_symbol for row in found if row.status == "ELIGIBLE"]
+    extra = [row.canonical_symbol for row in found if row.status == "ELIGIBLE" and row.canonical_symbol not in store.meta.instrument_scope]
+    if extra:
+        return CheckResult("INDEX_DISCOVERY", "FAIL", f"invented={extra}", True)
+    if len(eligible) < 1:
+        return CheckResult("INDEX_DISCOVERY", "FAIL", "none eligible", True)
+    return CheckResult("INDEX_DISCOVERY", "PASS", ",".join(eligible), True)
 
 
 def _contracts(store: CanonicalStore) -> CheckResult:
@@ -433,14 +477,17 @@ def _pit(store: CanonicalStore) -> CheckResult:
     return CheckResult("PIT", "PASS", "adversarial future rows isolated from T", True)
 
 
-def _two_c_expiry(store: CanonicalStore, underlying: str, as_of: datetime) -> date | None:
+def _two_c_expiry(store: CanonicalStore, underlying: str, as_of: datetime, profile: str = "WEEKLY_PREFERRED") -> date | None:
     src = HistoricalOptionSource(store)
     try:
         chain = src.snapshot(underlying, as_of, spot=1.0)
     except Exception:
         records = universe_at(store, underlying, as_of)
-        return select_nearest_weekly_expiry(underlying, as_of, records)
-    chosen, _ = choose_expiry(chain, as_of, load_config().options)
+        from grow.history.resolver import resolve_nearest_expiry
+
+        resolved = resolve_nearest_expiry(underlying, as_of, records, profile)
+        return None if resolved.selected_expiry is None else date.fromisoformat(resolved.selected_expiry)
+    chosen, _ = choose_expiry(chain, as_of, load_config().options, policy_profile=profile)
     return None if chosen is None else chosen.day
 
 

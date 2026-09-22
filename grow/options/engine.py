@@ -24,7 +24,6 @@ from grow.options.select import (
     strike_window,
 )
 from grow.options.validate import (
-    _INDEX,
     assert_ist,
     intrinsic,
     moneyness,
@@ -74,9 +73,13 @@ class IndexOptionsEngine:
             return empty((str(exc),))
         if signal.direction in {"LONG", "SHORT", "SELL", "BUY", "OPTION_SELL"}:
             return empty((f"EXECUTION_LANGUAGE:{signal.direction}",))
-        if signal.symbol.ticker not in _INDEX:
-            return empty((f"UNSUPPORTED_UNDERLYING:{signal.symbol.ticker}",))
-        if option_chain.underlying != signal.symbol.ticker:
+        from grow.history.universe import default_index_registry
+
+        registry = default_index_registry()
+        ticker = signal.symbol.ticker
+        if not registry.allows(ticker, as_of.date()):
+            return empty((f"UNSUPPORTED_UNDERLYING:{ticker}",))
+        if option_chain.underlying != ticker:
             return empty(("UNDERLYING_CHAIN_MISMATCH",))
         if underlying_snapshot.symbol.ticker != signal.symbol.ticker:
             return empty(("UNDERLYING_SNAPSHOT_MISMATCH",))
@@ -97,7 +100,12 @@ class IndexOptionsEngine:
         kept, rejected, notes = validate_chain(option_chain, as_of=as_of, config=cfg)
         if not kept and any(n.startswith("STALE") or n in {"CHAIN_FROM_FUTURE", "LIVE_CHAIN_FORBIDDEN"} for n in notes):
             return empty(notes, rejected)
-        expiry, expiry_why = choose_expiry(option_chain, as_of, cfg)
+        expiry, expiry_why = choose_expiry(
+            option_chain,
+            as_of,
+            cfg,
+            policy_profile=registry.policy(ticker, as_of.date()).expiry_policy_profile,
+        )
         if expiry is None:
             return empty((expiry_why, *notes), rejected)
         spot = underlying_snapshot.last_price

@@ -46,22 +46,33 @@ def choose_expiry(
     chain: OptionChainSnapshot,
     as_of: datetime,
     config: OptionsConfig,
+    *,
+    policy_profile: str | None = None,
 ) -> tuple[OptionExpiry | None, str]:
     today = session_day(as_of)
-    preferred = ExpiryClass.WEEKLY if config.preferred_expiry_class == "weekly" else ExpiryClass.MONTHLY
-    eligible: list[OptionExpiry] = []
-    for expiry in chain.expiries:
-        if expiry.day < today:
-            continue
-        if expiry.day == today and not config.allow_same_day:
-            continue
-        if expiry.klass is not preferred:
-            continue
-        eligible.append(expiry)
-    if not eligible:
-        return None, f"NO_ELIGIBLE_EXPIRY:{preferred.value}"
-    chosen = min(eligible, key=lambda item: (item.day, item.klass.value))
-    return chosen, f"EXPIRY:{chosen.day.isoformat()}:{chosen.klass.value}"
+    profile = policy_profile or (
+        "WEEKLY_PREFERRED" if config.preferred_expiry_class == "weekly" else "MONTHLY_ONLY"
+    )
+    if profile == "MONTHLY_ONLY":
+        order = (ExpiryClass.MONTHLY,)
+    elif profile == "WEEKLY_THEN_MONTHLY":
+        order = (ExpiryClass.WEEKLY, ExpiryClass.MONTHLY)
+    else:
+        order = (ExpiryClass.WEEKLY,)
+    for preferred in order:
+        eligible: list[OptionExpiry] = []
+        for expiry in chain.expiries:
+            if expiry.day < today:
+                continue
+            if expiry.day == today and not config.allow_same_day:
+                continue
+            if expiry.klass is not preferred:
+                continue
+            eligible.append(expiry)
+        if eligible:
+            chosen = min(eligible, key=lambda item: (item.day, item.klass.value))
+            return chosen, f"EXPIRY:{chosen.day.isoformat()}:{chosen.klass.value}"
+    return None, f"NO_ELIGIBLE_EXPIRY:{order[0].value}"
 
 
 def allowed_type(direction: str) -> OptionType | None:

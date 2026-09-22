@@ -36,4 +36,27 @@ def snapshot(config: GrowConfig, book: PaperBook, last_cycle: CycleReport | None
         },
         "book": book.snapshot(),
         "last_cycle": None if last_cycle is None else last_cycle.to_dict(),
+        "research_label": "HISTORICAL RESEARCH / NOT LIVE",
     }
+
+
+def provider_evaluation_view(store=None, result=None) -> dict[str, Any]:
+    from grow.history.candidates import PUBLIC_CANDIDATES
+    from grow.history.eval import ProviderEvaluationRunner
+    from grow.history.sample_2i import SAMPLE_2I_ID, build_2i_store
+    from grow.history.scorecard import scorecard_from
+
+    sample = store or build_2i_store()
+    evaluation = result or ProviderEvaluationRunner().evaluate(sample)
+    card = scorecard_from(sample, evaluation)
+    return {
+        "label": "HISTORICAL RESEARCH / NOT LIVE",
+        "live": False,
+        "dataset_id": sample.meta.dataset_id if store is not None else SAMPLE_2I_ID,
+        "scorecard": card.to_dict(),
+        "qualification_status": evaluation.qualification_status,
+        "approved_for_2e": evaluation.approved_for_2e,
+        "public_candidates": [c.to_dict() for c in PUBLIC_CANDIDATES],
+        "checks": [c.to_dict() for c in evaluation.checks],
+    }
+

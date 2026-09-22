@@ -45,3 +45,9 @@ A technically passing framework sample **cannot** become `APPROVED_FOR_2E`.
 `select_nearest_weekly_expiry` reconstructs the universe at `as_of` and
 applies the locked rule. Decision-time selection remains
 `grow.options.select.choose_expiry` on the reconstructed chain.
+
+Milestone 2I adds a versioned `IndexUniverseRegistry` and
+`resolve_nearest_expiry` so weekly-preferred and monthly-only indices can
+coexist without hard-coding NIFTY/BANKNIFTY as the only possible names.
+See [`dynamic.md`](dynamic.md).
+

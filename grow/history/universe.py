@@ -1,0 +1,188 @@
+"""Versioned index-option universe. OPTIDX only. Not stock options.
+
+NIFTY and BANKNIFTY remain supported defaults. Additional approved
+index underlyings are added here, not by hard-coding the provider layer.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date, datetime
+
+from grow.clock import IST
+
+WEEKLY_PREFERRED = "WEEKLY_PREFERRED"
+MONTHLY_ONLY = "MONTHLY_ONLY"
+WEEKLY_THEN_MONTHLY = "WEEKLY_THEN_MONTHLY"
+CUSTOM_HISTORICAL = "CUSTOM_HISTORICAL"
+KNOWN_EXPIRY_PROFILES = frozenset(
+    {WEEKLY_PREFERRED, MONTHLY_ONLY, WEEKLY_THEN_MONTHLY, CUSTOM_HISTORICAL}
+)
+OPTIDX = "OPTIDX"
+REGISTRY_VERSION = "index.universe.v1"
+
+
+@dataclass(frozen=True)
+class IndexPolicy:
+    index_id: str
+    canonical_symbol: str
+    display_name: str
+    exchange: str
+    instrument_type: str
+    active_from: date
+    active_to: date | None
+    option_supported: bool
+    expiry_policy_profile: str
+    strike_policy_profile: str
+    lot_size_source: str
+    liquidity_policy: str
+    research_status: str
+    license_status: str
+    provider_symbol_map: tuple[tuple[str, str], ...] = ()
+
+    def active_on(self, day: date) -> bool:
+        if day < self.active_from:
+            return False
+        if self.active_to is not None and day > self.active_to:
+            return False
+        return True
+
+
+@dataclass(frozen=True)
+class EligibleUnderlying:
+    index_id: str
+    canonical_symbol: str
+    expiry_policy_profile: str
+    status: str
+    reason: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "index_id": self.index_id,
+            "canonical_symbol": self.canonical_symbol,
+            "expiry_policy_profile": self.expiry_policy_profile,
+            "status": self.status,
+            "reason": self.reason,
+        }
+
+
+def _policy(
+    symbol: str,
+    *,
+    name: str,
+    profile: str,
+    active_from: date,
+    active_to: date | None = None,
+    exchange: str = "NSE",
+) -> IndexPolicy:
+    return IndexPolicy(
+        index_id=symbol,
+        canonical_symbol=symbol,
+        display_name=name,
+        exchange=exchange,
+        instrument_type=OPTIDX,
+        active_from=active_from,
+        active_to=active_to,
+        option_supported=True,
+        expiry_policy_profile=profile,
+        strike_policy_profile="ATM_PM2",
+        lot_size_source="CONTRACT_MASTER",
+        liquidity_policy="options.select.v1",
+        research_status="APPROVED",
+        license_status="POLICY",
+        provider_symbol_map=(("canonical", symbol),),
+    )
+
+
+def default_index_policies() -> tuple[IndexPolicy, ...]:
+    return (
+        _policy("NIFTY", name="Nifty 50", profile=WEEKLY_PREFERRED, active_from=date(2019, 1, 1)),
+        _policy("BANKNIFTY", name="Nifty Bank", profile=WEEKLY_PREFERRED, active_from=date(2019, 1, 1)),
+        _policy("MIDCPNIFTY", name="Nifty Midcap Select", profile=MONTHLY_ONLY, active_from=date(2023, 1, 1)),
+    )
+
+
+class IndexUniverseRegistry:
+    def __init__(self, policies: tuple[IndexPolicy, ...] | None = None) -> None:
+        rows = policies or default_index_policies()
+        by_id: dict[str, IndexPolicy] = {}
+        for policy in rows:
+            if policy.instrument_type != OPTIDX:
+                continue
+            if policy.expiry_policy_profile not in KNOWN_EXPIRY_PROFILES:
+                continue
+            by_id[policy.canonical_symbol] = policy
+        self._policies = by_id
+        self.version = REGISTRY_VERSION
+
+    def policy(self, symbol: str, day: date | None = None) -> IndexPolicy | None:
+        item = self._policies.get(symbol)
+        if item is None:
+            return None
+        if day is not None and not item.active_on(day):
+            return None
+        return item
+
+    def allows(self, symbol: str, day: date | None = None) -> bool:
+        item = self.policy(symbol, day)
+        return bool(item and item.option_supported)
+
+    def symbols(self, day: date | None = None) -> frozenset[str]:
+        return frozenset(s for s, p in self._policies.items() if day is None or p.active_on(day))
+
+    def all_policies(self) -> tuple[IndexPolicy, ...]:
+        return tuple(self._policies.values())
+
+
+_DEFAULT: IndexUniverseRegistry | None = None
+
+
+def default_index_registry() -> IndexUniverseRegistry:
+    global _DEFAULT
+    if _DEFAULT is None:
+        _DEFAULT = IndexUniverseRegistry()
+    return _DEFAULT
+
+
+def is_supported_index(symbol: str, day: date | None = None) -> bool:
+    return default_index_registry().allows(symbol, day)
+
+
+def discover_underlyings(store, as_of: datetime, registry: IndexUniverseRegistry | None = None) -> tuple[EligibleUnderlying, ...]:
+    """Historically listed OPTIDX names at as_of. Never invents a symbol."""
+    reg = registry or default_index_registry()
+    moment = as_of.astimezone(IST)
+    day = moment.date()
+    listed: set[str] = set()
+    for contract in store.all_contracts():
+        if contract.first_seen_at <= moment <= contract.last_seen_at:
+            listed.add(contract.underlying)
+    rows: list[EligibleUnderlying] = []
+    for policy in sorted(reg.all_policies(), key=lambda p: p.canonical_symbol):
+        if not policy.active_on(day) or not policy.option_supported:
+            continue
+        if policy.canonical_symbol in listed:
+            rows.append(
+                EligibleUnderlying(
+                    index_id=policy.index_id,
+                    canonical_symbol=policy.canonical_symbol,
+                    expiry_policy_profile=policy.expiry_policy_profile,
+                    status="ELIGIBLE",
+                    reason="LISTED",
+                )
+            )
+        else:
+            rows.append(
+                EligibleUnderlying(
+                    index_id=policy.index_id,
+                    canonical_symbol=policy.canonical_symbol,
+                    expiry_policy_profile=policy.expiry_policy_profile,
+                    status="DATA_UNAVAILABLE",
+                    reason="DATA_UNAVAILABLE",
+                )
+            )
+    return tuple(rows)
+
+
+def eligible_symbols(discovered: tuple[EligibleUnderlying, ...]) -> tuple[str, ...]:
+    return tuple(row.canonical_symbol for row in discovered if row.status == "ELIGIBLE")
