@@ -16,6 +16,7 @@ from grow.history.models import (
     BID_ASK_GAPS,
     FRAMEWORK_TEST_ONLY,
     KNOWN_MAPPING_POLICIES,
+    KNOWN_QUALITY_WARNINGS,
     MAPPING_EXACT,
     MISSING_IV,
     MISSING_OI,
@@ -41,6 +42,9 @@ class CanonicalStore:
             raise GrowConfigError(f"UNKNOWN_MAPPING_POLICY:{meta.mapping_policy}")
         if meta.slot_tolerance_seconds < 0:
             raise GrowConfigError("SLOT_TOLERANCE")
+        unknown = [wid for wid in meta.quality_warnings if wid not in KNOWN_QUALITY_WARNINGS]
+        if unknown:
+            raise GrowConfigError(";".join(f"UNKNOWN_WARNING_ID:{wid}" for wid in unknown))
         self._sessions: dict[date, HistoricalSession] = {}
         self._bars: dict[tuple[str, str, datetime], HistoricalBar] = {}
         self._contracts: dict[str, HistoricalOptionContract] = {}

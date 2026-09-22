@@ -158,20 +158,23 @@ def acknowledge_dataset_warnings(
     dataset_warnings: tuple[str, ...] | list[str],
     accepted: tuple[str, ...] | list[str],
 ) -> tuple[str, ...]:
+    from grow.history.models import KNOWN_QUALITY_WARNINGS
+
+    issues: list[str] = []
+    for wid in list(dataset_warnings) + list(accepted):
+        if wid not in KNOWN_QUALITY_WARNINGS:
+            issues.append(f"UNKNOWN_WARNING_ID:{wid}")
     material = frozenset(dataset_warnings)
     chosen = frozenset(accepted)
-    issues: list[str] = []
     if not material:
-        if chosen:
-            issues.extend(f"UNKNOWN_WARNING_ID:{wid}" for wid in sorted(chosen))
-        return tuple(issues)
+        return tuple(dict.fromkeys(issues))
     unknown = chosen - material
     missing = material - chosen
     if unknown:
-        issues.extend(f"UNKNOWN_WARNING_ID:{wid}" for wid in sorted(unknown))
+        issues.extend(f"UNKNOWN_WARNING_ID:{wid}" for wid in sorted(unknown) if wid in KNOWN_QUALITY_WARNINGS)
     if missing:
         issues.append("WARNINGS_NOT_ACKNOWLEDGED")
-    return tuple(issues)
+    return tuple(dict.fromkeys(issues))
 
 
 def require_historical_research(

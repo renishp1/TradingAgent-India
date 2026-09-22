@@ -102,6 +102,7 @@ class FixtureDirector:
         end: date,
         granularity: str = "M15",
         parent_plan_id: str | None = None,
+        accepted_dataset_warnings: tuple[str, ...] = (),
     ) -> ResearchPlan:
         rd = self.config.research_director
         self._require(enabled=rd.enabled, flag=rd.allow_plan_creation, code="PLAN_CREATION_DISABLED")
@@ -147,7 +148,7 @@ class FixtureDirector:
             prompt_version=PROMPT_VERSION,
             provider="fixture",
             model_name=DIRECTOR_VERSION,
-            accepted_dataset_warnings=(),
+            accepted_dataset_warnings=accepted_dataset_warnings,
         )
         plan = replace(draft, plan_id=_plan_id(draft))
         self.plans[plan.plan_id] = plan

@@ -693,6 +693,12 @@ class HistoryHardeningTests(unittest.TestCase):
         self.assertEqual(loaded.meta.mapping_policy, "NEAREST_WITHIN_TOLERANCE")
         self.assertEqual(loaded.meta.slot_tolerance_seconds, 30)
 
+    def test_unknown_dataset_warning_id_rejected(self) -> None:
+        with self.assertRaises(GrowConfigError) as ctx:
+            CanonicalStore(_meta(quality_warnings=("MISSING_IVs",)))
+        self.assertIn("UNKNOWN_WARNING_ID", str(ctx.exception))
+        CanonicalStore(_meta(quality_warnings=("MISSING_IV",)))
+
     def test_missing_m15_quality_not_complete(self) -> None:
         store = CanonicalStore(_meta())
         store.add_session(_session())

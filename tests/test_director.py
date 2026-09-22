@@ -405,6 +405,44 @@ class DirectorWarningAckTests(unittest.TestCase):
         clean = replace(plan, dataset_id=allowed.dataset_id, dataset_version="v1")
         ResearchPlanValidator().validate(clean, cat)
 
+    def test_plan_api_passes_accepted_warnings_into_freeze(self) -> None:
+        d = FixtureDirector()
+        warnings = (BID_ASK_GAPS, MISSING_IV, OPTION_SNAPSHOT_GAPS)
+        hist = ApprovedDataSource(
+            dataset_id="hist.warn.api",
+            provider="file",
+            instrument_scope=("NIFTY", "BANKNIFTY"),
+            date_coverage=(date(2026, 1, 1), date(2026, 12, 31)),
+            timestamp_granularity=("M5", "M15", "D1"),
+            timezone="Asia/Kolkata",
+            option_chain_depth="atm_pm2",
+            bid_ask_available=True,
+            oi_available=True,
+            volume_available=True,
+            iv_available=False,
+            greeks_available=False,
+            historical_contract_metadata=True,
+            session_calendar_version=d.catalog[FIXTURE_DATASET].session_calendar_version,
+            quality_status=APPROVED_WITH_WARNINGS,
+            licensing_status="APPROVED",
+            dataset_version="v1",
+            provenance="test",
+            usage_scope="HISTORICAL_RESEARCH",
+            is_fixture=False,
+            quality_warnings=warnings,
+        )
+        d.catalog = {**d.catalog, hist.dataset_id: hist}
+        _, empty = _valid_plan(d, dataset_id=hist.dataset_id)
+        with self.assertRaises(GrowConfigError) as ctx:
+            d.freeze(empty)
+        self.assertIn("WARNINGS_NOT_ACKNOWLEDGED", str(ctx.exception))
+        _, plan = _valid_plan(d, dataset_id=hist.dataset_id, accepted_dataset_warnings=warnings)
+        self.assertEqual(plan.accepted_dataset_warnings, warnings)
+        frozen = d.freeze(plan)
+        self.assertEqual(frozen.accepted_dataset_warnings, warnings)
+        self.assertEqual(frozen.freeze_hash, plan.fingerprint())
+        self.assertEqual(frozen.freeze_payload()["accepted_dataset_warnings"], list(warnings))
+
 
 if __name__ == "__main__":
     unittest.main()

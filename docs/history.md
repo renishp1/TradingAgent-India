@@ -52,7 +52,8 @@ Material warnings are dataset-version IDs, not a blanket flag:
 - `MISSING_VOLUME`
 - `MISSING_SESSIONS`
 
-A research plan must list **exactly** those IDs. Unknown IDs fail
+A research plan must list **exactly** those IDs via
+`FixtureDirector.plan(accepted_dataset_warnings=...)`. Unknown IDs fail
 `UNKNOWN_WARNING_ID`. Partial acceptance fails `WARNINGS_NOT_ACKNOWLEDGED`.
 Accepted IDs are part of the frozen plan fingerprint.
 
