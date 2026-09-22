@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ast
 import json
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -216,14 +216,14 @@ def classify_smoke_result(
     authenticated: bool,
     catalog_ok: bool,
     mapping_ready: bool,
-    snapshot_ok: bool,
+    option_tick_ok: bool,
     paper_fill: bool,
     hard_fail: bool,
     fixture_fallback: bool,
 ) -> str:
     if hard_fail or fixture_fallback:
         return HARD_FAIL
-    if not authenticated or not catalog_ok or not mapping_ready or not snapshot_ok:
+    if not authenticated or not catalog_ok or not mapping_ready or not option_tick_ok:
         return FAIL
     if paper_fill:
         return PASS
@@ -235,32 +235,163 @@ def _scalar(value: Any) -> Any:
 
 
 def _reverse_symbol_ids(symbol_ids: Mapping[str, str]) -> dict[str, str]:
-    return {name: ident for ident, name in symbol_ids.items()}
+    return {str(name): str(ident) for ident, name in symbol_ids.items() if str(name).strip()}
 
 
-def _first_contracts(snapshot: Any, symbol_ids: Mapping[str, str]) -> list[dict[str, Any]]:
-    reverse = _reverse_symbol_ids(symbol_ids)
-    rows: list[dict[str, Any]] = []
-    chains = getattr(snapshot, "chains", {}) or {}
-    for chain in chains.values():
-        for contract in getattr(chain, "contracts", ())[:2]:
-            provider_symbol = getattr(contract, "provider_contract_id", None)
-            option_type = _scalar(contract.option_type)
-            rows.append(
-                {
-                    "canonical_id": f"{contract.underlying}-{contract.expiry.isoformat()}-{int(contract.strike)}-{option_type}",
-                    "provider_contract_id": provider_symbol,
-                    "provider_symbol_id": reverse.get(str(provider_symbol)) if provider_symbol else None,
-                    "underlying": contract.underlying,
-                    "expiry": contract.expiry.isoformat(),
-                    "strike": contract.strike,
-                    "option_type": option_type,
-                    "expiry_class": _scalar(contract.expiry_class),
-                }
-            )
-            if len(rows) >= 4:
-                return rows
-    return rows
+def _valid_timestamp(value: Any) -> bool:
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        return False
+    return value.tzinfo.utcoffset(value) is not None
+
+
+def _marked_fixture(value: Any) -> bool:
+    return getattr(value, "is_fixture", False) is True
+
+
+@dataclass(frozen=True)
+class OptionTickCheck:
+    """Live option-quote evidence. Catalog rows and index ticks are not quotes."""
+
+    quotes: tuple[Mapping[str, Any], ...] = ()
+    fixture_rejected: bool = False
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.quotes) and not self.fixture_rejected
+
+
+def _provider_quotes_marked_fixture(provider: Any) -> bool:
+    quotes = getattr(provider, "_quotes", None) or {}
+    if not isinstance(quotes, Mapping):
+        return False
+    for quote in quotes.values():
+        if isinstance(quote, Mapping) and quote.get("is_fixture") is True:
+            return True
+    return False
+
+
+def _snapshot_marked_fixture(snapshot: Any) -> bool:
+    if _marked_fixture(snapshot):
+        return True
+    for chain in (getattr(snapshot, "chains", {}) or {}).values():
+        if _marked_fixture(chain):
+            return True
+        for contract in getattr(chain, "contracts", ()) or ():
+            if _marked_fixture(contract):
+                return True
+    for item in (getattr(snapshot, "market", {}) or {}).values():
+        if _marked_fixture(item) or _marked_fixture(getattr(item, "source", None)):
+            return True
+    return False
+
+
+def _live_option_quote(
+    snapshot: Any,
+    contract: Any,
+    reverse: Mapping[str, str],
+) -> dict[str, Any] | None:
+    option_type = str(_scalar(getattr(contract, "option_type", "")) or "")
+    if option_type not in {"CE", "PE"}:
+        return None
+    bid = getattr(contract, "bid", None)
+    ask = getattr(contract, "ask", None)
+    ltp = getattr(contract, "last_price", None)
+    if bid is None and ask is None and ltp is None:
+        return None
+    provider_symbol = str(getattr(contract, "provider_contract_id", "") or "").strip()
+    if not provider_symbol:
+        return None
+    provider_symbol_id = reverse.get(provider_symbol)
+    if provider_symbol_id in (None, ""):
+        return None
+    underlying = str(getattr(contract, "underlying", "") or "").strip()
+    expiry = getattr(contract, "expiry", None)
+    strike = getattr(contract, "strike", None)
+    if not underlying or expiry is None or strike is None:
+        return None
+    try:
+        strike_value = float(strike)
+    except (TypeError, ValueError):
+        return None
+    if strike_value <= 0:
+        return None
+    expiry_text = expiry.isoformat() if hasattr(expiry, "isoformat") else str(expiry)
+    canonical_id = f"{underlying}-{expiry_text}-{int(strike_value)}-{option_type}"
+    if not canonical_id or canonical_id == provider_symbol:
+        return None
+    event_time = getattr(snapshot, "event_time", None)
+    received_time = getattr(snapshot, "received_time", None)
+    quote_time = getattr(contract, "timestamp", None)
+    if not all(_valid_timestamp(item) for item in (event_time, received_time, quote_time)):
+        return None
+    return {
+        "snapshot_id": snapshot.snapshot_id,
+        "event_time": event_time.isoformat(),
+        "received_time": received_time.isoformat(),
+        "provider_symbol_id": str(provider_symbol_id),
+        "provider_symbol": provider_symbol,
+        "canonical_id": canonical_id,
+        "underlying": underlying,
+        "expiry": expiry_text,
+        "strike": strike,
+        "option_type": option_type,
+        "bid": bid,
+        "ask": ask,
+        "ltp": ltp,
+        "quote_freshness": True,
+        "sequence": snapshot.sequence,
+    }
+
+
+def assess_option_ticks(snapshot: Any, symbol_ids: Mapping[str, str] | None = None) -> OptionTickCheck:
+    """A first live tick is one CE/PE contract with a real quote, not merely a snapshot."""
+    if snapshot is None:
+        return OptionTickCheck()
+    if _snapshot_marked_fixture(snapshot):
+        return OptionTickCheck(fixture_rejected=True)
+    if getattr(snapshot, "freshness_ok", False) is not True:
+        return OptionTickCheck()
+    if not _valid_timestamp(getattr(snapshot, "event_time", None)):
+        return OptionTickCheck()
+    reverse = _reverse_symbol_ids(dict(symbol_ids or {}))
+    quotes: list[dict[str, Any]] = []
+    for chain in (getattr(snapshot, "chains", {}) or {}).values():
+        for contract in getattr(chain, "contracts", ()) or ():
+            row = _live_option_quote(snapshot, contract, reverse)
+            if row is not None:
+                quotes.append(row)
+    return OptionTickCheck(tuple(quotes))
+
+
+def _loop_option_check(loop: Any) -> OptionTickCheck:
+    provider = getattr(loop, "provider", None)
+    if _provider_quotes_marked_fixture(provider):
+        return OptionTickCheck(fixture_rejected=True)
+    symbol_ids = dict(getattr(provider, "_symbol_ids", {}) or {})
+    return assess_option_ticks(getattr(loop, "last_snapshot", None), symbol_ids)
+
+
+_SMOKE_STOP_REASONS = frozenset(
+    {
+        "AUTH_FAILED",
+        "AUTH_MISSING",
+        "METADATA_UNAVAILABLE",
+        "FIXTURE_FALLBACK_FORBIDDEN",
+        "SUBSCRIPTION_LIMIT",
+        "SYMBOL_MAP_NOT_READY",
+    }
+)
+
+
+def _smoke_stop_failure(reason: str) -> bool:
+    text = str(reason or "")
+    if text in _SMOKE_STOP_REASONS:
+        return True
+    if text.startswith(("AUTH_", "METADATA_", "SUBSCRIPTION_", "SESSION_TIMEOUT")):
+        return True
+    if "FIXTURE_FALLBACK" in text:
+        return True
+    return False
 
 
 def _pipeline_stages(reports: Sequence[LiveCycleReport]) -> dict[str, str]:
@@ -371,21 +502,24 @@ def build_smoke_report(
     if error is not None and str(error).startswith("AUTH_"):
         authenticated = False
     catalog_ok = bool(catalog)
-    snapshot_ok = snapshot is not None
+    quote_fixture = _provider_quotes_marked_fixture(provider)
+    tick_check = assess_option_ticks(snapshot, symbol_ids)
+    if quote_fixture or tick_check.fixture_rejected:
+        fixture_fallback = True
+    option_tick_ok = tick_check.ok and not fixture_fallback
     paper_fill = any(row.status is CycleStatus.PAPER_FILL for row in reports)
     hard_fail = bool(broker_hits or loaded or fixture_fallback or _is_hard_fail_error(error))
     result = classify_smoke_result(
         authenticated=authenticated,
         catalog_ok=catalog_ok,
         mapping_ready=mapping_ready,
-        snapshot_ok=snapshot_ok,
+        option_tick_ok=option_tick_ok,
         paper_fill=paper_fill,
         hard_fail=hard_fail,
         fixture_fallback=fixture_fallback,
     )
     sample_map = {ident: symbol_ids[ident] for ident in list(symbol_ids)[:4]}
-    contracts = [] if snapshot is None else _first_contracts(snapshot, symbol_ids)
-    first = None if not contracts else contracts[0]
+    first = None if not option_tick_ok else dict(tick_check.quotes[0])
     payload: dict[str, Any] = {
         "schema": SMOKE_SCHEMA,
         "session_id": loop.session.session_id,
@@ -421,20 +555,33 @@ def build_smoke_report(
             "symbol_id_sample": sample_map,
             "events": list(getattr(provider, "subscription_events", ()) or ())[-8:],
         },
+        "option_tick_ok": option_tick_ok,
+        "first_option_tick": first,
         "first_tick": None
-        if snapshot is None
+        if first is None or snapshot is None
         else {
-            "snapshot_id": snapshot.snapshot_id,
-            "event_time": snapshot.event_time.isoformat(),
-            "received_time": snapshot.received_time.isoformat(),
+            "snapshot_id": first["snapshot_id"],
+            "event_time": first["event_time"],
+            "received_time": first["received_time"],
             "provider_id": snapshot.provider_id,
-            "provider_symbol_id": None if first is None else first.get("provider_symbol_id"),
-            "provider_symbol": None if first is None else first.get("provider_contract_id"),
-            "canonical_id": None if first is None else first.get("canonical_id"),
-            "sequence": snapshot.sequence,
-            "freshness_ok": snapshot.freshness_ok,
+            "provider_symbol_id": first["provider_symbol_id"],
+            "provider_symbol": first["provider_symbol"],
+            "canonical_id": first["canonical_id"],
+            "sequence": first["sequence"],
+            "freshness_ok": True,
+            "quote_freshness": first["quote_freshness"],
             "underlyings": list(snapshot.underlyings),
-            "contracts": contracts,
+            "contracts": [
+                {
+                    "canonical_id": first["canonical_id"],
+                    "provider_contract_id": first["provider_symbol"],
+                    "provider_symbol_id": first["provider_symbol_id"],
+                    "underlying": first["underlying"],
+                    "expiry": first["expiry"],
+                    "strike": first["strike"],
+                    "option_type": first["option_type"],
+                }
+            ],
             "diagnostics": list(snapshot.diagnostics),
         },
         "pipeline": _pipeline_outcome(reports),
@@ -468,22 +615,21 @@ def write_smoke_report(report: Mapping[str, Any], path: Path) -> Path:
 
 
 def drain_smoke_loop(loop: Any, *, max_cycles: int = DEFAULT_MAX_CYCLES) -> list[LiveCycleReport]:
+    """Poll until a live option quote, a paper open, or a terminal smoke stop.
+
+    An index snapshot, heartbeat, auth frame, subscription ack, or catalog row
+    does not end the loop. ``max_cycles`` is the bounded smoke deadline.
+    """
     reports: list[LiveCycleReport] = []
-    snapshot_seen = False
-    extra_after_snapshot = 0
     for _ in range(max_cycles):
         batch = loop.run_once()
         reports.extend(batch)
-        if loop.last_snapshot is not None:
-            snapshot_seen = True
-            extra_after_snapshot += 1
-            if any(row.status is CycleStatus.PAPER_FILL for row in reports) or extra_after_snapshot >= 2:
-                break
+        if any(row.status is CycleStatus.PAPER_FILL for row in reports):
+            break
+        check = _loop_option_check(loop)
+        if check.fixture_rejected or check.ok:
+            break
         reason = batch[-1].reason if batch else ""
-        if reason in {"AUTH_FAILED", "AUTH_MISSING", "METADATA_UNAVAILABLE", "FIXTURE_FALLBACK_FORBIDDEN"}:
-            break
-        if reason.startswith("SESSION_TIMEOUT"):
-            break
-        if snapshot_seen and extra_after_snapshot >= 2:
+        if _smoke_stop_failure(reason):
             break
     return reports

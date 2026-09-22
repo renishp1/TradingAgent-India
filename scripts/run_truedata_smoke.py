@@ -12,7 +12,7 @@ Usage (never commit secrets):
 Flow:
     credentials → WebSocket auth → vendor catalog discovery (2I overlay)
     → 3C.1 expiry classification → ATM subscription → mapping_ready
-    → first live snapshot → 3A/3B paper loop diagnostics → smoke report
+    → first live option quote → 3A/3B paper loop diagnostics → smoke report
 
 The catalog is fetched from TrueData symbol lists. Do not inject a fixture
 catalog. Do not set any broker token or live_trading flag.
