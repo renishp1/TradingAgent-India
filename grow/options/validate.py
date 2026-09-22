@@ -64,7 +64,7 @@ def validate_chain(
         return (), (RejectedContract(("*", "*", 0.0, "*"), f"UNSUPPORTED_UNDERLYING:{chain.underlying}"),), (
             f"UNSUPPORTED_UNDERLYING:{chain.underlying}",
         )
-    if chain.is_fixture is False or "live" in chain.source_id.lower():
+    if config.allow_live_chain or config.provider == "live" or "live" in chain.source_id.lower():
         return (), (), ("LIVE_CHAIN_FORBIDDEN",)
     age = (as_of - chain.as_of).total_seconds() / 60.0
     if chain.as_of > as_of:

@@ -530,7 +530,7 @@ class BacktestTests(unittest.TestCase):
                     expiries=(OptionExpiry(expiry, ExpiryClass.WEEKLY),),
                     contracts=contracts,
                     source_id="t",
-                    is_fixture=True,
+                    is_fixture=False,
                     provider_metadata={},
                 )
 
