@@ -74,6 +74,7 @@ def _metrics(**overrides):
         "underlying": "RELIANCE",
         "limit_price": 100.0,
         "stop_loss": 80.0,
+        "lots": 1,
         "quantity": 1,
     }
     payload.update(overrides)
@@ -95,7 +96,7 @@ def _result(snapshot, *, name="strategy_research", instrument="RELIANCE-2500-CE"
         data_quality_concerns=(),
         assumptions=("buyer-only",),
         evidence=(f"snapshot_id={snapshot.snapshot_id}",),
-        metrics_used=("limit_price", "stop_loss", "quantity"),
+        metrics_used=("limit_price", "stop_loss", "lots", "quantity"),
         candidate_action=CandidateAction.PAPER_OPEN,
         candidate_instrument=instrument,
         entry_reason="paper-test",

@@ -62,27 +62,22 @@ Persistence of working orders and a scheduler that *initiates* square-off
 are later work. The rule is already enforced so those features cannot
 "forget" it.
 
-## Daily P&L (known limitation)
+## Daily P&L
 
-`GrowRuntime` currently passes `book.realized_pnl` into Risk Guard as
-`daily_pnl`. That value is **lifetime realized-at-cost** of the in-memory
-book, not a trading-day accumulator.
+`PaperExecutionEngine` (4C → paper campaign path) feeds Risk Guard with
+**IST trading-day** realized P&L. Closes from prior calendar days are excluded.
+Open-mark unrealized P&L is included only in the engine's entry-gate
+`DAILY_LOSS_LIMIT` check (`trading_day_total_pnl`). A daily-loss halt does not
+carry across midnight IST.
 
-```
-Day 1: -₹10,000
-Day 2: +₹5,000
-realized_pnl = -₹5,000   ← this is what loss.daily sees today
-```
-
-The book snapshot records this explicitly:
+`GrowRuntime` (legacy cash CEO probe) still passes lifetime
+`book.realized_pnl` into Risk Guard. Its book snapshot records:
 
 - `pnl.true_daily_pnl = null`
 - `pnl.fed_to_risk_guard_as = lifetime_realized_pnl`
 
-Do not treat `loss.daily` as a real daily halt until Milestone 2A adds a
-session-day accumulator (`daily_realized_pnl`, `daily_unrealized_pnl`,
-fees, slippage). The rule still fail-closes when the number it *is* given
-breaches `max_daily_loss`.
+Do not treat that legacy path as a real daily halt until it adopts the same
+trading-day accumulator.
 
 ## What this does not guarantee
 
