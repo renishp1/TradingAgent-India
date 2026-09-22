@@ -4,21 +4,28 @@ from __future__ import annotations
 
 import ast
 import gzip
+import importlib
+import io
 import struct
 import unittest
 from datetime import timedelta
+from email.message import Message
 from pathlib import Path
+from unittest.mock import patch
 
 from grow.clock import FrozenClock
 from grow.errors import GrowConfigError, GrowLiveTradingDisabled
 from grow.execution.lock import inspect_environment
 from grow.live_data.kite_market import (
     KiteMarketProvider,
+    RealKiteTransport,
     classify_socket_failure,
     decode_http_text,
     decode_market_packet,
+    load_kite_market_secrets,
     parse_nfo_instruments,
     select_option_contract,
+    select_option_pair,
 )
 from grow.live_data.kite_market import ScriptedKiteTransport
 from grow.live_data.loop import LivePaperLoop
@@ -34,6 +41,7 @@ from grow.live_data.smoke import (
     drain_smoke_loop,
     format_option_tick_evidence,
     kite_market_smoke_config,
+    redact_text,
 )
 from grow.market.session import SessionCalendar
 from tests.helpers import TEST_RISK_SECRET
@@ -289,7 +297,50 @@ class OptionGateTests(unittest.TestCase):
         self.assertIn("OPTION TICK: PASS", evidence)
         self.assertIn("Provider: Zerodha", evidence)
         self.assertIn(f"Instrument token: {CE_TOKEN}", evidence)
+        self.assertIn(PE_TOKEN, provider.transport.subscribed)
         loop.stop()
+
+    def test_fresh_pe_quote_passes_existing_validation(self) -> None:
+        when = AS_OF - timedelta(seconds=2)
+        provider = _provider(
+            [_frame(_full_packet(PE_TOKEN, ltp=88.0, bid=87.5, ask=88.5, volume=12, oi=30, when=when))]
+        )
+        payload = provider.poll()
+        self.assertEqual(payload["option_quotes"][0]["option_type"], "PE")
+        self.assertEqual(payload["option_quotes"][0]["ts"], when.isoformat())
+        self.assertNotEqual(payload["option_quotes"][0]["ts"], payload["received_time"])
+        snapshot = _normalize(payload)
+        check = assess_option_ticks(snapshot, provider._symbol_ids, max_staleness_seconds=30, now=AS_OF)
+        self.assertTrue(check.ok)
+        self.assertEqual(check.quotes[0]["option_type"], "PE")
+        self.assertEqual(check.quotes[0]["ltp"], 88.0)
+        self.assertEqual(check.quotes[0]["bid"], 87.5)
+        self.assertEqual(check.quotes[0]["ask"], 88.5)
+        self.assertTrue(check.quotes[0]["quote_freshness"])
+        put = next(row for row in snapshot.chains["NIFTY"].contracts if row.provider_contract_id == "NIFTY26SEP24200PE")
+        self.assertEqual(put.volume, 12)
+        self.assertEqual(put.open_interest, 30)
+
+    def test_fresh_ce_and_pe_quotes_pass_together(self) -> None:
+        when = AS_OF - timedelta(seconds=2)
+        provider = _provider(
+            [
+                _frame(_full_packet(CE_TOKEN, ltp=101.5, bid=101.0, ask=102.0, volume=40, oi=80, when=when)),
+                _frame(_full_packet(PE_TOKEN, ltp=88.0, bid=87.5, ask=88.5, volume=12, oi=30, when=when)),
+            ]
+        )
+        self.assertEqual(provider.transport.mode, "full")
+        self.assertIn(CE_TOKEN, provider.transport.subscribed)
+        self.assertIn(PE_TOKEN, provider.transport.subscribed)
+        provider.poll()
+        payload = provider.poll()
+        kinds = [row["option_type"] for row in payload["option_quotes"]]
+        self.assertEqual(kinds, ["CE", "PE"])
+        snapshot = _normalize(payload)
+        check = assess_option_ticks(snapshot, provider._symbol_ids, max_staleness_seconds=30, now=AS_OF)
+        self.assertEqual({row["option_type"] for row in check.quotes}, {"CE", "PE"})
+        self.assertTrue(all(row["quote_freshness"] for row in check.quotes))
+        self.assertTrue(all(row["quote_timestamp"] == when.isoformat() for row in check.quotes))
 
     def test_quote_without_exchange_timestamp_is_not_accepted(self) -> None:
         packet = bytearray(44)
@@ -464,6 +515,122 @@ class ZerodhaSmokeSafetyTests(unittest.TestCase):
             code = mod.main({"PATH": "/usr/bin"})
         self.assertEqual(code, 2)
         self.assertIn("SMOKE_DISABLED", buf.getvalue())
+
+    def test_main_without_credentials_is_auth_missing(self) -> None:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("run_zerodha_smoke_auth", ROOT / "scripts" / "run_zerodha_smoke.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        from contextlib import redirect_stderr
+
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            code = mod.main({"ZERODHA_SMOKE": "1", "GROW_RISK_SECRET": TEST_RISK_SECRET, "PATH": "/usr/bin"})
+        self.assertEqual(code, 2)
+        self.assertIn("AUTH_MISSING", buf.getvalue())
+        self.assertNotIn(TEST_RISK_SECRET, buf.getvalue())
+
+
+class PairSelectionTests(unittest.TestCase):
+    def test_pair_requires_both_sides(self) -> None:
+        from grow.live_data.expiry_class import ExpiryClassifier
+
+        call, put = select_option_pair(
+            parse_nfo_instruments(CSV),
+            spots={"NIFTY": 24210.0, "BANKNIFTY": 55000.0},
+            as_of=AS_OF.date(),
+            classifier=ExpiryClassifier(clock=FrozenClock(AS_OF)),
+        )
+        self.assertEqual(call.option_type, "CE")
+        self.assertEqual(put.option_type, "PE")
+        self.assertEqual(call.strike, put.strike)
+        self.assertEqual(call.expiry, put.expiry)
+        self.assertEqual(call.underlying, "NIFTY")
+
+    def test_no_complete_pair_is_no_valid_option(self) -> None:
+        only_calls = "\n".join(line for line in CSV.splitlines() if ",PE," not in line)
+        transport = ScriptedKiteTransport(instruments_csv=only_calls, spots={"NIFTY": 24210.0}, frames=[])
+        provider = KiteMarketProvider(transport=transport, clock=FrozenClock(AS_OF))
+        with self.assertRaises(GrowConfigError) as ctx:
+            provider.connect()
+        self.assertEqual(str(ctx.exception), "NO_VALID_OPTION")
+
+
+class TransportFailureTests(unittest.TestCase):
+    def test_missing_credentials(self) -> None:
+        with self.assertRaises(GrowConfigError) as ctx:
+            load_kite_market_secrets({})
+        self.assertEqual(str(ctx.exception), "AUTH_MISSING")
+
+    def test_authentication_failure_is_sanitized(self) -> None:
+        import urllib.error
+
+        transport = RealKiteTransport(api_key="market-key", access_token="SECRETTOKEN")
+        body = io.BytesIO(b"access_token=SECRETTOKEN")
+        error = urllib.error.HTTPError(
+            "https://api.kite.trade/instruments/NFO",
+            401,
+            "denied SECRETTOKEN",
+            Message(),
+            body,
+        )
+        with patch("urllib.request.urlopen", side_effect=error):
+            with self.assertRaises(GrowConfigError) as ctx:
+                transport.fetch_instruments()
+        self.assertEqual(str(ctx.exception), "AUTH_FAILED")
+        self.assertNotIn("SECRETTOKEN", str(ctx.exception))
+
+    def test_connection_failure_is_not_auth_failed(self) -> None:
+        transport = RealKiteTransport(api_key="market-key", access_token="SECRETTOKEN")
+
+        class _Socket:
+            @staticmethod
+            def create_connection(url, timeout=15):
+                raise ConnectionRefusedError(url)
+
+        real_import = importlib.import_module
+
+        def _import(name, package=None):
+            if name == "websocket":
+                return _Socket
+            return real_import(name, package)
+
+        with patch("importlib.import_module", side_effect=_import):
+            with self.assertRaises(GrowConfigError) as ctx:
+                transport.connect()
+        self.assertEqual(str(ctx.exception), "CONNECT_FAILED")
+        self.assertNotIn("SECRETTOKEN", str(ctx.exception))
+
+    def test_feed_disconnect_and_timeout_stay_distinct(self) -> None:
+        transport = RealKiteTransport(api_key="market-key", access_token="SECRETTOKEN")
+        transport.connected = True
+
+        class _Closed:
+            def recv(self):
+                raise RuntimeError("access_token=SECRETTOKEN closed")
+
+        transport._ws = _Closed()
+        with self.assertRaises(GrowConfigError) as ctx:
+            transport.recv()
+        self.assertEqual(str(ctx.exception), "FEED_DISCONNECTED")
+        self.assertNotIn("SECRETTOKEN", str(ctx.exception))
+
+        class _Slow:
+            def recv(self):
+                raise TimeoutError("access_token=SECRETTOKEN")
+
+        transport._ws = _Slow()
+        self.assertIsNone(transport.recv())
+
+    def test_secret_redaction_removes_credentials(self) -> None:
+        text = redact_text(
+            "wss://ws.kite.trade?api_key=SUPERAPIKEY&access_token=SUPERSECRETKEY",
+            ("SUPERAPIKEY", "SUPERSECRETKEY"),
+        )
+        self.assertNotIn("SUPERAPIKEY", text)
+        self.assertNotIn("SUPERSECRETKEY", text)
+        self.assertIn("[REDACTED]", text)
 
 
 if __name__ == "__main__":

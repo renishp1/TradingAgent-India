@@ -145,6 +145,12 @@ def classify_socket_failure(exc: BaseException) -> str:
     return "NETWORK_ERROR"
 
 
+def _socket_timeout(exc: BaseException) -> bool:
+    if isinstance(exc, TimeoutError):
+        return True
+    return "timeout" in type(exc).__name__.lower()
+
+
 def load_kite_market_secrets(environ: Mapping[str, str]) -> tuple[str, str]:
     api_key = str(environ.get("KITE_API_KEY") or "").strip()
     access_token = str(environ.get("KITE_ACCESS_TOKEN") or "").strip()
@@ -244,6 +250,45 @@ def select_option_contract(
             return calls[0]
         if puts:
             return puts[0]
+    raise GrowConfigError("NO_VALID_OPTION")
+
+
+def select_option_pair(
+    options: Sequence[NfoOption],
+    *,
+    spots: Mapping[str, float],
+    as_of: date,
+    classifier: ExpiryClassifier,
+) -> tuple[NfoOption, NfoOption]:
+    """Nearest live expiry, then the closest strike that has both a CE and a PE."""
+    grouped: dict[str, list[NfoOption]] = {name: [] for name in UNDERLYING_ORDER}
+    for row in options:
+        if row.expiry < as_of:
+            continue
+        classified = classifier.classify(
+            provider_symbol=row.tradingsymbol,
+            canonical_symbol=row.underlying,
+            expiry=row.expiry,
+            option_type=row.option_type,
+            as_of=as_of,
+        )
+        if not is_tradable_expiry_class(classified.expiry_class):
+            continue
+        grouped[row.underlying].append(row)
+    for underlying in UNDERLYING_ORDER:
+        spot = spots.get(underlying)
+        rows = grouped[underlying]
+        if spot is None or not rows:
+            continue
+        expiry = min(row.expiry for row in rows)
+        pool = [row for row in rows if row.expiry == expiry]
+        strikes = sorted({row.strike for row in pool}, key=lambda value: (abs(value - float(spot)), value))
+        for strike in strikes:
+            at_strike = [row for row in pool if row.strike == strike]
+            calls = [row for row in at_strike if row.option_type == "CE"]
+            puts = [row for row in at_strike if row.option_type == "PE"]
+            if calls and puts:
+                return calls[0], puts[0]
     raise GrowConfigError("NO_VALID_OPTION")
 
 
@@ -454,7 +499,9 @@ class RealKiteTransport:
             raise GrowConfigError("FEED_DISCONNECTED")
         try:
             raw = self._ws.recv()
-        except Exception:
+        except Exception as exc:
+            if _socket_timeout(exc):
+                return None
             raise GrowConfigError("FEED_DISCONNECTED") from None
         if raw is None or raw == b"" or raw == "":
             return None
@@ -524,6 +571,9 @@ class KiteMarketProvider:
         self._options: tuple[NfoOption, ...] = ()
         self._chain: tuple[NfoOption, ...] = ()
         self.selected: NfoOption | None = None
+        self.selected_put: NfoOption | None = None
+        self._contracts: dict[int, NfoOption] = {}
+        self._side_quotes: dict[str, NormalizedOptionQuote] = {}
         self._spots: dict[str, float] = {}
         self._index_tokens: dict[int, str] = {}
         self._quote: NormalizedOptionQuote | None = None
@@ -559,7 +609,7 @@ class KiteMarketProvider:
         if not spots:
             self._fail_metadata("METADATA_UNAVAILABLE")
         try:
-            selected = select_option_contract(
+            call, put = select_option_pair(
                 self._options,
                 spots=spots,
                 as_of=self.clock.now().date(),
@@ -568,20 +618,28 @@ class KiteMarketProvider:
         except GrowConfigError as exc:
             self._fail_metadata(str(exc))
             raise
-        self.selected = selected
-        self._spots = {selected.underlying: spots[selected.underlying]}
-        index_token = next(token for token, name in index_tokens.items() if name == selected.underlying)
-        self._index_tokens = {index_token: selected.underlying}
+        self.selected = call
+        self.selected_put = put
+        self._contracts = {call.instrument_token: call, put.instrument_token: put}
+        self._spots = {call.underlying: spots[call.underlying]}
+        index_token = next(token for token, name in index_tokens.items() if name == call.underlying)
+        self._index_tokens = {index_token: call.underlying}
         self._chain = tuple(
             row
             for row in self._options
-            if row.underlying == selected.underlying and row.expiry == selected.expiry and _classified_ok(self.classifier, row)
+            if row.underlying == call.underlying and row.expiry == call.expiry and _classified_ok(self.classifier, row)
         )
         self._instruments = [_catalog_row(self.classifier, row) for row in self._chain]
-        self._symbol_ids = {str(selected.instrument_token): selected.tradingsymbol}
-        self._desired = (selected.tradingsymbol,)
+        self._symbol_ids = {
+            str(call.instrument_token): call.tradingsymbol,
+            str(put.instrument_token): put.tradingsymbol,
+        }
+        self._desired = (call.tradingsymbol, put.tradingsymbol)
         try:
-            self.transport.subscribe((index_token, selected.instrument_token), mode="full")
+            self.transport.subscribe(
+                (index_token, call.instrument_token, put.instrument_token),
+                mode="full",
+            )
         except GrowConfigError as exc:
             self._error = "SUBSCRIPTION_FAILED"
             self._state = SessionHealth.DEGRADED
@@ -591,9 +649,9 @@ class KiteMarketProvider:
         self.subscription_events.append(
             {
                 "type": "SUBSCRIBE",
-                "symbols": [selected.tradingsymbol],
-                "instrument_token": selected.instrument_token,
-                "count": 1,
+                "symbols": [call.tradingsymbol, put.tradingsymbol],
+                "instrument_tokens": [call.instrument_token, put.instrument_token],
+                "count": 2,
                 "timestamp": self.clock.now().isoformat(),
             }
         )
@@ -660,6 +718,7 @@ class KiteMarketProvider:
         saw_option = False
         saw_index = False
         index_time: datetime | None = None
+        event_time: datetime | None = None
         for tick in ticks:
             if tick.instrument_token in self._index_tokens:
                 if tick.last_price is not None:
@@ -673,22 +732,23 @@ class KiteMarketProvider:
             if quote is None:
                 continue
             self._quote = quote
+            self._side_quotes[quote.option_type] = quote
             saw_option = True
-        if saw_option and self._quote is not None:
-            return self._assemble(self._quote.quote_time, include_quote=True)
+            if event_time is None or quote.quote_time > event_time:
+                event_time = quote.quote_time
+        if saw_option and event_time is not None:
+            return self._assemble(event_time, include_quote=True)
         if saw_index:
             event_time = index_time if index_time is not None and index_time <= self.clock.now() else self.clock.now()
             return self._assemble(event_time, include_quote=False)
         return self._control("UNSUPPORTED_MESSAGE")
 
     def _option_quote(self, tick: MarketTick) -> NormalizedOptionQuote | None:
-        if self.selected is None or tick.exchange_timestamp is None:
-            return None
-        if tick.instrument_token != self.selected.instrument_token:
+        row = self._contracts.get(tick.instrument_token)
+        if row is None or tick.exchange_timestamp is None:
             return None
         if not tick.tradable or tick.mode != "full":
             return None
-        row = self.selected
         expiry = row.expiry.isoformat()
         canonical = f"{row.underlying}-{expiry}-{int(row.strike)}-{row.option_type}"
         if canonical == row.tradingsymbol:
@@ -739,7 +799,12 @@ class KiteMarketProvider:
                     "expiry_class": classified.expiry_class,
                 }
             )
-        quotes = [self._quote.to_stream_quote()] if include_quote and self._quote is not None else []
+        quotes = []
+        if include_quote:
+            for side in ("CE", "PE"):
+                quote = self._side_quotes.get(side)
+                if quote is not None and quote.quote_time <= event_time:
+                    quotes.append(quote.to_stream_quote())
         if self._state is SessionHealth.READY:
             self._state = SessionHealth.RUNNING
         self._last_at = event_time
