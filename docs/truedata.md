@@ -99,7 +99,10 @@ Precedence:
    weekday of the month, holiday-adjusted to the previous session).
 3. Provider vs calendar disagreement → `UNKNOWN` + `CLASSIFICATION_CONFLICT`.
 4. No schedule for the underlying → `UNKNOWN` + `CLASSIFIER_NOT_READY`.
-5. Anything else → `UNKNOWN` + `UNKNOWN_EXPIRY_CLASS`.
+5. Expiry year not covered by the loaded calendar (`nse.fo.2026.v1` covers
+   2026 only) → `UNKNOWN` + `CALENDAR_UNSUPPORTED_YEAR`. The 2026 holiday
+   list is never reused for 2027+ and holidays are never guessed.
+6. Anything else → `UNKNOWN` + `UNKNOWN_EXPIRY_CLASS`.
 
 | Result | Eligible for 2I selection / live subscription |
 |---|---|

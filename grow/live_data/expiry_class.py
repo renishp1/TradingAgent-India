@@ -4,6 +4,10 @@ Provider metadata wins when it is WEEKLY/MONTHLY and agrees with the versioned
 calendar. Calendar classifies a date only when it is a scheduled weekly or
 monthly expiry under an explicit per-underlying weekday policy. Anything else
 stays UNKNOWN and is ineligible for live subscription.
+
+The loaded F&O holiday calendar is year-scoped. An expiry whose year is not in
+the loaded calendar stays UNKNOWN. The classifier does not guess holidays or
+reuse another year's calendar.
 """
 
 from __future__ import annotations
@@ -16,7 +20,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from grow.clock import IST, Clock, FrozenClock
 from grow.live_data.catalog import KNOWN_EXPIRY_CLASSES, UNKNOWN_EXPIRY_CLASS
-from grow.market.fo_calendar import FO_CALENDAR_VERSION, FO_HOLIDAYS_2026
+from grow.market.fo_calendar import FO_CALENDAR_VERSION, FO_CALENDAR_YEARS, FO_HOLIDAYS_2026
 
 POLICY_VERSION = "expiry.class.nse.v2"
 CALENDAR_VERSION = FO_CALENDAR_VERSION
@@ -31,10 +35,12 @@ RULE_CONFLICT = "expiry.class.conflict.v1"
 RULE_UNSUPPORTED = "expiry.class.unsupported.v1"
 RULE_UNKNOWN = "expiry.class.unknown.v1"
 RULE_NOT_READY = "expiry.class.not_ready.v1"
+RULE_UNSUPPORTED_YEAR = "expiry.class.unsupported_year.v1"
 
 CLASSIFICATION_CONFLICT = "CLASSIFICATION_CONFLICT"
 CLASSIFIER_NOT_READY = "CLASSIFIER_NOT_READY"
 PROVIDER_CLASS_UNSUPPORTED = "PROVIDER_CLASS_UNSUPPORTED"
+CALENDAR_UNSUPPORTED_YEAR = "CALENDAR_UNSUPPORTED_YEAR"
 
 TUESDAY = 1
 
@@ -142,12 +148,14 @@ class ExpiryClassifier:
         clock: Clock | None = None,
         policy_version: str = POLICY_VERSION,
         calendar_version: str = CALENDAR_VERSION,
+        supported_years: Iterable[int] | None = None,
     ) -> None:
         self.schedules = tuple(schedules if schedules is not None else default_expiry_schedules())
         self.holidays = frozenset(holidays if holidays is not None else FO_HOLIDAYS_2026)
         self.clock = clock or FrozenClock(datetime.now(tz=IST))
         self.policy_version = policy_version
         self.calendar_version = calendar_version
+        self.supported_years = frozenset(supported_years if supported_years is not None else FO_CALENDAR_YEARS)
         self._cache: dict[tuple[Any, ...], ExpiryClassification] = {}
 
     def schedule_for(self, underlying: str, day: date) -> ExpirySchedule | None:
@@ -156,6 +164,9 @@ class ExpiryClassifier:
             if row.canonical_symbol == name and row.active_on(day):
                 return row
         return None
+
+    def supports_year(self, year: int) -> bool:
+        return year in self.supported_years
 
     def invalidate(self) -> None:
         self._cache.clear()
@@ -179,6 +190,7 @@ class ExpiryClassifier:
             self.policy_version,
             self.calendar_version,
             frozenset(self.holidays),
+            frozenset(self.supported_years),
         )
         cached = self._cache.get(cache_key)
         if cached is not None:
@@ -227,7 +239,6 @@ class ExpiryClassifier:
                 None,
             )
         schedule = self.schedule_for(canonical_symbol, valid_for)
-        calendar_class = None if schedule is None else self._calendar_class(schedule, expiry)
         raw = None if provider_class in (None, "") else str(provider_class).strip().upper()
         provider_valid = raw in KNOWN_EXPIRY_CLASSES
         provider_malformed = raw is not None and not provider_valid
@@ -243,9 +254,23 @@ class ExpiryClassifier:
                 provider_symbol,
                 canonical_symbol,
                 raw,
-                calendar_class,
+                None,
             )
-        if provider_valid and calendar_class is not None and provider_valid and raw != calendar_class:
+        if not self.supports_year(expiry.year):
+            return self._result(
+                UNKNOWN_EXPIRY_CLASS,
+                RULE_UNSUPPORTED_YEAR,
+                NONE,
+                classified_at,
+                valid_for,
+                CALENDAR_UNSUPPORTED_YEAR,
+                provider_symbol,
+                canonical_symbol,
+                raw,
+                None,
+            )
+        calendar_class = self._calendar_class(schedule, expiry)
+        if provider_valid and calendar_class is not None and raw != calendar_class:
             return self._result(
                 UNKNOWN_EXPIRY_CLASS,
                 RULE_CONFLICT,
@@ -313,6 +338,8 @@ class ExpiryClassifier:
         )
 
     def _calendar_class(self, schedule: ExpirySchedule, expiry: date) -> str | None:
+        if not self.supports_year(expiry.year):
+            return None
         monthlies = set()
         for year, month in _adjacent_months(expiry.year, expiry.month):
             marked = self._monthly_date(year, month, schedule.monthly_weekday)
@@ -328,10 +355,15 @@ class ExpiryClassifier:
         return None
 
     def _monthly_date(self, year: int, month: int, weekday: int | None) -> date | None:
-        if weekday is None:
+        if weekday is None or year not in self.supported_years:
             return None
         raw = last_weekday_of_month(year, month, weekday)
-        return previous_session_day(raw, self.holidays)
+        if raw.year not in self.supported_years:
+            return None
+        adjusted = previous_session_day(raw, self._holidays_for_year(year))
+        if adjusted is None or adjusted.year not in self.supported_years:
+            return None
+        return adjusted
 
     def _weekly_dates(self, around: date, weekday: int) -> set[date]:
         start = around.replace(day=1) - timedelta(days=7)
@@ -342,12 +374,18 @@ class ExpiryClassifier:
         found: set[date] = set()
         cursor = start
         while cursor < end:
-            if cursor.weekday() == weekday:
-                adjusted = previous_session_day(cursor, self.holidays)
-                if adjusted is not None:
+            if cursor.weekday() == weekday and cursor.year in self.supported_years:
+                adjusted = previous_session_day(cursor, self._holidays_for_year(cursor.year))
+                if adjusted is not None and adjusted.year in self.supported_years:
                     found.add(adjusted)
             cursor += timedelta(days=1)
         return found
+
+    def _holidays_for_year(self, year: int) -> frozenset[date]:
+        """Never apply another year's holiday list as a stand-in calendar."""
+        if year not in self.supported_years:
+            return frozenset()
+        return frozenset(day for day in self.holidays if day.year == year)
 
     def _result(
         self,
@@ -372,6 +410,7 @@ class ExpiryClassifier:
                 "rule_id": rule_id,
                 "policy_version": self.policy_version,
                 "calendar_version": self.calendar_version,
+                "supported_years": sorted(self.supported_years),
                 "valid_for_date": valid_for.isoformat(),
             }
         )

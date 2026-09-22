@@ -21,6 +21,7 @@ from grow.history.universe import (
 from grow.live_data.catalog import UNKNOWN_EXPIRY_CLASS
 from grow.live_data.expiry_class import (
     CALENDAR,
+    CALENDAR_UNSUPPORTED_YEAR,
     CALENDAR_VERSION,
     CLASSIFICATION_CONFLICT,
     CLASSIFIER_NOT_READY,
@@ -37,6 +38,7 @@ from grow.live_data.models import CycleStatus
 from grow.live_data.truedata import TrueDataAdapter
 from grow.market.fo_calendar import (
     FO_CALENDAR_VERSION,
+    FO_CALENDAR_YEARS,
     FO_EXCLUDED_DATES_2026,
     FO_HOLIDAYS_2026,
     FO_WEEKEND_OBSERVANCES_2026,
@@ -67,6 +69,9 @@ MAHAVIR_PREV = date(2026, 3, 30)
 HOLI = date(2026, 3, 3)
 HOLI_PREV = date(2026, 3, 2)
 GANESH = date(2026, 9, 14)
+NIFTY_2027_WEEKLY = date(2027, 9, 21)
+NIFTY_2027_MONTHLY = date(2027, 9, 28)
+NIFTY_2027_SHIFTED = date(2027, 9, 27)
 
 
 def _classify(**kwargs):
@@ -285,6 +290,7 @@ class FoCalendarTests(unittest.TestCase):
         self.assertNotIn("nse.session.cash", source)
         default = ExpiryClassifier(clock=FrozenClock(AS_OF))
         self.assertEqual(default.holidays, FO_HOLIDAYS_2026)
+        self.assertEqual(default.supported_years, FO_CALENDAR_YEARS)
         self.assertNotEqual(default.holidays, CASH_HOLIDAYS_2026)
 
     def test_ordinary_tuesday_is_weekly_for_nifty(self) -> None:
@@ -318,6 +324,94 @@ class FoCalendarTests(unittest.TestCase):
         self.assertEqual(_class_of("NIFTY", MAHAVIR, classifier=cash).expiry_class, "MONTHLY")
         self.assertEqual(_class_of("NIFTY", MAHAVIR).expiry_class, UNKNOWN_EXPIRY_CLASS)
         self.assertEqual(_class_of("NIFTY", MAHAVIR_PREV).expiry_class, "MONTHLY")
+
+
+class UnsupportedYearTests(unittest.TestCase):
+    def test_2026_nifty_weekly_and_monthly_unchanged(self) -> None:
+        weekly = _class_of("NIFTY", NIFTY_WEEKLY)
+        monthly = _class_of("NIFTY", NIFTY_MONTHLY)
+        self.assertEqual(weekly.expiry_class, "WEEKLY")
+        self.assertEqual(weekly.evidence_source, CALENDAR)
+        self.assertEqual(weekly.calendar_version, "nse.fo.2026.v1")
+        self.assertEqual(monthly.expiry_class, "MONTHLY")
+        self.assertEqual(monthly.evidence_source, CALENDAR)
+
+    def test_2027_nifty_expiry_is_unknown_with_2026_calendar(self) -> None:
+        classifier = ExpiryClassifier(clock=FrozenClock(AS_OF))
+        self.assertEqual(classifier.calendar_version, "nse.fo.2026.v1")
+        self.assertEqual(classifier.supported_years, frozenset({2026}))
+        for expiry, provider_class in (
+            (NIFTY_2027_WEEKLY, None),
+            (NIFTY_2027_MONTHLY, None),
+            (NIFTY_2027_WEEKLY, "WEEKLY"),
+            (NIFTY_2027_MONTHLY, "MONTHLY"),
+        ):
+            result = _class_of("NIFTY", expiry, classifier=classifier, provider_class=provider_class)
+            self.assertEqual(result.expiry_class, UNKNOWN_EXPIRY_CLASS, expiry.isoformat())
+            self.assertEqual(result.diagnostic, CALENDAR_UNSUPPORTED_YEAR, expiry.isoformat())
+            self.assertEqual(result.evidence_source, NONE, expiry.isoformat())
+            self.assertNotEqual(result.expiry_class, "WEEKLY")
+            self.assertNotEqual(result.expiry_class, "MONTHLY")
+
+    def test_2027_holiday_adjustment_is_never_attempted_with_2026_holidays(self) -> None:
+        from grow.live_data import expiry_class as expiry_mod
+
+        planted = FO_HOLIDAYS_2026 | {NIFTY_2027_MONTHLY}
+        classifier = ExpiryClassifier(
+            clock=FrozenClock(AS_OF),
+            holidays=planted,
+            calendar_version=FO_CALENDAR_VERSION,
+        )
+        original = expiry_mod.previous_session_day
+
+        def guarded(day: date, holidays) -> date | None:
+            self.assertNotEqual(day.year, 2027, f"holiday-adjusted {day.isoformat()}")
+            for item in holidays:
+                self.assertNotEqual(item.year, 2027, f"used {item.isoformat()} from another year")
+            return original(day, holidays)
+
+        expiry_mod.previous_session_day = guarded
+        try:
+            monthly_like = _class_of("NIFTY", NIFTY_2027_MONTHLY, classifier=classifier)
+            shifted_like = _class_of("NIFTY", NIFTY_2027_SHIFTED, classifier=classifier)
+            weekly_like = _class_of("NIFTY", NIFTY_2027_WEEKLY, classifier=classifier)
+            self.assertIsNone(classifier._calendar_class(classifier.schedules[0], NIFTY_2027_MONTHLY))
+            self.assertIsNone(classifier._calendar_class(classifier.schedules[0], NIFTY_2027_WEEKLY))
+        finally:
+            expiry_mod.previous_session_day = original
+        for result in (monthly_like, shifted_like, weekly_like):
+            self.assertEqual(result.expiry_class, UNKNOWN_EXPIRY_CLASS)
+            self.assertEqual(result.diagnostic, CALENDAR_UNSUPPORTED_YEAR)
+            self.assertEqual(result.evidence_source, NONE)
+            self.assertNotEqual(result.expiry_class, "WEEKLY")
+            self.assertNotEqual(result.expiry_class, "MONTHLY")
+
+    def test_2027_unknown_is_excluded_from_truedata_subscription(self) -> None:
+        adapter = TrueDataAdapter(
+            events=(),
+            catalog=[
+                {"provider_symbol": "NIFTY 50", "lot_size": None},
+                {"provider_symbol": "NIFTY26092225000CE", "lot_size": 75, "expiry": NIFTY_WEEKLY, "option_type": "CE"},
+                {"provider_symbol": "NIFTY27092125000CE", "lot_size": 75, "expiry": NIFTY_2027_WEEKLY, "option_type": "CE"},
+                {"provider_symbol": "NIFTY27092825000CE", "lot_size": 75, "expiry": NIFTY_2027_MONTHLY, "option_type": "CE"},
+            ],
+            settings=_settings(),
+            clock=FrozenClock(AS_OF),
+        )
+        adapter._spots["NIFTY"] = 25000.0
+        adapter.connect()
+        by_symbol = {row["provider_symbol"]: row for row in adapter.instrument_catalog()}
+        self.assertEqual(by_symbol["NIFTY26092225000CE"]["expiry_class"], "WEEKLY")
+        self.assertEqual(by_symbol["NIFTY27092125000CE"]["expiry_class"], UNKNOWN_EXPIRY_CLASS)
+        self.assertEqual(by_symbol["NIFTY27092125000CE"]["classification"]["diagnostic"], CALENDAR_UNSUPPORTED_YEAR)
+        self.assertEqual(by_symbol["NIFTY27092825000CE"]["expiry_class"], UNKNOWN_EXPIRY_CLASS)
+        self.assertEqual(by_symbol["NIFTY27092825000CE"]["classification"]["diagnostic"], CALENDAR_UNSUPPORTED_YEAR)
+        self.assertTrue(any("NIFTY26092225000CE" in symbol for symbol in adapter._desired))
+        self.assertFalse(any("NIFTY27092125000CE" in symbol for symbol in adapter._desired))
+        self.assertFalse(any("NIFTY27092825000CE" in symbol for symbol in adapter._desired))
+        counts = classification_counts(adapter.instrument_catalog())
+        self.assertGreaterEqual(counts["unknown"], 2)
+        self.assertGreaterEqual(counts["excluded"], 2)
 
 
 class PolicyIntegrationTests(unittest.TestCase):

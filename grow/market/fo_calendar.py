@@ -3,6 +3,10 @@
 Source: NSE circular NSE/FAOP/71777 dated 12 December 2025.
 This is not the cash-session approximation in grow.market.session, and it is
 not the F&O settlement-holiday list (NCL/CMPT/71923).
+
+This calendar covers 2026 only. A classifier must not apply these holidays to
+any other year, guess missing years, or silently reuse this list as a prior-year
+fallback.
 """
 
 from __future__ import annotations
@@ -11,6 +15,7 @@ from datetime import date
 
 FO_CALENDAR_VERSION = "nse.fo.2026.v1"
 FO_HOLIDAY_CIRCULAR = "NSE/FAOP/71777"
+FO_CALENDAR_YEARS = frozenset({2026})
 
 # Official 2026 NSE F&O trading holidays (NSE/FAOP/71777).
 # Weekend-only observances are omitted: 2026-02-15, 2026-03-21, 2026-08-15,
