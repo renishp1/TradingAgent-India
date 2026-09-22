@@ -9,7 +9,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from grow.clock import IST, FrozenClock
-from grow.config import load_config
+from grow.config import apply_paper_capital_profile, load_config
 from grow.decision.aggregation.debate import DebateSummary
 from grow.decision.contracts.agent_result import AgentResult, AgentStatus, CandidateAction
 from grow.decision.integration.contract import IntegratedDecisionStatus
@@ -20,8 +20,10 @@ from grow.market_data.normalized.models import DataQualityStatus, OptionQuoteVie
 from grow.market_data.snapshots.builder import build_fixture_snapshot
 from grow.orchestration.models import AggregateAnalysisPackage
 from grow.paper.engine import PaperExecutionEngine
-from grow.paper.fills import simulate_fill
+from grow.paper.fills import LTP_RESEARCH_FILL_MODEL, policy_from_config, simulate_fill
 from grow.paper.positions import PositionState
+from grow.paper.quotes import live_snapshot_from_agent
+from grow.paper.exits import ExitReason
 
 from tests.helpers import TEST_RISK_SECRET, make_guard
 
@@ -46,6 +48,7 @@ def _quote(as_of, **overrides):
         quote_age_seconds=0.0,
         provider_contract_id="RELIANCE-2500-CE",
         quality=DataQualityStatus.OK,
+        lot_size=1,
     )
     payload.update(overrides)
     return OptionQuoteView(**payload)
@@ -432,7 +435,7 @@ class PaperExecutionTests(unittest.TestCase):
             prices.append(order.execution_price)
             slips.append(order.slippage)
             self.assertEqual(order.price_source, "ASK")
-            self.assertEqual(order.slippage_model_version, "paper.fill.configurable.v1")
+            self.assertEqual(order.slippage_model_version, "paper.fills.configurable.v1")
             self.assertEqual(order.fee_model_version, "costs.india.fn_o.v1")
             self.assertIn("brokerage_per_order", order.fee_assumptions)
         self.assertEqual(prices[0], prices[1])
@@ -493,12 +496,16 @@ class PaperExecutionTests(unittest.TestCase):
         self.assertTrue(engine.execute(decision, snap, package=package).accepted)
         fills_before = len(engine.ledger.book.fills)
         clock.advance(timedelta(seconds=31))
-        reasons = engine.on_snapshot(_snapshot(AS_OF + timedelta(minutes=1)))
+        # Timeout with unavailable/stale quote: stop entries, mark unresolved, do not fabricate close.
+        stale = _snapshot(AS_OF + timedelta(minutes=1), quality=DataQualityStatus.STALE)
+        reasons = engine.on_snapshot(stale)
         self.assertIn("SESSION_TIMEOUT", reasons)
+        self.assertIn("DATA_STALE", reasons)
         position = engine.positions.open_positions()[0]
         self.assertEqual(position.state, PositionState.OPEN)
         self.assertIn("SESSION_TIMEOUT_WITH_OPEN_POSITION", position.diagnostics)
         self.assertTrue(engine.positions.halted)
+        self.assertTrue(engine.positions.unresolved_close)
         self.assertEqual(len(engine.ledger.book.fills), fills_before)
         self.assertIsNone(position.closed_at)
 
@@ -615,6 +622,310 @@ class FillModelUnitTests(unittest.TestCase):
             ),
             "FUTURE_PRICE",
         )
+
+
+class PaperTimeoutRecoveryTests(unittest.TestCase):
+    def test_timeout_with_no_open_position(self) -> None:
+        config = replace(_config(), live_data=replace(_config().live_data, session_timeout_seconds=30))
+        clock = FrozenClock(AS_OF)
+        engine = PaperExecutionEngine(config, clock=clock, risk_secret=TEST_RISK_SECRET)
+        clock.advance(timedelta(seconds=31))
+        reasons = engine.on_snapshot(_snapshot(AS_OF + timedelta(minutes=1)))
+        self.assertIn("SESSION_TIMEOUT", reasons)
+        self.assertEqual(engine.positions.open_positions(), ())
+        self.assertTrue(engine.positions.halted)
+        snap = _snapshot(AS_OF + timedelta(minutes=2))
+        decision, package = _approved(config, clock, snap, cycle_id="cycle-to-block")
+        blocked = engine.execute(decision, snap, package=package)
+        self.assertFalse(blocked.accepted)
+        self.assertEqual(blocked.reason, "SESSION_TIMEOUT")
+
+    def test_timeout_unavailable_quote_then_fresh_recovery_closes(self) -> None:
+        config = replace(_config(), live_data=replace(_config().live_data, session_timeout_seconds=30))
+        clock = FrozenClock(AS_OF)
+        engine = PaperExecutionEngine(config, clock=clock, risk_secret=TEST_RISK_SECRET)
+        snap = _snapshot()
+        decision, package = _approved(config, clock, snap, cycle_id="cycle-to-rec")
+        self.assertTrue(engine.execute(decision, snap, package=package).accepted)
+        clock.advance(timedelta(seconds=31))
+        stale = _snapshot(AS_OF + timedelta(minutes=1), quality=DataQualityStatus.STALE)
+        first = engine.on_snapshot(stale)
+        self.assertIn("SESSION_TIMEOUT", first)
+        self.assertIn("DATA_STALE", first)
+        open_pos = engine.positions.open_positions()[0]
+        self.assertEqual(open_pos.state, PositionState.OPEN)
+        self.assertTrue(engine.positions.unresolved_close)
+        fills_before = len(engine.ledger.book.fills)
+
+        recover_at = AS_OF + timedelta(minutes=5)
+        recovered = engine.on_snapshot(
+            _snapshot(recover_at, quotes=(_quote(recover_at, ltp=105.0, bid=105.0, ask=106.0),))
+        )
+        self.assertIn(ExitReason.SESSION_TIMEOUT, recovered)
+        self.assertEqual(engine.positions.open_positions(), ())
+        closed = engine.positions.all()[0]
+        self.assertEqual(closed.state, PositionState.CLOSED)
+        self.assertEqual(closed.exit_reason, ExitReason.SESSION_TIMEOUT)
+        self.assertFalse(engine.positions.unresolved_close)
+        self.assertTrue(engine.positions.halted)
+        self.assertEqual(len(engine.ledger.book.fills), fills_before + 1)
+        kinds = [row.kind for row in engine.journal.records]
+        self.assertIn("REJECTION", kinds)
+        self.assertIn("FILL", kinds)
+        self.assertTrue(any(row.payload.get("reason") == "TIMEOUT_RECOVERY_CLOSED" for row in engine.journal.records))
+        summary = engine.positions.summary()
+        self.assertAlmostEqual(summary.net_realized_pnl, summary.gross_realized_pnl - summary.total_costs)
+
+    def test_timeout_recovery_no_duplicate_close(self) -> None:
+        config = replace(_config(), live_data=replace(_config().live_data, session_timeout_seconds=30))
+        clock = FrozenClock(AS_OF)
+        engine = PaperExecutionEngine(config, clock=clock, risk_secret=TEST_RISK_SECRET)
+        snap = _snapshot()
+        decision, package = _approved(config, clock, snap, cycle_id="cycle-to-dup")
+        self.assertTrue(engine.execute(decision, snap, package=package).accepted)
+        clock.advance(timedelta(seconds=31))
+        engine.on_snapshot(_snapshot(AS_OF + timedelta(minutes=1), quality=DataQualityStatus.STALE))
+        recover_at = AS_OF + timedelta(minutes=5)
+        engine.on_snapshot(_snapshot(recover_at, quotes=(_quote(recover_at, ltp=105.0, bid=105.0, ask=106.0),)))
+        fills = len(engine.ledger.book.fills)
+        engine.on_snapshot(
+            _snapshot(recover_at + timedelta(minutes=1), quotes=(_quote(recover_at + timedelta(minutes=1), ltp=104.0, bid=104.0, ask=105.0),))
+        )
+        self.assertEqual(len(engine.ledger.book.fills), fills)
+        self.assertEqual(engine.positions.summary().closes, 1)
+        recovery_rows = [row for row in engine.journal.records if row.payload.get("reason") == "TIMEOUT_RECOVERY_CLOSED"]
+        self.assertEqual(len(recovery_rows), 1)
+        sell_fills = [row for row in engine.journal.records if row.kind == "FILL" and row.payload.get("side") == "SELL"]
+        self.assertEqual(len(sell_fills), 1)
+
+
+class PaperLotSizeTests(unittest.TestCase):
+    def test_nifty_real_lot_size_one_and_multiple_lots(self) -> None:
+        config = _config(max_per_trade_risk=100_000, max_open_positions=2)
+        config = replace(config, market=replace(config.market, universe=(*config.market.universe, "NIFTY")))
+        engine, clock = _engine(config)
+        lot_size = 75
+        quote = _quote(
+            AS_OF,
+            underlying="NIFTY",
+            strike=25000.0,
+            option_type="CE",
+            provider_contract_id="NIFTY-25000-CE",
+            lot_size=lot_size,
+            open_interest=1200,
+            volume=400,
+        )
+        snap = build_fixture_snapshot(
+            underlying="NIFTY",
+            as_of=AS_OF,
+            spot=25000.0,
+            option_contracts=(quote,),
+        )
+        decision, package = _approved(
+            config,
+            clock,
+            snap,
+            instrument="NIFTY-25000-CE",
+            cycle_id="cycle-nifty-1",
+            metrics=_metrics(underlying="NIFTY", lots=1, quantity=75, limit_price=100.0, stop_loss=80.0),
+        )
+        result = engine.execute(decision, snap, package=package)
+        self.assertTrue(result.accepted, result.reason)
+        position = engine.positions.open_positions()[0]
+        self.assertEqual(position.lot_size, 75)
+        self.assertEqual(position.lots, 1)
+        self.assertEqual(position.quantity, 75)
+        order = engine.orders()[0]
+        self.assertEqual(order.lot_size, 75)
+        self.assertEqual(order.lots, 1)
+        self.assertEqual(order.quantity, 75)
+        fill = next(row for row in engine.journal.records if row.kind == "FILL")
+        self.assertEqual(fill.payload["lot_size"], 75)
+        self.assertEqual(fill.payload["lots"], 1)
+        self.assertEqual(fill.payload["quantity"], 75)
+        self.assertEqual(fill.payload["notional"], round(75 * fill.payload["execution_price"], 2))
+        self.assertEqual(engine.ledger.book.positions[order.symbol].quantity, 75)
+
+        engine2, clock2 = _engine(config)
+        decision2, package2 = _approved(
+            config,
+            clock2,
+            snap,
+            instrument="NIFTY-25000-CE",
+            cycle_id="cycle-nifty-2",
+            metrics=_metrics(underlying="NIFTY", lots=2, quantity=150, limit_price=100.0, stop_loss=80.0),
+        )
+        result2 = engine2.execute(decision2, snap, package=package2)
+        self.assertTrue(result2.accepted, result2.reason)
+        pos2 = engine2.positions.open_positions()[0]
+        self.assertEqual(pos2.lot_size, 75)
+        self.assertEqual(pos2.lots, 2)
+        self.assertEqual(pos2.quantity, 150)
+        close_at = datetime(2026, 9, 22, 15, 20, tzinfo=IST)
+        engine2.on_snapshot(
+            build_fixture_snapshot(
+                underlying="NIFTY",
+                as_of=close_at,
+                spot=25000.0,
+                option_contracts=(_quote(close_at, underlying="NIFTY", strike=25000.0, provider_contract_id="NIFTY-25000-CE", lot_size=75, ltp=110.0, bid=110.0, ask=111.0),),
+            )
+        )
+        closed = engine2.positions.all()[0]
+        self.assertEqual(closed.state, PositionState.CLOSED)
+        self.assertAlmostEqual(closed.realized_gross, round((110.0 - closed.entry_price) * 150, 4))
+
+    def test_missing_lot_size_rejects(self) -> None:
+        config = _config()
+        engine, clock = _engine(config)
+        snap = _snapshot(quotes=(_quote(AS_OF, lot_size=None),))
+        decision, package = _approved(config, clock, snap, cycle_id="cycle-nolot", metrics=_metrics(quantity=1))
+        result = engine.execute(decision, snap, package=package)
+        self.assertFalse(result.accepted)
+        self.assertEqual(result.reason, "MISSING_LOT_SIZE")
+        self.assertEqual(engine.positions.open_positions(), ())
+
+    def test_no_hardcoded_lot_size_one_in_paper_execution(self) -> None:
+        root = ROOT / "grow" / "paper"
+        for path in root.glob("*.py"):
+            text = path.read_text(encoding="utf-8")
+            self.assertNotIn("lot_size=1", text.replace(" ", ""), msg=str(path))
+
+
+class PaperProvenanceTests(unittest.TestCase):
+    def test_fixture_and_live_provenance_preserved(self) -> None:
+        fixture = _snapshot()
+        self.assertTrue(fixture.is_fixture)
+        live_like = type(fixture)(
+            snapshot_id=fixture.snapshot_id,
+            version=fixture.version,
+            schema=fixture.schema,
+            provider="kite_market",
+            exchange=fixture.exchange,
+            session_timestamp=fixture.session_timestamp,
+            decision_timestamp=fixture.decision_timestamp,
+            session_date=fixture.session_date,
+            underlyings=fixture.underlyings,
+            option_contracts=(
+                _quote(
+                    AS_OF,
+                    open_interest=555,
+                    volume=321,
+                    previous_open_interest=500,
+                    implied_volatility=0.18,
+                    delta=0.45,
+                    gamma=0.01,
+                    theta=-0.02,
+                    vega=0.12,
+                    expiry_class="WEEKLY",
+                    lot_size=1,
+                ),
+            ),
+            data_quality=fixture.data_quality,
+            quality_notes=fixture.quality_notes,
+            source_snapshot_ids=fixture.source_snapshot_ids,
+            diagnostics={"fixture": False, "adapter_version": "kite.v9"},
+            paper_mode=True,
+            live_trading=False,
+            is_fixture=False,
+        )
+        mapped = live_snapshot_from_agent(live_like, sequence=7)
+        chain = mapped.chains["RELIANCE"]
+        self.assertFalse(chain.is_fixture)
+        self.assertEqual(mapped.provider_id, "kite_market")
+        self.assertEqual(mapped.adapter_version, "kite.v9")
+        self.assertEqual(mapped.snapshot_id, live_like.snapshot_id)
+        self.assertTrue(chain.provider_metadata["paper_execution"])
+        self.assertFalse(chain.provider_metadata["live_trading"])
+        self.assertFalse(chain.provider_metadata["broker_order_path"])
+        contract = chain.contracts[0]
+        self.assertEqual(contract.open_interest, 555)
+        self.assertEqual(contract.volume, 321)
+        self.assertEqual(contract.previous_open_interest, 500)
+        self.assertEqual(contract.implied_volatility, 0.18)
+        self.assertEqual(contract.delta, 0.45)
+        self.assertEqual(contract.gamma, 0.01)
+        self.assertEqual(contract.theta, -0.02)
+        self.assertEqual(contract.vega, 0.12)
+        self.assertEqual(contract.provider_contract_id, "RELIANCE-2500-CE")
+        self.assertEqual(contract.timestamp, AS_OF)
+
+        fixture_mapped = live_snapshot_from_agent(fixture, sequence=1)
+        self.assertTrue(fixture_mapped.chains["RELIANCE"].is_fixture)
+
+
+class PaperCapitalAndPriceModeTests(unittest.TestCase):
+    def test_india_index_options_paper_10k_profile(self) -> None:
+        config = apply_paper_capital_profile(load_config(), "INDIA_INDEX_OPTIONS_PAPER_10K")
+        self.assertEqual(config.paper.starting_cash, 10_000)
+        self.assertEqual(config.risk.max_daily_loss, 2_000)
+        self.assertEqual(config.risk.max_per_trade_risk, 1_000)
+        self.assertEqual(config.risk.max_open_positions, 2)
+        self.assertEqual(config.paper.capital_profile, "INDIA_INDEX_OPTIONS_PAPER_10K")
+        # Global defaults remain unchanged when profile is not applied.
+        baseline = load_config()
+        self.assertEqual(baseline.paper.starting_cash, 1_000_000)
+        engine, clock = _engine(config)
+        self.assertEqual(engine.positions.starting_cash, 10_000)
+        snap = _snapshot()
+        # Notional 100 exceeds max_per_trade_risk? 1 * 100 = 100 < 1000 — allowed.
+        decision, package = _approved(config, clock, snap, cycle_id="cycle-10k")
+        self.assertTrue(engine.execute(decision, snap, package=package).accepted)
+        # Second open blocked by max_open_positions=2 only after two opens; craft a second instrument.
+        snap2 = _snapshot(quotes=(_quote(AS_OF, strike=2600.0, provider_contract_id="RELIANCE-2600-CE"),))
+        # Need fresh engine state with two positions capacity — open second then third blocked.
+        decision2, package2 = _approved(
+            config,
+            clock,
+            snap2,
+            instrument="RELIANCE-2600-CE",
+            cycle_id="cycle-10k-b",
+            metrics=_metrics(limit_price=100.0, stop_loss=80.0, quantity=1),
+        )
+        self.assertTrue(engine.execute(decision2, snap2, package=package2).accepted)
+        snap3 = _snapshot(quotes=(_quote(AS_OF, strike=2700.0, provider_contract_id="RELIANCE-2700-CE"),))
+        decision3, package3 = _approved(
+            config,
+            clock,
+            snap3,
+            instrument="RELIANCE-2700-CE",
+            cycle_id="cycle-10k-c",
+            metrics=_metrics(limit_price=100.0, stop_loss=80.0, quantity=1),
+        )
+        blocked = engine.execute(decision3, snap3, package=package3)
+        self.assertFalse(blocked.accepted)
+        self.assertEqual(blocked.reason, "MAX_POSITIONS")
+
+    def test_execution_price_modes(self) -> None:
+        conservative = replace(
+            _config(),
+            paper=replace(_config().paper, price_mode="conservative", slippage_bps=10, fill_model="configurable"),
+        )
+        policy = policy_from_config(conservative)
+        self.assertEqual(policy.entry_source, "ASK")
+        self.assertEqual(policy.exit_source, "BID")
+        self.assertEqual(policy.version, "paper.fills.conservative.v1")
+        engine, clock = _engine(conservative)
+        snap = _snapshot()
+        decision, package = _approved(conservative, clock, snap, cycle_id="cycle-cons")
+        result = engine.execute(decision, snap, package=package)
+        self.assertTrue(result.accepted, result.reason)
+        order = engine.orders()[0]
+        self.assertEqual(order.price_source, "ASK")
+        fill = next(row for row in engine.journal.records if row.kind == "FILL")
+        self.assertEqual(fill.payload["price_source"], "ASK")
+        self.assertIn("reference_price", fill.payload)
+        self.assertEqual(fill.payload["fill_model_version"], "paper.fills.conservative.v1")
+        self.assertEqual(fill.payload["slippage_bps"], 10)
+
+        mid = replace(_config(), paper=replace(_config().paper, price_mode="midpoint", slippage_bps=0, fill_model="configurable"))
+        mid_policy = policy_from_config(mid)
+        self.assertEqual(mid_policy.entry_source, "MIDPOINT")
+        self.assertEqual(mid_policy.exit_source, "MIDPOINT")
+
+        ltp = replace(_config(), paper=replace(_config().paper, price_mode="ltp", slippage_bps=0, fill_model="configurable"))
+        ltp_policy = policy_from_config(ltp)
+        self.assertTrue(ltp_policy.research_only)
+        self.assertEqual(ltp_policy.version, LTP_RESEARCH_FILL_MODEL)
 
 
 if __name__ == "__main__":

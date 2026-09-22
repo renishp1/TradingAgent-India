@@ -213,8 +213,11 @@ class PaperExecutionEngine:
 
         requested = _float_metric(decision, "limit_price")
         stop = _float_metric(decision, "stop_loss")
-        quantity = _int_metric(decision, "quantity")
-        if requested is None or requested <= 0 or stop is None or stop <= 0 or quantity is None or quantity < 1:
+        sizing = _resolve_sizing(decision, quote)
+        if isinstance(sizing, str):
+            return self._reject(decision, snapshot, outputs, sizing, moment)
+        lot_size, lots, quantity = sizing
+        if requested is None or requested <= 0 or stop is None or stop <= 0:
             return self._reject(decision, snapshot, outputs, "INCOMPLETE_CANDIDATE", moment)
         ticker = contract_id(quote)
         if self.positions.has_open(ticker):
@@ -230,7 +233,18 @@ class PaperExecutionEngine:
             model_version=self.policy.version,
         )
         if isinstance(simulated, str):
-            return self._reject(decision, snapshot, outputs, simulated, moment, quote=quote, requested=requested, quantity=quantity)
+            return self._reject(
+                decision,
+                snapshot,
+                outputs,
+                simulated,
+                moment,
+                quote=quote,
+                requested=requested,
+                quantity=quantity,
+                lot_size=lot_size,
+                lots=lots,
+            )
         if stop >= simulated.price:
             return self._reject(
                 decision,
@@ -241,6 +255,8 @@ class PaperExecutionEngine:
                 quote=quote,
                 requested=requested,
                 quantity=quantity,
+                lot_size=lot_size,
+                lots=lots,
                 simulated=simulated,
             )
 
@@ -250,6 +266,8 @@ class PaperExecutionEngine:
             quote=quote,
             ticker=ticker,
             quantity=quantity,
+            lot_size=lot_size,
+            lots=lots,
             requested=requested,
             simulated=simulated,
             moment=moment,
@@ -308,8 +326,8 @@ class PaperExecutionEngine:
             strike=quote.strike,
             option_type=quote.option_type,
             provider_id=snapshot.provider,
-            lot_size=1,
-            lots=quantity,
+            lot_size=lot_size,
+            lots=lots,
             quantity=quantity,
             entry_price=fill.price,
             opened_at=fill.filled_at,
@@ -325,6 +343,7 @@ class PaperExecutionEngine:
             execution_price=fill.price,
             slippage=simulated.slippage,
             price_source=simulated.source,
+            reference_price=simulated.reference,
             position_id=position.position_id,
         )
         self._save(order)
@@ -334,7 +353,7 @@ class PaperExecutionEngine:
             decision=decision,
             snapshot=snapshot,
             agent_outputs=outputs,
-            payload=_fill_payload(order, simulated, fill),
+            payload=_fill_payload(order, simulated, fill, lot_size=lot_size, lots=lots, quantity=quantity),
         )
         order = replace(order, status=PaperLifecycle.OPEN.value, journal_record_id=filled_record.record_id)
         self._save(order)
@@ -344,7 +363,20 @@ class PaperExecutionEngine:
             decision=decision,
             snapshot=snapshot,
             agent_outputs=outputs,
-            payload={"position_id": position.position_id, "state": position.state.value, "order": order.to_dict()},
+            payload={
+                "position_id": position.position_id,
+                "state": position.state.value,
+                "underlying": quote.underlying,
+                "expiry": quote.expiry.isoformat(),
+                "strike": quote.strike,
+                "option_type": quote.option_type,
+                "provider_contract_id": quote.provider_contract_id,
+                "lot_size": lot_size,
+                "lots": lots,
+                "quantity": quantity,
+                "notional": expected_notional(quantity, fill.price),
+                "order": order.to_dict(),
+            },
         )
         self._journal(
             kind="OUTCOME",
@@ -358,14 +390,18 @@ class PaperExecutionEngine:
         return self._result("FILLED", decision, order, accepted=True, position_id=position.position_id)
 
     def on_snapshot(self, snapshot: AgentMarketSnapshot) -> tuple[str, ...]:
-        """Mark, exit, expire, and account. Stale data does not open or reprice."""
+        """Mark, exit, expire, and account. Stale data does not open or reprice.
+
+        Session timeout stops new entries and marks unresolved closes, but does
+        not permanently freeze recovery: when valid fresh quotes arrive, pending
+        closes are retried without fabricating prices.
+        """
         self._assert_runtime(snapshot)
         moment = snapshot.decision_timestamp.astimezone(IST)
         reasons: list[str] = []
-        if self._enforce_timeout(moment):
+        timed_out = self._enforce_timeout(moment)
+        if timed_out:
             reasons.append("SESSION_TIMEOUT")
-            self._journal_pnl(snapshot, None)
-            return tuple(reasons)
         if gate_snapshot_quality(snapshot) is not DataQualityStatus.OK:
             self._journal(
                 kind="REJECTION",
@@ -373,9 +409,10 @@ class PaperExecutionEngine:
                 decision=None,
                 snapshot=snapshot,
                 agent_outputs=(),
-                payload={"reason": "DATA_STALE", "scope": "MARK"},
+                payload={"reason": "DATA_STALE", "scope": "MARK", "timeout": timed_out},
             )
             reasons.append("DATA_STALE")
+            self._journal_pnl(snapshot, None)
             return tuple(reasons)
         for position in self.positions.open_positions():
             if position.expiry < snapshot.session_date:
@@ -383,19 +420,68 @@ class PaperExecutionEngine:
         live = live_snapshot_from_agent(snapshot, sequence=self._mark_sequence)
         self._mark_sequence += 1
         self.positions.mark(live)
-        for exit_decision in self.positions.exits(live):
-            position = self.positions.get(exit_decision.position_id)
-            if position is None or position.state is not PositionState.OPEN:
-                continue
-            reasons.append(
-                self._close_position(
-                    position,
-                    snapshot,
-                    exit_reason=exit_decision.reason,
+        if timed_out or (self._timeout_recorded and self.positions.unresolved_close):
+            recovery = self._retry_timeout_closes(snapshot)
+            reasons.extend(recovery)
+        else:
+            for exit_decision in self.positions.exits(live):
+                position = self.positions.get(exit_decision.position_id)
+                if position is None or position.state is not PositionState.OPEN:
+                    continue
+                reasons.append(
+                    self._close_position(
+                        position,
+                        snapshot,
+                        exit_reason=exit_decision.reason,
+                    )
                 )
-            )
         self._journal_pnl(snapshot, None)
         return tuple(reason for reason in reasons if reason)
+
+    def _retry_timeout_closes(self, snapshot: AgentMarketSnapshot) -> list[str]:
+        """After timeout, close remaining open inventory once fresh quotes exist."""
+        outcomes: list[str] = []
+        open_rows = list(self.positions.open_positions())
+        if not open_rows:
+            if self.positions.unresolved_close:
+                self.positions.unresolved_close = False
+                self._journal(
+                    kind="OUTCOME",
+                    timestamp=snapshot.decision_timestamp,
+                    decision=None,
+                    snapshot=snapshot,
+                    agent_outputs=(),
+                    payload={
+                        "reason": "TIMEOUT_RECOVERY_CLEAR",
+                        "unresolved_close": False,
+                        "halted": self.positions.halted,
+                    },
+                )
+            return outcomes
+        for position in open_rows:
+            if position.state is not PositionState.OPEN:
+                continue
+            result = self._close_position(position, snapshot, exit_reason=ExitReason.SESSION_TIMEOUT)
+            outcomes.append(result)
+        still_open = self.positions.open_positions()
+        if not still_open and any(item == ExitReason.SESSION_TIMEOUT for item in outcomes):
+            self.positions.unresolved_close = False
+            # Session halt remains: new entries stay blocked after timeout.
+            self.positions.halted = True
+            self._journal(
+                kind="OUTCOME",
+                timestamp=snapshot.decision_timestamp,
+                decision=None,
+                snapshot=snapshot,
+                agent_outputs=(),
+                payload={
+                    "reason": "TIMEOUT_RECOVERY_CLOSED",
+                    "unresolved_close": False,
+                    "halted": True,
+                    "closes": [item for item in outcomes if item == ExitReason.SESSION_TIMEOUT],
+                },
+            )
+        return outcomes
 
     def export_state(self) -> dict[str, Any]:
         """Replayable checkpoint. Journal rows are a copy, not a live alias."""
@@ -540,7 +626,7 @@ class PaperExecutionEngine:
         moment_clock = FrozenClock(moment)
         self.guard.clock = moment_clock
         self.ledger.clock = moment_clock
-        intent = Intent.SQUARE_OFF if exit_reason in {ExitReason.SESSION_CLOSE, "EXPIRED"} else Intent.CLOSE
+        intent = Intent.SQUARE_OFF if exit_reason in {ExitReason.SESSION_CLOSE, ExitReason.SESSION_TIMEOUT, "EXPIRED"} else Intent.CLOSE
         proposal = TradeProposal(
             proposal_id=f"px-{position.position_id}-{exit_reason}",
             symbol=Symbol(position.contract_id),
@@ -618,11 +704,17 @@ class PaperExecutionEngine:
             payload={
                 "side": "SELL",
                 "execution_price": fill.price,
+                "reference_price": simulated.reference,
                 "price_source": simulated.source,
                 "slippage": simulated.slippage,
                 "slippage_bps": simulated.slippage_bps,
                 "slippage_model_version": simulated.model_version,
+                "fill_model_version": simulated.model_version,
                 "fee_model_version": self.costs.version,
+                "lot_size": position.lot_size,
+                "lots": position.lots,
+                "quantity": position.quantity,
+                "notional": expected_notional(position.quantity, fill.price),
                 "quote_timestamp": simulated.quote_timestamp.isoformat(),
                 "fill_timestamp": fill.filled_at.isoformat(),
             },
@@ -673,7 +765,7 @@ class PaperExecutionEngine:
             self.positions.abort_exit(position.position_id, reason)
         else:
             position.diagnostics.append(reason)
-        if exit_reason in {ExitReason.SESSION_CLOSE, "EXPIRED"}:
+        if exit_reason in {ExitReason.SESSION_CLOSE, ExitReason.SESSION_TIMEOUT, "EXPIRED"}:
             self.positions.unresolved_close = True
             self.positions.halted = True
         order = self._order_for_position(position.position_id)
@@ -700,6 +792,8 @@ class PaperExecutionEngine:
         quote=None,
         requested: float | None = None,
         quantity: int | None = None,
+        lot_size: int | None = None,
+        lots: int | None = None,
         simulated: FillSimulation | None = None,
     ) -> PaperExecutionResult:
         order = self._new_order(
@@ -708,6 +802,8 @@ class PaperExecutionEngine:
             quote=quote,
             ticker=contract_id(quote) if quote is not None else (decision.candidate_instrument or decision.decision_id),
             quantity=quantity or 0,
+            lot_size=lot_size,
+            lots=lots,
             requested=requested,
             simulated=simulated,
             moment=moment,
@@ -776,6 +872,8 @@ class PaperExecutionEngine:
         requested: float | None,
         simulated: FillSimulation | None,
         moment: datetime,
+        lot_size: int | None = None,
+        lots: int | None = None,
     ) -> PaperOrder:
         paper_order_id = "po-" + digest_payload({"decision_id": decision.decision_id})
         fees = _fee_assumptions(self.costs)
@@ -788,15 +886,19 @@ class PaperExecutionEngine:
             instrument=decision.candidate_instrument or ticker,
             token=None if quote is None else quote.provider_contract_id,
             symbol=ticker,
+            underlying=None if quote is None else quote.underlying,
             expiry=None if quote is None else quote.expiry,
             strike=None if quote is None else quote.strike,
             option_type=None if quote is None else quote.option_type,
+            lot_size=lot_size,
+            lots=lots,
             quantity=quantity,
             side="BUY",
             direction=decision.direction,
             order_type="LIMIT",
             requested_price=requested,
             execution_price=None if simulated is None else simulated.price,
+            reference_price=None if simulated is None else simulated.reference,
             status=PaperLifecycle.CREATED.value,
             fill_status=FillStatus.UNFILLED.value,
             rejection_reason=None,
@@ -967,12 +1069,14 @@ class PaperExecutionEngine:
         if elapsed < self.config.live_data.session_timeout_seconds:
             return False
         if self._timeout_recorded:
+            # Still timed out — block new entries — but do not prevent close recovery.
             return True
         self._timeout_recorded = True
         if self.positions.open_positions():
             self.positions.halt_for_timeout()
             reason = "SESSION_TIMEOUT_WITH_OPEN_POSITION"
         else:
+            self.positions.halted = True
             reason = "SESSION_TIMEOUT"
         self._journal(
             kind="REJECTION",
@@ -1034,17 +1138,65 @@ def _fee_assumptions(costs: CostModel) -> dict[str, Any]:
     }
 
 
-def _fill_payload(order: PaperOrder, simulated: FillSimulation, fill: Fill) -> dict[str, Any]:
+def _resolve_sizing(decision: IntegratedDecision, quote) -> tuple[int, int, int] | str:
+    """lot_size from contract metadata; lots from decision; quantity = lot_size × lots."""
+    lot_size = quote.lot_size
+    metric_lot = _int_metric(decision, "lot_size")
+    if lot_size is None:
+        lot_size = metric_lot
+    elif metric_lot is not None and metric_lot != lot_size:
+        return "LOT_SIZE_MISMATCH"
+    if lot_size is None or lot_size < 1:
+        return "MISSING_LOT_SIZE"
+    lots = _int_metric(decision, "lots")
+    quantity_metric = _int_metric(decision, "quantity")
+    if lots is None:
+        # Backward-compatible: quantity means lots when lots is omitted.
+        if quantity_metric is None or quantity_metric < 1:
+            return "INCOMPLETE_CANDIDATE"
+        lots = quantity_metric
+        quantity = lots * lot_size
+    else:
+        if lots < 1:
+            return "INCOMPLETE_CANDIDATE"
+        quantity = lots * lot_size
+        if quantity_metric is not None and quantity_metric != quantity:
+            return "LOT_QUANTITY_MISMATCH"
+    if quantity != lots * lot_size or quantity < 1:
+        return "LOT_QUANTITY_MISMATCH"
+    return lot_size, lots, quantity
+
+
+def _fill_payload(
+    order: PaperOrder,
+    simulated: FillSimulation,
+    fill: Fill,
+    *,
+    lot_size: int,
+    lots: int,
+    quantity: int,
+) -> dict[str, Any]:
     return {
         "paper_order_id": order.paper_order_id,
         "requested_price": order.requested_price,
         "execution_price": fill.price,
+        "reference_price": simulated.reference,
         "price_source": simulated.source,
         "slippage": simulated.slippage,
         "slippage_bps": simulated.slippage_bps,
         "slippage_model_version": simulated.model_version,
+        "fill_model_version": simulated.model_version,
         "fee_model_version": order.fee_model_version,
         "fee_assumptions": dict(order.fee_assumptions),
+        "lot_size": lot_size,
+        "lots": lots,
+        "quantity": quantity,
+        "notional": expected_notional(quantity, fill.price),
+        "underlying": order.underlying,
+        "expiry": None if order.expiry is None else order.expiry.isoformat(),
+        "strike": order.strike,
+        "option_type": order.option_type,
+        "provider_contract_id": order.token,
         "quote_timestamp": simulated.quote_timestamp.isoformat(),
         "fill_timestamp": fill.filled_at.isoformat(),
         "fill_id": fill.fill_id,

@@ -91,6 +91,15 @@ class OptionQuoteView:
     quote_age_seconds: float | None
     provider_contract_id: str
     quality: DataQualityStatus
+    # Contract metadata preserved from the source when available.
+    lot_size: int | None = None
+    previous_open_interest: int | None = None
+    implied_volatility: float | None = None
+    delta: float | None = None
+    gamma: float | None = None
+    theta: float | None = None
+    vega: float | None = None
+    expiry_class: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -107,6 +116,14 @@ class OptionQuoteView:
             "quote_age_seconds": self.quote_age_seconds,
             "provider_contract_id": self.provider_contract_id,
             "quality": self.quality.value,
+            "lot_size": self.lot_size,
+            "previous_open_interest": self.previous_open_interest,
+            "implied_volatility": self.implied_volatility,
+            "delta": self.delta,
+            "gamma": self.gamma,
+            "theta": self.theta,
+            "vega": self.vega,
+            "expiry_class": self.expiry_class,
         }
 
 
@@ -130,6 +147,9 @@ class AgentMarketSnapshot:
     diagnostics: Mapping[str, Any]
     paper_mode: bool = True
     live_trading: bool = False
+    # Fixture vs live classification of the *market data* source.
+    # Paper execution is simulated; that does not make the quotes fixtures.
+    is_fixture: bool = False
 
     def __post_init__(self) -> None:
         if self.live_trading:
@@ -158,6 +178,7 @@ class AgentMarketSnapshot:
             "diagnostics": thaw_map(self.diagnostics),
             "paper_mode": True,
             "live_trading": False,
+            "is_fixture": self.is_fixture,
         }
 
 

@@ -12,9 +12,13 @@ from datetime import datetime
 from grow.clock import IST
 from grow.market_data.normalized.models import OptionQuoteView
 
-DETERMINISTIC_FILL_MODEL = "paper.fill.deterministic.v1"
-CONFIGURABLE_FILL_MODEL = "paper.fill.configurable.v1"
+DETERMINISTIC_FILL_MODEL = "paper.fills.deterministic.v1"
+CONFIGURABLE_FILL_MODEL = "paper.fills.configurable.v1"
+CONSERVATIVE_FILL_MODEL = "paper.fills.conservative.v1"
+MIDPOINT_FILL_MODEL = "paper.fills.midpoint.v1"
+LTP_RESEARCH_FILL_MODEL = "paper.fills.ltp.research.v1"
 PRICE_SOURCES = frozenset({"LTP", "BID", "ASK", "MIDPOINT"})
+PRICE_MODES = frozenset({"conservative", "midpoint", "ltp"})
 
 
 @dataclass(frozen=True)
@@ -26,9 +30,17 @@ class FillPolicy:
     entry_source: str
     exit_source: str
     slippage_bps: float
+    price_mode: str | None = None
+    research_only: bool = False
 
     @property
     def version(self) -> str:
+        if self.price_mode == "conservative":
+            return CONSERVATIVE_FILL_MODEL
+        if self.price_mode == "midpoint":
+            return MIDPOINT_FILL_MODEL
+        if self.price_mode == "ltp":
+            return LTP_RESEARCH_FILL_MODEL
         return DETERMINISTIC_FILL_MODEL if self.deterministic else CONFIGURABLE_FILL_MODEL
 
 
@@ -45,6 +57,41 @@ class FillSimulation:
 
 def policy_from_config(config) -> FillPolicy:
     paper = config.paper
+    price_mode = getattr(paper, "price_mode", None)
+    if price_mode:
+        mode = str(price_mode).strip().lower()
+        bps = paper.slippage_bps
+        if bps is None:
+            bps = 0.0 if mode != "conservative" else float(config.backtest.slippage_bps)
+        if mode == "conservative":
+            return FillPolicy(
+                model="configurable",
+                deterministic=False,
+                entry_source="ASK",
+                exit_source="BID",
+                slippage_bps=float(bps),
+                price_mode="conservative",
+            )
+        if mode == "midpoint":
+            return FillPolicy(
+                model="configurable",
+                deterministic=False,
+                entry_source="MIDPOINT",
+                exit_source="MIDPOINT",
+                slippage_bps=float(bps if bps is not None else 0.0),
+                price_mode="midpoint",
+            )
+        if mode == "ltp":
+            # Research/test only — not a realistic fill assumption.
+            return FillPolicy(
+                model="configurable",
+                deterministic=False,
+                entry_source="LTP",
+                exit_source="LTP",
+                slippage_bps=float(bps if bps is not None else 0.0),
+                price_mode="ltp",
+                research_only=True,
+            )
     deterministic = paper.fill_model == "deterministic"
     if deterministic:
         return FillPolicy(

@@ -61,6 +61,10 @@ class PaperOrder:
     position_id: str | None = None
     journal_record_id: str | None = None
     exit_reason: str | None = None
+    lot_size: int | None = None
+    lots: int | None = None
+    underlying: str | None = None
+    reference_price: float | None = None
     paper_mode: bool = True
     live_trading: bool = False
     broker_order_path: bool = False
@@ -83,20 +87,25 @@ class PaperOrder:
             "instrument": self.instrument,
             "token": self.token,
             "symbol": self.symbol,
+            "underlying": self.underlying,
             "expiry": None if self.expiry is None else self.expiry.isoformat(),
             "strike": self.strike,
             "option_type": self.option_type,
+            "lot_size": self.lot_size,
+            "lots": self.lots,
             "quantity": self.quantity,
             "side": self.side,
             "direction": self.direction,
             "order_type": self.order_type,
             "requested_price": self.requested_price,
             "execution_price": self.execution_price,
+            "reference_price": self.reference_price,
             "status": self.status,
             "fill_status": self.fill_status,
             "rejection_reason": self.rejection_reason,
             "fee_model_version": self.fee_model_version,
             "slippage_model_version": self.slippage_model_version,
+            "fill_model_version": self.slippage_model_version,
             "slippage_bps": self.slippage_bps,
             "slippage": self.slippage,
             "price_source": self.price_source,
@@ -146,6 +155,10 @@ class PaperOrder:
             position_id=None if payload.get("position_id") is None else str(payload["position_id"]),
             journal_record_id=None if payload.get("journal_record_id") is None else str(payload["journal_record_id"]),
             exit_reason=None if payload.get("exit_reason") is None else str(payload["exit_reason"]),
+            lot_size=None if payload.get("lot_size") is None else int(payload["lot_size"]),
+            lots=None if payload.get("lots") is None else int(payload["lots"]),
+            underlying=None if payload.get("underlying") is None else str(payload["underlying"]),
+            reference_price=None if payload.get("reference_price") is None else float(payload["reference_price"]),
             paper_mode=True,
             live_trading=False,
             broker_order_path=False,

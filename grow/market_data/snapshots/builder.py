@@ -100,7 +100,11 @@ def build_agent_snapshot(
             )
             if contract_quality is DataQualityStatus.STALE:
                 notes.append(f"STALE_OPTION:{contract.provider_contract_id}")
-            options.append(_option_from_contract(contract, age, contract_quality))
+            lot = live.lot_sizes.get(contract.provider_contract_id)
+            if lot is None:
+                ident = f"{contract.underlying}-{contract.expiry.isoformat()}-{int(contract.strike)}-{contract.option_type.value}"
+                lot = live.lot_sizes.get(ident)
+            options.append(_option_from_contract(contract, age, contract_quality, lot_size=lot))
 
     if not underlyings:
         quality = DataQualityStatus.INSUFFICIENT
@@ -119,6 +123,7 @@ def build_agent_snapshot(
             "sequence": live.sequence,
         }
     )
+    is_fixture = bool(live.chains) and all(chain.is_fixture for chain in live.chains.values())
     return AgentMarketSnapshot(
         snapshot_id=f"agent-{version}",
         version=version,
@@ -143,7 +148,9 @@ def build_agent_snapshot(
             "fresh_option_count": sum(
                 1 for row in options if row.quality is DataQualityStatus.OK
             ),
+            "fixture": is_fixture,
         },
+        is_fixture=is_fixture,
     )
 
 
@@ -191,6 +198,7 @@ def build_fixture_snapshot(
                 contract,
                 (decision_ts - contract.timestamp.astimezone(IST)).total_seconds(),
                 DataQualityStatus.OK,
+                lot_size=None,
             )
             for contract in chain.contracts
         )
@@ -232,6 +240,7 @@ def build_fixture_snapshot(
             ),
             **(diagnostics or {}),
         },
+        is_fixture=True,
     )
 
 
@@ -269,6 +278,8 @@ def _option_from_contract(
     contract: OptionContract,
     age: float,
     quality: DataQualityStatus,
+    *,
+    lot_size: int | None = None,
 ) -> OptionQuoteView:
     return OptionQuoteView(
         underlying=contract.underlying,
@@ -284,4 +295,12 @@ def _option_from_contract(
         quote_age_seconds=age,
         provider_contract_id=contract.provider_contract_id,
         quality=quality,
+        lot_size=lot_size,
+        previous_open_interest=contract.previous_open_interest,
+        implied_volatility=contract.implied_volatility,
+        delta=contract.delta,
+        gamma=contract.gamma,
+        theta=contract.theta,
+        vega=contract.vega,
+        expiry_class=contract.expiry_class.value if contract.expiry_class is not None else None,
     )

@@ -44,6 +44,10 @@ grow:
     fill_model: deterministic
     entry_price_source: LTP
     exit_price_source: BID
+    # Optional named modes: conservative | midpoint | ltp (ltp is research/test only).
+    # price_mode: conservative
+    # Optional named capital profile: INDIA_INDEX_OPTIONS_PAPER_10K (apply via apply_paper_capital_profile).
+    # capital_profile: INDIA_INDEX_OPTIONS_PAPER_10K
 
   model:
     provider: mock
