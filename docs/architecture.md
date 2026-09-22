@@ -10,6 +10,7 @@ Milestone 2H (provider evaluation, nearest weekly) lives in [`docs/provider.md`]
 Milestone 2I (dynamic index/expiry discovery) lives in [`docs/dynamic.md`](dynamic.md).
 Milestone 3A (live stream → paper) lives in [`docs/live_data.md`](live_data.md).
 Milestone 3B (paper MTM + exits) lives in [`docs/positions.md`](positions.md).
+Milestone 3C (TrueData live adapter) lives in [`docs/truedata.md`](truedata.md).
 
 ## Product split
 

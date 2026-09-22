@@ -263,6 +263,16 @@ class LiveDataConfig:
     session_close_square_off: bool
     position_exit_quote_source: str
     allow_trailing_stop: bool
+    mode: str
+    subscription_strike_window: int
+    max_symbols: int
+    reconnect_max_attempts: int
+    reconnect_max_backoff_seconds: int
+    truedata_username_env: str
+    truedata_password_env: str
+    truedata_endpoint: str
+    truedata_port: int
+    truedata_bid_ask: bool
 
 
 @dataclass(frozen=True)
@@ -385,10 +395,25 @@ class GrowConfig:
             raise GrowLiveTradingDisabled("live_data.live_trading must be false. Milestone 3A is paper only.")
         if not self.live_data.paper_mode:
             raise GrowConfigError("live_data.paper_mode must be true.")
-        if self.live_data.provider not in {"mock"}:
-            raise GrowConfigError("3A live_data.provider must be 'mock' until a vendor adapter is reviewed.")
-        if self.live_data.reconnect_policy != "fail_closed":
+        if self.live_data.provider not in {"mock", "truedata"}:
+            raise GrowConfigError("live_data.provider must be 'mock' or 'truedata'.")
+        if self.live_data.mode not in {"replay", "real"}:
+            raise GrowConfigError("live_data.mode must be replay or real.")
+        if self.live_data.provider == "mock" and self.live_data.reconnect_policy != "fail_closed":
             raise GrowConfigError("3A live_data.reconnect_policy must be fail_closed.")
+        if self.live_data.provider == "truedata" and self.live_data.reconnect_policy not in {
+            "fail_closed",
+            "bounded_backoff",
+        }:
+            raise GrowConfigError("3C truedata reconnect_policy must be fail_closed or bounded_backoff.")
+        if self.live_data.subscription_strike_window < 2:
+            raise GrowConfigError("live_data.subscription_strike_window must be >= 2 (2C uses ATM ±2).")
+        if self.live_data.max_symbols < 1:
+            raise GrowConfigError("live_data.max_symbols must be >= 1")
+        if self.live_data.reconnect_max_attempts < 1:
+            raise GrowConfigError("live_data.reconnect.max_attempts must be >= 1")
+        if self.live_data.reconnect_max_backoff_seconds < 1:
+            raise GrowConfigError("live_data.reconnect.max_backoff_seconds must be >= 1")
         if self.live_data.max_staleness_seconds < 1:
             raise GrowConfigError("live_data.max_staleness_seconds must be >= 1")
         if self.live_data.session_timeout_seconds < 1:
@@ -593,6 +618,12 @@ def _live_data_config(raw: dict[str, Any]) -> LiveDataConfig:
     allowed = raw.get("allowed_underlyings") or []
     if allowed and not isinstance(allowed, list):
         raise GrowConfigError("live_data.allowed_underlyings must be a list")
+    reconnect = raw.get("reconnect") or {}
+    if reconnect and not isinstance(reconnect, dict):
+        raise GrowConfigError("live_data.reconnect must be a mapping")
+    vendor = raw.get("truedata") or {}
+    if vendor and not isinstance(vendor, dict):
+        raise GrowConfigError("live_data.truedata must be a mapping")
     return LiveDataConfig(
         enabled=_as_bool(raw.get("enabled", False), "live_data.enabled"),
         provider=str(raw.get("provider", "mock")).lower(),
@@ -610,6 +641,18 @@ def _live_data_config(raw: dict[str, Any]) -> LiveDataConfig:
         session_close_square_off=_as_bool(raw.get("session_close_square_off", True), "live_data.session_close_square_off"),
         position_exit_quote_source=str(raw.get("position_exit_quote_source", "bid_then_ltp")).lower(),
         allow_trailing_stop=_as_bool(raw.get("allow_trailing_stop", False), "live_data.allow_trailing_stop"),
+        mode=str(raw.get("mode", "replay")).lower(),
+        subscription_strike_window=_as_int(raw.get("subscription_strike_window", 4), "live_data.subscription_strike_window"),
+        max_symbols=_as_int(raw.get("max_symbols", 50), "live_data.max_symbols"),
+        reconnect_max_attempts=_as_int(reconnect.get("max_attempts", 5), "live_data.reconnect.max_attempts"),
+        reconnect_max_backoff_seconds=_as_int(
+            reconnect.get("max_backoff_seconds", 30), "live_data.reconnect.max_backoff_seconds"
+        ),
+        truedata_username_env=str(vendor.get("username_env", "TRUEDATA_USERNAME")),
+        truedata_password_env=str(vendor.get("password_env", "TRUEDATA_PASSWORD")),
+        truedata_endpoint=str(vendor.get("endpoint", "push.truedata.in")),
+        truedata_port=_as_int(vendor.get("port", 8082), "live_data.truedata.port"),
+        truedata_bid_ask=_as_bool(vendor.get("bid_ask", True), "live_data.truedata.bid_ask"),
     )
 
 
@@ -653,6 +696,12 @@ def _overlay_env(raw: dict[str, Any], environ: dict[str, str]) -> dict[str, Any]
         live["live_trading"] = _parse_scalar(environ["GROW_LIVE_DATA_LIVE_TRADING"])
     if environ.get("GROW_LIVE_DATA_PAPER_MODE"):
         live["paper_mode"] = _parse_scalar(environ["GROW_LIVE_DATA_PAPER_MODE"])
+    if environ.get("LIVE_DATA_ENABLED"):
+        live["enabled"] = _parse_scalar(environ["LIVE_DATA_ENABLED"])
+    if environ.get("LIVE_DATA_PROVIDER"):
+        live["provider"] = environ["LIVE_DATA_PROVIDER"]
+    if environ.get("GROW_LIVE_DATA_MODE"):
+        live["mode"] = environ["GROW_LIVE_DATA_MODE"]
     return raw
 
 

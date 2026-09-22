@@ -197,6 +197,7 @@ grow:
   live_data:
     enabled: false
     provider: mock
+    mode: replay
     max_staleness_seconds: 30
     reconnect_policy: fail_closed
     session_timeout_seconds: 30
@@ -210,4 +211,15 @@ grow:
     session_close_square_off: true
     position_exit_quote_source: bid_then_ltp
     allow_trailing_stop: false
+    subscription_strike_window: 4
+    max_symbols: 50
+    reconnect:
+      max_attempts: 5
+      max_backoff_seconds: 30
+    truedata:
+      username_env: TRUEDATA_USERNAME
+      password_env: TRUEDATA_PASSWORD
+      endpoint: push.truedata.in
+      port: 8082
+      bid_ask: true
     # allowed_underlyings omitted: discover from the provider, overlay 2I

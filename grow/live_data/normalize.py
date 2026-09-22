@@ -17,19 +17,36 @@ from grow.data.schema import (
 )
 from grow.errors import GrowConfigError
 from grow.history.universe import default_index_registry, is_forbidden_instrument
-from grow.live_data.models import ADAPTER_VERSION, MOCK_PROVIDER_ID, SCHEMA, LiveSnapshot
+from grow.live_data.models import (
+    ADAPTER_VERSION,
+    APPROVED_STREAM_IDS,
+    MOCK_PROVIDER_ID,
+    SCHEMA,
+    TRUEDATA_PROVIDER_ID,
+    LiveSnapshot,
+)
 from grow.market.session import SessionCalendar
-from grow.options.models import ExpiryClass, OptionChainSnapshot, OptionContract, OptionExpiry, OptionType
+from grow.options.models import ExpiryClass, FieldSource, OptionChainSnapshot, OptionContract, OptionExpiry, OptionType
 from grow.types import SessionState, Symbol
 
-STREAM_META = SourceMeta(
-    name=MOCK_PROVIDER_ID,
-    vendor="grow-mock",
-    license="synthetic-stream-not-licensed",
-    is_live=True,
-    is_fixture=False,
-    schema=SCHEMA,
-)
+STREAM_META = {
+    MOCK_PROVIDER_ID: SourceMeta(
+        name=MOCK_PROVIDER_ID,
+        vendor="grow-mock",
+        license="synthetic-stream-not-licensed",
+        is_live=True,
+        is_fixture=False,
+        schema=SCHEMA,
+    ),
+    TRUEDATA_PROVIDER_ID: SourceMeta(
+        name=TRUEDATA_PROVIDER_ID,
+        vendor="truedata",
+        license="operator-subscription-not-in-repo",
+        is_live=True,
+        is_fixture=False,
+        schema=SCHEMA,
+    ),
+}
 
 
 def _aware(value: Any, label: str) -> datetime:
@@ -65,8 +82,9 @@ def normalize_event(
     provider = str(raw.get("provider") or "")
     if raw.get("is_fixture") is True or provider in {"fixture", "historical"}:
         raise GrowConfigError("FIXTURE_FALLBACK_FORBIDDEN")
-    if provider != MOCK_PROVIDER_ID:
+    if provider not in APPROVED_STREAM_IDS:
         raise GrowConfigError(f"PROVIDER_NOT_APPROVED:{provider}")
+    meta = STREAM_META[provider]
     if str(raw.get("source_timezone") or "Asia/Kolkata") != "Asia/Kolkata":
         raise GrowConfigError("SOURCE_TIMEZONE")
     if str(raw.get("instrument_type") or "OPTIDX") != "OPTIDX":
@@ -138,7 +156,7 @@ def normalize_event(
     chains: dict[str, OptionChainSnapshot] = {}
     lot_sizes: dict[str, int] = {}
     for symbol in underlyings:
-        chain, lots = _chain_for(symbol, event_time, spots.get(symbol), contracts_raw, quotes_by, raw)
+        chain, lots = _chain_for(symbol, event_time, spots.get(symbol), contracts_raw, quotes_by, raw, provider)
         chains[symbol] = chain
         lot_sizes.update(lots)
     market: dict[str, MarketSnapshot] = {}
@@ -173,13 +191,13 @@ def normalize_event(
                 last_bar_end=last_end,
                 notes=tuple(diagnostics),
             ),
-            source=STREAM_META,
+            source=meta,
         )
     snapshot_id = str(raw.get("snapshot_id") or _digest(f"{sequence}:{event_time.isoformat()}"))
     return LiveSnapshot(
         snapshot_id=snapshot_id,
         schema=SCHEMA,
-        provider_id=MOCK_PROVIDER_ID,
+        provider_id=provider,
         adapter_version=str(raw.get("adapter_version") or ADAPTER_VERSION),
         sequence=sequence,
         event_time=event_time,
@@ -209,6 +227,7 @@ def _chain_for(
     master: list[dict[str, Any]],
     quotes: dict[tuple[str, str, float, str], dict[str, Any]],
     raw: Mapping[str, Any],
+    provider: str,
 ) -> tuple[OptionChainSnapshot, dict[str, int]]:
     rows = [row for row in master if str(row.get("underlying")).upper() == symbol]
     contracts: list[OptionContract] = []
@@ -250,6 +269,12 @@ def _chain_for(
         bid = None if quote.get("bid") is None else float(quote["bid"])
         ask = None if quote.get("ask") is None else float(quote["ask"])
         ltp = None if quote.get("ltp") is None else float(quote["ltp"])
+        iv = None if quote.get("iv") in (None, "") else float(quote["iv"])
+        delta = None if quote.get("delta") in (None, "") else float(quote["delta"])
+        gamma = None if quote.get("gamma") in (None, "") else float(quote["gamma"])
+        theta = None if quote.get("theta") in (None, "") else float(quote["theta"])
+        vega = None if quote.get("vega") in (None, "") else float(quote["vega"])
+        greeks = (delta, gamma, theta, vega)
         contracts.append(
             OptionContract(
                 underlying=symbol,
@@ -263,13 +288,15 @@ def _chain_for(
                 volume=int(quote.get("volume") or 0),
                 open_interest=int(quote.get("oi") or 0),
                 previous_open_interest=None,
-                implied_volatility=None,
-                delta=None,
-                gamma=None,
-                theta=None,
-                vega=None,
+                implied_volatility=iv,
+                delta=delta,
+                gamma=gamma,
+                theta=theta,
+                vega=vega,
                 timestamp=ts,
                 provider_contract_id=provider_id,
+                iv_source=FieldSource.PROVIDER if iv is not None else FieldSource.UNAVAILABLE,
+                greek_source=FieldSource.PROVIDER if any(v is not None for v in greeks) else FieldSource.UNAVAILABLE,
             )
         )
     if spot is None:
@@ -282,8 +309,8 @@ def _chain_for(
         spot=spot,
         expiries=tuple(OptionExpiry(day, klass) for day, klass in sorted(expiries.items())),
         contracts=tuple(contracts),
-        source_id=MOCK_PROVIDER_ID,
+        source_id=provider,
         is_fixture=False,
-        provider_metadata={"provider": MOCK_PROVIDER_ID, "schema": SCHEMA},
+        provider_metadata={"provider": provider, "schema": SCHEMA},
     )
     return chain, lots

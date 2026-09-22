@@ -17,7 +17,7 @@ from grow.errors import GrowConfigError, GrowLiveTradingDisabled
 from grow.execution.lock import LIVE_TRADING_COMPILED, assert_paper_runtime
 from grow.history.universe import default_index_registry
 from grow.live_data.models import (
-    MOCK_PROVIDER_ID,
+    APPROVED_STREAM_IDS,
     CycleStatus,
     LiveCycleReport,
     LiveHealth,
@@ -148,7 +148,7 @@ class LivePaperLoop:
     def start(self) -> None:
         self._transition(SessionHealth.CONNECTING)
         self.provider.connect()
-        if self.provider.identity != MOCK_PROVIDER_ID:
+        if self.provider.identity not in APPROVED_STREAM_IDS:
             self._transition(SessionHealth.DEGRADED)
             raise GrowConfigError(f"PROVIDER_NOT_APPROVED:{self.provider.identity}")
         self._transition(SessionHealth.READY)
@@ -739,5 +739,14 @@ def _event_id(session_id: str, snapshot: LiveSnapshot, symbol: str, suffix: str)
 
 
 def open_loop(config: GrowConfig, *, clock: Clock | None = None, risk_secret: str | None = None, events=None) -> LivePaperLoop:
-    provider = open_provider(config.live_data.provider, events=events)
+    kwargs: dict[str, Any] = {}
+    if events is not None:
+        kwargs["events"] = events
+    if config.live_data.provider == "truedata":
+        from grow.live_data.truedata import settings_from_live_config
+
+        kwargs["settings"] = settings_from_live_config(config.live_data)
+        kwargs["clock"] = clock
+        kwargs["live_config"] = config.live_data
+    provider = open_provider(config.live_data.provider, **kwargs)
     return LivePaperLoop(config, provider, clock=clock, risk_secret=risk_secret)

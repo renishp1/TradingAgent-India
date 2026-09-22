@@ -1,0 +1,27 @@
+{
+  "note": "Sanitized TrueData-shaped vendor messages. Not a licensed feed. Not a 2E historical dataset.",
+  "usage": "ADAPTER_TESTING",
+  "ticks": [
+    {
+      "kind": "tick",
+      "symbol": "NIFTY 50",
+      "timestamp": "2026-09-18T11:00:00+05:30",
+      "ltp": 25040.0,
+      "bid": 25039.5,
+      "ask": 25040.5,
+      "sequence": 10
+    },
+    {
+      "kind": "tick",
+      "symbol": "NIFTY25092225000CE",
+      "timestamp": "2026-09-18T11:00:00+05:30",
+      "ltp": 80.0,
+      "bid": 79.5,
+      "ask": 80.5,
+      "oi": 5000,
+      "volume": 200,
+      "sequence": 11
+    },
+    "NIFTY25092225000PE,2026-09-18T11:00:00+05:30,70.0,10,70.1,150,69.0,71.0,68.5,69.8,4000,3900,10500,,12,69.5,40,70.5,35"
+  ]
+}

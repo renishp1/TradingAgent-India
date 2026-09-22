@@ -72,7 +72,6 @@ class ProviderTests(unittest.TestCase):
             ("grow.data.fixture.v1", "FIXTURE_FALLBACK_FORBIDDEN"),
             ("live.nse", "PROVIDER_NOT_APPROVED"),
             ("kite", "PROVIDER_NOT_APPROVED"),
-            ("truedata", "PROVIDER_NOT_APPROVED"),
         ):
             with self.assertRaises(GrowConfigError) as ctx:
                 open_provider(bad)

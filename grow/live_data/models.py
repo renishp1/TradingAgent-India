@@ -15,6 +15,8 @@ from grow.types import Fill, RiskVerdict
 SCHEMA = "grow.stream.snapshot.v1"
 ADAPTER_VERSION = "live_data.adapter.v1"
 MOCK_PROVIDER_ID = "grow.stream.mock.v1"
+TRUEDATA_PROVIDER_ID = "grow.stream.truedata.v1"
+APPROVED_STREAM_IDS = frozenset({MOCK_PROVIDER_ID, TRUEDATA_PROVIDER_ID})
 
 
 class SessionHealth(str, Enum):
@@ -41,6 +43,8 @@ class LiveHealth:
     last_message_at: datetime | None
     last_sequence: int | None
     error: str | None = None
+    reconnect_count: int = 0
+    subscribed: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -50,6 +54,8 @@ class LiveHealth:
             "last_message_at": None if self.last_message_at is None else self.last_message_at.isoformat(),
             "last_sequence": self.last_sequence,
             "error": self.error,
+            "reconnect_count": self.reconnect_count,
+            "subscribed": list(self.subscribed),
             "live_trading": False,
         }
 

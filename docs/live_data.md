@@ -46,6 +46,9 @@ No broker. No live trading. No 2A allow_live_feed flip.
 `paper_stream` is a paper-trading chain mode. It is not a broker venue and it
 cannot be selected unless `live_data.enabled=true`.
 
+Milestone 3C adds `live_data.provider=truedata` (`grow.stream.truedata.v1`).
+See [`docs/truedata.md`](truedata.md). Mock remains the CI default.
+
 A fixture or historical payload presented to the mock adapter fails closed
 with `FIXTURE_FALLBACK_FORBIDDEN`.
 
