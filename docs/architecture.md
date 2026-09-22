@@ -8,6 +8,7 @@ Review #1 findings live in [`docs/review-1.md`](review-1.md).
 Milestone 2A (data plane, fixture only) lives in [`docs/milestone-2a.md`](milestone-2a.md).
 Milestone 2H (provider evaluation, nearest weekly) lives in [`docs/provider.md`](provider.md).
 Milestone 2I (dynamic index/expiry discovery) lives in [`docs/dynamic.md`](dynamic.md).
+Milestone 3A (live stream → paper) lives in [`docs/live_data.md`](live_data.md).
 
 ## Product split
 

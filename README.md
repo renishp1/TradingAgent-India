@@ -23,7 +23,7 @@ still a constrained paper-trading foundation, not a desk.
 9. Automated tests.
 10. Architecture docs: [`docs/architecture.md`](docs/architecture.md), [`docs/safety.md`](docs/safety.md), [`docs/milestone-1.md`](docs/milestone-1.md).
 
-Options, live data, brokers, and LangGraph remain **out of scope**.
+Brokers, live order placement, and LangGraph remain **out of scope**.
 Milestone 2A is fixture market data ([`docs/milestone-2a.md`](docs/milestone-2a.md)).
 Milestone 2B is the quantitative strategy engine ([`docs/strategy.md`](docs/strategy.md)).
 Milestone 2C is the index-options research engine ([`docs/options.md`](docs/options.md)).
@@ -34,7 +34,8 @@ Milestone 2G is point-in-time historical data ([`docs/history.md`](docs/history.
 Milestone 2H is provider evaluation ([`docs/provider.md`](docs/provider.md)).
 Milestone 2I is dynamic index/expiry discovery ([`docs/dynamic.md`](docs/dynamic.md)).
 Milestone 2J is recorded historical provider integration ([`docs/integrate.md`](docs/integrate.md)).
-Do not attach a live vendor feed, live option chain, or broker.
+Milestone 3A is live market-data → paper trading ([`docs/live_data.md`](docs/live_data.md)).
+Do not attach a live broker or real-money execution.
 
 
 ## Layout
@@ -48,6 +49,7 @@ TradingAgent-India/
 │   ├── backtest/           # 2E fixture replay + walk-forward
 │   ├── director/           # 2F research plan / freeze / review
 │   ├── history/            # 2G point-in-time historical data
+│   ├── live_data/          # 3A mock stream → paper (no broker)
 │   ├── market/
 │   ├── options/            # 2C fixture chain; BUY CE/PE research only
 │   ├── strategies/         # 2B quant engine (signals only)

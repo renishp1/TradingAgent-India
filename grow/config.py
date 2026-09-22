@@ -246,6 +246,21 @@ class BacktestConfig:
 
 
 @dataclass(frozen=True)
+class LiveDataConfig:
+    enabled: bool
+    provider: str
+    max_staleness_seconds: int
+    reconnect_policy: str
+    session_timeout_seconds: int
+    snapshot_interval_seconds: int
+    require_option_chain: bool
+    paper_mode: bool
+    live_trading: bool
+    quantity: int
+    allowed_underlyings: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class ResearchDirectorConfig:
     enabled: bool
     provider: str
@@ -282,6 +297,7 @@ class GrowConfig:
     ai: AIConfig
     backtest: BacktestConfig
     research_director: ResearchDirectorConfig
+    live_data: LiveDataConfig
     source_path: str
 
     def assert_safe(self) -> None:
@@ -316,10 +332,12 @@ class GrowConfig:
             raise GrowConfigError("2B supported_timeframes must be M5, M15, D1.")
         if self.data.allow_options_chain or self.options.allow_live_chain:
             raise GrowConfigError("Live option chains are not attached.")
-        if self.options.provider not in {"fixture", "historical"}:
-            raise GrowConfigError("2C options.provider must be 'fixture' or 'historical'.")
+        if self.options.provider not in {"fixture", "historical", "paper_stream"}:
+            raise GrowConfigError("2C options.provider must be 'fixture', 'historical', or 'paper_stream'.")
         if self.options.provider == "live":
             raise GrowConfigError("Live option chains are not attached.")
+        if self.options.provider == "paper_stream" and not self.live_data.enabled:
+            raise GrowConfigError("options.provider=paper_stream requires live_data.enabled.")
         if self.options.preferred_expiry_class != "weekly":
             raise GrowConfigError("2C preferred_expiry_class is weekly.")
         if self.options.allow_same_day:
@@ -358,6 +376,27 @@ class GrowConfig:
             raise GrowConfigError("2F must reject test-window tuning.")
         if not self.research_director.require_approved_dataset:
             raise GrowConfigError("2F require_approved_dataset must be true.")
+        if self.live_data.live_trading:
+            raise GrowLiveTradingDisabled("live_data.live_trading must be false. Milestone 3A is paper only.")
+        if not self.live_data.paper_mode:
+            raise GrowConfigError("live_data.paper_mode must be true.")
+        if self.live_data.provider not in {"mock"}:
+            raise GrowConfigError("3A live_data.provider must be 'mock' until a vendor adapter is reviewed.")
+        if self.live_data.reconnect_policy != "fail_closed":
+            raise GrowConfigError("3A live_data.reconnect_policy must be fail_closed.")
+        if self.live_data.max_staleness_seconds < 1:
+            raise GrowConfigError("live_data.max_staleness_seconds must be >= 1")
+        if self.live_data.quantity < 1:
+            raise GrowConfigError("live_data.quantity (lots) must be >= 1")
+        if self.live_data.enabled:
+            if self.data.allow_live_feed:
+                raise GrowConfigError("3A must not flip data.allow_live_feed. live_data is a separate plane.")
+            if self.options.allow_live_chain:
+                raise GrowConfigError("options.allow_live_chain remains false. 3A uses paper_stream.")
+            if self.execution.live_trading_enabled:
+                raise GrowLiveTradingDisabled("live_data.enabled cannot combine with live trading.")
+            if self.ai.allow_broker or self.ai.allow_live_trading or self.ai.allow_ai_execution:
+                raise GrowConfigError("3A AI may not enable broker, live trading, or execution.")
 
 
 
@@ -529,6 +568,27 @@ def _director_config(raw: dict[str, Any], gov: dict[str, Any]) -> ResearchDirect
     )
 
 
+def _live_data_config(raw: dict[str, Any]) -> LiveDataConfig:
+    if not isinstance(raw, dict):
+        raise GrowConfigError("grow.live_data must be a mapping")
+    allowed = raw.get("allowed_underlyings") or []
+    if allowed and not isinstance(allowed, list):
+        raise GrowConfigError("live_data.allowed_underlyings must be a list")
+    return LiveDataConfig(
+        enabled=_as_bool(raw.get("enabled", False), "live_data.enabled"),
+        provider=str(raw.get("provider", "mock")).lower(),
+        max_staleness_seconds=_as_int(raw.get("max_staleness_seconds", 30), "live_data.max_staleness_seconds"),
+        reconnect_policy=str(raw.get("reconnect_policy", "fail_closed")).lower(),
+        session_timeout_seconds=_as_int(raw.get("session_timeout_seconds", 30), "live_data.session_timeout_seconds"),
+        snapshot_interval_seconds=_as_int(raw.get("snapshot_interval_seconds", 60), "live_data.snapshot_interval_seconds"),
+        require_option_chain=_as_bool(raw.get("require_option_chain", True), "live_data.require_option_chain"),
+        paper_mode=_as_bool(raw.get("paper_mode", True), "live_data.paper_mode"),
+        live_trading=_as_bool(raw.get("live_trading", False), "live_data.live_trading"),
+        quantity=_as_int(raw.get("quantity", 1), "live_data.quantity"),
+        allowed_underlyings=tuple(str(s).strip().upper() for s in allowed),
+    )
+
+
 def _overlay_env(raw: dict[str, Any], environ: dict[str, str]) -> dict[str, Any]:
     grow = raw.setdefault("grow", {})
     execution = grow.setdefault("execution", {})
@@ -537,6 +597,7 @@ def _overlay_env(raw: dict[str, Any], environ: dict[str, str]) -> dict[str, Any]
     model = grow.setdefault("model", {})
     ta = grow.setdefault("tradingagents", {})
     data = grow.setdefault("data", {})
+    live = grow.setdefault("live_data", {})
 
     if "GROW_EXECUTION_MODE" in environ and environ["GROW_EXECUTION_MODE"].strip():
         execution["mode"] = environ["GROW_EXECUTION_MODE"]
@@ -560,6 +621,14 @@ def _overlay_env(raw: dict[str, Any], environ: dict[str, str]) -> dict[str, Any]
         data["provider"] = environ["GROW_DATA_PROVIDER"]
     if environ.get("GROW_ALLOW_LIVE_FEED"):
         data["allow_live_feed"] = _parse_scalar(environ["GROW_ALLOW_LIVE_FEED"])
+    if environ.get("GROW_LIVE_DATA_ENABLED"):
+        live["enabled"] = _parse_scalar(environ["GROW_LIVE_DATA_ENABLED"])
+    if environ.get("GROW_LIVE_DATA_PROVIDER"):
+        live["provider"] = environ["GROW_LIVE_DATA_PROVIDER"]
+    if environ.get("GROW_LIVE_DATA_LIVE_TRADING"):
+        live["live_trading"] = _parse_scalar(environ["GROW_LIVE_DATA_LIVE_TRADING"])
+    if environ.get("GROW_LIVE_DATA_PAPER_MODE"):
+        live["paper_mode"] = _parse_scalar(environ["GROW_LIVE_DATA_PAPER_MODE"])
     return raw
 
 
@@ -653,6 +722,7 @@ def _build(raw: dict[str, Any], source_path: str) -> GrowConfig:
         ai=_ai_config(g.get("ai") or {}),
         backtest=_backtest_config(g.get("backtest") or {}),
         research_director=_director_config(g.get("research_director") or {}, g.get("research_governance") or {}),
+        live_data=_live_data_config(g.get("live_data") or {}),
         source_path=source_path,
     )
     config.assert_safe()

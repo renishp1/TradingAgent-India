@@ -193,3 +193,16 @@ grow:
     require_acceptance_rules: true
     require_test_freeze: true
     reject_test_window_tuning: true
+
+  live_data:
+    enabled: false
+    provider: mock
+    max_staleness_seconds: 30
+    reconnect_policy: fail_closed
+    session_timeout_seconds: 30
+    snapshot_interval_seconds: 60
+    require_option_chain: true
+    paper_mode: true
+    live_trading: false
+    quantity: 1
+    # allowed_underlyings omitted: discover from the provider, overlay 2I

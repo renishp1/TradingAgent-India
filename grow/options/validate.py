@@ -11,6 +11,7 @@ from grow.options.models import FieldSource, OptionChainSnapshot, OptionContract
 _VALID_SOURCE = frozenset({FieldSource.PROVIDER, FieldSource.COMPUTED})
 _INDEX = frozenset({"NIFTY", "BANKNIFTY"})
 _FORBIDDEN_UNDERLYING = frozenset({"RELIANCE", "TCS", "FUT", "FUTURES"})
+_CHAIN_PROVIDERS = frozenset({"fixture", "historical", "paper_stream"})
 
 
 def assert_ist(moment: datetime, field: str) -> None:
@@ -60,7 +61,14 @@ def validate_chain(
     kept: list[OptionContract] = []
     assert_ist(chain.as_of, "chain.as_of")
     assert_ist(as_of, "as_of")
-    if chain.underlying not in _INDEX:
+    if config.provider == "paper_stream":
+        from grow.history.universe import default_index_registry, is_forbidden_instrument
+
+        if is_forbidden_instrument(chain.underlying) or not default_index_registry().allows(chain.underlying):
+            return (), (RejectedContract(("*", "*", 0.0, "*"), f"UNSUPPORTED_UNDERLYING:{chain.underlying}"),), (
+                f"UNSUPPORTED_UNDERLYING:{chain.underlying}",
+            )
+    elif chain.underlying not in _INDEX:
         return (), (RejectedContract(("*", "*", 0.0, "*"), f"UNSUPPORTED_UNDERLYING:{chain.underlying}"),), (
             f"UNSUPPORTED_UNDERLYING:{chain.underlying}",
         )
@@ -68,7 +76,9 @@ def validate_chain(
         return (), (), ("LIVE_CHAIN_FORBIDDEN",)
     if config.provider == "fixture" and chain.is_fixture is False:
         return (), (), ("LIVE_CHAIN_FORBIDDEN",)
-    if config.provider not in {"fixture", "historical"}:
+    if config.provider == "paper_stream" and chain.is_fixture is True:
+        return (), (), ("FIXTURE_FALLBACK_FORBIDDEN",)
+    if config.provider not in _CHAIN_PROVIDERS:
         return (), (), ("LIVE_CHAIN_FORBIDDEN",)
     age = (as_of - chain.as_of).total_seconds() / 60.0
     if chain.as_of > as_of:
@@ -100,7 +110,12 @@ def _contract_reason(
 ) -> str | None:
     if contract.underlying != chain.underlying:
         return "UNDERLYING_MISMATCH"
-    if contract.underlying not in _INDEX:
+    if config.provider == "paper_stream":
+        from grow.history.universe import default_index_registry, is_forbidden_instrument
+
+        if is_forbidden_instrument(contract.underlying) or not default_index_registry().allows(contract.underlying):
+            return "UNSUPPORTED_UNDERLYING"
+    elif contract.underlying not in _INDEX:
         return "UNSUPPORTED_UNDERLYING"
     if contract.underlying in _FORBIDDEN_UNDERLYING:
         return "STOCK_OR_FUTURE"

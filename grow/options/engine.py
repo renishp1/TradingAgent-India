@@ -41,8 +41,8 @@ class IndexOptionsEngine:
         self.config = config or load_config()
         if self.config.options.allow_live_chain or self.config.options.provider == "live":
             raise GrowConfigError("Live option chains are not attached.")
-        if self.config.options.provider not in {"fixture", "historical"}:
-            raise GrowConfigError("2C only evaluates fixture or historical chains.")
+        if self.config.options.provider not in {"fixture", "historical", "paper_stream"}:
+            raise GrowConfigError("2C only evaluates fixture, historical, or paper_stream chains.")
 
     def evaluate(
         self,
