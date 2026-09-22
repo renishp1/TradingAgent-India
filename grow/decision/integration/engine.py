@@ -1,9 +1,13 @@
-"""Phase-4 Decision Engine — deterministic BUY_CE / BUY_PE / NO_TRADE surface.
+"""Phase-4/7 Decision Engine — BUY_CE / BUY_PE / NO_TRADE with campaign signal.
 
 Wraps ``DecisionIntegrator`` so Risk Guard remains the final safety authority.
-Phase 7 attaches a dedicated ``SignalEngine`` explanation (supporting +
-counter-evidence) without changing Risk Guard authority.
-Does not submit paper fills and does not call a broker.
+Phase 7 evaluates ``SignalEngine`` for explained supporting/counter-evidence, then
+attaches the ``CampaignSignal`` to the integrator decision.
+
+Order of authority:
+1. DecisionIntegrator + Risk Guard produce the authoritative decision.
+2. SignalEngine explains intent; it is never an execution authority.
+3. No paper fills and no broker order path live here.
 """
 
 from __future__ import annotations
@@ -27,7 +31,7 @@ from grow.risk.guard import RiskGuard
 
 
 class DecisionEngine:
-    """Named Phase-4 decision surface over the existing 4C integrator."""
+    """Named decision surface: integrator (Risk Guard) + SignalEngine explanation."""
 
     def __init__(
         self,
@@ -52,7 +56,6 @@ class DecisionEngine:
 
     @property
     def integrator(self) -> DecisionIntegrator:
-        """Compatibility access to the underlying 4C integrator."""
         return self._integrator
 
     @property
@@ -66,9 +69,16 @@ class DecisionEngine:
         package: AggregateAnalysisPackage,
         book: DecisionBookState | None = None,
     ) -> IntegratedDecision:
-        """Produce one auditable decision with explicit DecisionAction + campaign signal."""
-        signal = self._signal_engine.evaluate(snapshot=snapshot, package=package)
-        decision = self._integrator.integrate(snapshot=snapshot, package=package, book=book)
+        """Evaluate signal → integrate once (Risk Guard) → attach campaign_signal."""
+        signal = self._signal_engine.evaluate(
+            snapshot=snapshot,
+            package=package,
+        )
+        decision = self._integrator.integrate(
+            snapshot=snapshot,
+            package=package,
+            book=book,
+        )
         return self._with_signal(decision, signal)
 
     def explain(
@@ -77,17 +87,21 @@ class DecisionEngine:
         snapshot: AgentMarketSnapshot,
         package: AggregateAnalysisPackage,
     ) -> CampaignSignal:
-        """Signal-only evaluation (no Risk Guard). Useful for audit/tests."""
+        """Signal-only evaluation. Does not invoke Risk Guard or paper fills."""
         return self._signal_engine.evaluate(snapshot=snapshot, package=package)
 
     def replay(self, decision_id: str) -> IntegratedDecision:
-        """Replay integrator decision and re-attach deterministic campaign signal."""
+        """Replay integrator once, re-evaluate signal from audit record, attach."""
         record = self.audit.get(decision_id)
         decision = self._integrator.replay(decision_id)
-        signal = self._signal_engine.evaluate(snapshot=record.snapshot, package=record.package)
+        signal = self._signal_engine.evaluate(
+            snapshot=record.snapshot,
+            package=record.package,
+        )
         return self._with_signal(decision, signal)
 
     def _with_signal(self, decision: IntegratedDecision, signal: CampaignSignal) -> IntegratedDecision:
+        """Attach CampaignSignal explanation. Does not alter Risk Guard outcome."""
         evidence = dict(decision.calculated_evidence)
         evidence["campaign_signal"] = signal.to_dict()
         evidence["signal_engine_version"] = signal.engine_version

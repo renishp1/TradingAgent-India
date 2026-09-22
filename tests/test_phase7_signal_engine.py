@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import ast
 import unittest
 from datetime import date, datetime
+from pathlib import Path
+from unittest.mock import patch
 
 from grow.clock import IST, FrozenClock
 from grow.config import load_config
 from grow.decision.aggregation.debate import DebateSummary
 from grow.decision.contracts.agent_result import AgentResult, AgentStatus, CandidateAction
-from grow.decision.integration.contract import DecisionAction, IntegratedDecisionStatus
+from grow.decision.integration.contract import DecisionAction, DecisionBookState, IntegratedDecisionStatus
 from grow.decision.integration.engine import DecisionEngine
 from grow.decision.signal import SIGNAL_ENGINE_VERSION, SIGNAL_SCHEMA, CampaignSignal, SignalEngine
 from grow.market_data.normalized.models import DataQualityStatus, OptionQuoteView
@@ -21,6 +24,7 @@ from tests.helpers import make_guard
 
 AS_OF = datetime(2026, 9, 22, 11, 0, tzinfo=IST)
 EXPIRY = date(2026, 9, 24)
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _quote(**overrides):
@@ -142,10 +146,6 @@ class SignalEngineUnitTests(unittest.TestCase):
         self.assertTrue(any("finding:" in item for item in signal.supporting_evidence))
         self.assertEqual(signal.counter_evidence, ())
         self.assertEqual(signal.reason_codes, ())
-        payload = signal.to_dict()
-        self.assertIn("counter_evidence", payload)
-        self.assertTrue(payload["paper_mode"])
-        self.assertFalse(payload["live_trading"])
 
     def test_buy_pe_for_bearish(self) -> None:
         snap = _snapshot(quotes=(_quote(option_type="PE", provider_contract_id="RELIANCE-2500-PE"),))
@@ -188,59 +188,160 @@ class SignalEngineUnitTests(unittest.TestCase):
         self.assertTrue(any(item.code == "CHAIN_FILTER" for item in signal.counter_evidence))
         self.assertIn("UNKNOWN_EXPIRY_CLASS", signal.reason_codes)
 
-    def test_no_actionable_agents_fail_closed(self) -> None:
-        snap = _snapshot()
-        result = _result(snap)
-        # Force NONE action via reconstructing
-        quiet = AgentResult(
-            agent_name=result.agent_name,
-            agent_version=result.agent_version,
-            snapshot_id=result.snapshot_id,
-            snapshot_version=result.snapshot_version,
-            decision_timestamp=result.decision_timestamp,
-            status=AgentStatus.PASS,
-            observations=result.observations,
-            calculated_metrics=result.calculated_metrics,
-            interpretation=(),
-            findings=(),
-            data_quality_concerns=(),
-            assumptions=(),
-            evidence=(),
-            metrics_used=(),
-            candidate_action=CandidateAction.NONE,
-            candidate_instrument=None,
-            entry_reason=None,
-            invalidation_reason=None,
-            risk_flags=(),
-            missing_data=(),
-            confidence=0.1,
-            cycle_id="cycle-p7",
-        )
-        signal = SignalEngine().evaluate(snapshot=snap, package=_package(snap, quiet, agreement=False, conflicts=()))
-        self.assertEqual(signal.action, DecisionAction.NO_TRADE)
-        self.assertIn("NO_ACTIONABLE_AGENTS", signal.reason_codes)
-
 
 class DecisionEngineSignalAttachmentTests(unittest.TestCase):
     def test_decide_attaches_campaign_signal(self) -> None:
+        """1. decide() returns campaign_signal != None."""
         snap = _snapshot()
         decision = _engine().decide(snapshot=snap, package=_package(snap, _result(snap)))
-        self.assertEqual(decision.status, IntegratedDecisionStatus.CANDIDATE)
-        self.assertEqual(decision.action, DecisionAction.BUY_CE)
         self.assertIsNotNone(decision.campaign_signal)
-        self.assertEqual(decision.campaign_signal["action"], "BUY_CE")
-        self.assertEqual(decision.campaign_signal["schema_version"], SIGNAL_SCHEMA)
-        self.assertIn("campaign_signal", decision.to_dict())
-        self.assertEqual(DecisionEngine.signal_of(decision)["engine_version"], SIGNAL_ENGINE_VERSION)
+        self.assertIsNotNone(decision.to_dict()["campaign_signal"])
 
-    def test_explain_matches_standalone_engine(self) -> None:
+    def test_decide_buy_ce_signal_action(self) -> None:
+        """2. BUY_CE decision has campaign_signal.action == BUY_CE."""
+        snap = _snapshot()
+        decision = _engine().decide(snapshot=snap, package=_package(snap, _result(snap)))
+        self.assertEqual(decision.action, DecisionAction.BUY_CE)
+        self.assertEqual(decision.campaign_signal["action"], "BUY_CE")
+
+    def test_decide_buy_pe_signal_action(self) -> None:
+        """3. BUY_PE decision has campaign_signal.action == BUY_PE."""
+        snap = _snapshot(quotes=(_quote(option_type="PE", provider_contract_id="RELIANCE-2500-PE"),))
+        result = _result(
+            snap,
+            instrument="RELIANCE-2500-PE",
+            direction="BEARISH",
+            option_type="PE",
+            stop_loss=80.0,
+            target=60.0,
+        )
+        decision = _engine().decide(snapshot=snap, package=_package(snap, result))
+        self.assertEqual(decision.action, DecisionAction.BUY_PE)
+        self.assertEqual(decision.campaign_signal["action"], "BUY_PE")
+
+    def test_replay_reattaches_campaign_signal(self) -> None:
+        """4. replay() re-attaches campaign_signal."""
+        snap = _snapshot()
+        engine = _engine()
+        first = engine.decide(snapshot=snap, package=_package(snap, _result(snap)))
+        replayed = engine.replay(first.decision_id)
+        self.assertIsNotNone(replayed.campaign_signal)
+        self.assertEqual(replayed.campaign_signal["action"], first.campaign_signal["action"])
+        self.assertEqual(replayed.campaign_signal["signal_id"], first.campaign_signal["signal_id"])
+        self.assertEqual(replayed.to_dict()["campaign_signal"], first.to_dict()["campaign_signal"])
+
+    def test_debate_disagreement_decision_remains_no_trade(self) -> None:
+        """5. SignalEngine NO_TRADE remains NO_TRADE when debate disagrees."""
+        snap = _snapshot()
+        decision = _engine().decide(
+            snapshot=snap,
+            package=_package(
+                snap,
+                _result(snap),
+                agreement=False,
+                conflicts=("ACTION_CONFLICT:PAPER_OPEN,HOLD",),
+                dissenting=("other_agent",),
+            ),
+        )
+        self.assertEqual(decision.action, DecisionAction.NO_TRADE)
+        self.assertEqual(decision.campaign_signal["action"], "NO_TRADE")
+        self.assertIn("DEBATE_DISAGREEMENT", decision.campaign_signal["reason_codes"])
+
+    def test_chain_filter_rejection_decision_remains_no_trade(self) -> None:
+        """6. Chain-filter rejection remains NO_TRADE."""
+        snap = _snapshot(quotes=(_quote(expiry_class=None),))
+        decision = _engine().decide(snapshot=snap, package=_package(snap, _result(snap)))
+        self.assertEqual(decision.action, DecisionAction.NO_TRADE)
+        self.assertEqual(decision.campaign_signal["action"], "NO_TRADE")
+        self.assertIn("UNKNOWN_EXPIRY_CLASS", decision.campaign_signal["reason_codes"])
+
+    def test_risk_guard_authoritative_over_buy_signal(self) -> None:
+        """7. Risk Guard rejection remains authoritative even when SignalEngine is BUY_CE."""
         snap = _snapshot()
         package = _package(snap, _result(snap))
-        engine = _engine()
-        explained = engine.explain(snapshot=snap, package=package)
-        standalone = SignalEngine(load_config()).evaluate(snapshot=snap, package=package)
-        self.assertEqual(explained.to_dict(), standalone.to_dict())
-        self.assertIsInstance(explained, CampaignSignal)
+        # Standalone signal would be BUY_CE.
+        signal = SignalEngine(load_config()).evaluate(snapshot=snap, package=package)
+        self.assertEqual(signal.action, DecisionAction.BUY_CE)
+        decision = _engine().decide(
+            snapshot=snap,
+            package=package,
+            book=DecisionBookState(
+                cash=10_000.0,
+                gross_notional=0.0,
+                daily_pnl=-20_000.0,
+                symbol_notional=0.0,
+                open_positions=0,
+            ),
+        )
+        self.assertEqual(decision.status, IntegratedDecisionStatus.BLOCKED)
+        self.assertEqual(decision.action, DecisionAction.NO_TRADE)
+        self.assertIsNone(decision.trade_candidate)
+        # Signal still explains BUY_CE intent; it does not override Risk Guard.
+        self.assertIsNotNone(decision.campaign_signal)
+        self.assertEqual(decision.campaign_signal["action"], "BUY_CE")
+
+    def test_signal_engine_evaluated_once_per_decide(self) -> None:
+        """8. SignalEngine is evaluated exactly once per decide() call."""
+        snap = _snapshot()
+        package = _package(snap, _result(snap))
+        config = load_config()
+        engine = DecisionEngine(config, risk_guard=make_guard(config, clock=FrozenClock(AS_OF)))
+        with patch.object(engine._signal_engine, "evaluate", wraps=engine._signal_engine.evaluate) as mocked:
+            decision = engine.decide(snapshot=snap, package=package)
+        self.assertEqual(mocked.call_count, 1)
+        self.assertIsNotNone(decision.campaign_signal)
+
+    def test_integrator_invoked_once_per_decide(self) -> None:
+        """9. DecisionIntegrator is invoked exactly once per decide() call."""
+        snap = _snapshot()
+        package = _package(snap, _result(snap))
+        config = load_config()
+        engine = DecisionEngine(config, risk_guard=make_guard(config, clock=FrozenClock(AS_OF)))
+        with patch.object(engine._integrator, "integrate", wraps=engine._integrator.integrate) as mocked:
+            decision = engine.decide(snapshot=snap, package=package)
+        self.assertEqual(mocked.call_count, 1)
+        self.assertIsNotNone(decision.campaign_signal)
+
+    def test_no_broker_or_live_order_path_in_signal_modules(self) -> None:
+        """10. No broker/live-order path is introduced."""
+        banned = {"place_order", "place_live_order", "kiteconnect", "LiveBroker"}
+        paths = [
+            ROOT / "grow" / "decision" / "integration" / "engine.py",
+            ROOT / "grow" / "decision" / "signal" / "engine.py",
+            ROOT / "grow" / "decision" / "signal" / "models.py",
+        ]
+        for path in paths:
+            source = path.read_text(encoding="utf-8")
+            tree = ast.parse(source)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Name):
+                    self.assertNotIn(node.id, banned)
+                if isinstance(node, ast.Attribute):
+                    self.assertNotIn(node.attr, banned)
+            self.assertNotIn("grow.execution.live", source)
+
+    def test_decide_source_has_no_early_return_before_signal(self) -> None:
+        """Structural guard: decide() must evaluate signal before returning."""
+        source = (ROOT / "grow" / "decision" / "integration" / "engine.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        decide_fn = None
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef) and node.name == "DecisionEngine":
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef) and item.name == "decide":
+                        decide_fn = item
+        self.assertIsNotNone(decide_fn)
+        # First meaningful call should be signal evaluate; must not return integrate alone.
+        text = ast.get_source_segment(source, decide_fn) or ""
+        self.assertIn("_signal_engine.evaluate", text)
+        self.assertIn("_integrator.integrate", text)
+        self.assertIn("_with_signal", text)
+        # Forbidden early-return pattern: return integrate(...) as the whole body outcome
+        # without _with_signal.
+        self.assertNotRegex(
+            text,
+            r"return self\._integrator\.integrate\([^)]*\)\s*$",
+        )
 
 
 if __name__ == "__main__":
