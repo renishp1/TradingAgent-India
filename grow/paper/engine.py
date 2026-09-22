@@ -413,10 +413,20 @@ class PaperExecutionEngine:
         Session timeout stops new entries and marks unresolved closes, but does
         not permanently freeze recovery: when valid fresh quotes arrive, pending
         closes are retried without fabricating prices.
+
+        Every state-mutating return path checkpoints exactly once when
+        ``checkpoint_path`` is configured (including the early DATA_STALE exit).
         """
         self._assert_runtime(snapshot)
         moment = snapshot.decision_timestamp.astimezone(IST)
         reasons: list[str] = []
+
+        def _finish() -> tuple[str, ...]:
+            # Single checkpoint exit for all mutating returns from this method.
+            out = tuple(reason for reason in reasons if reason)
+            self.checkpoint()
+            return out
+
         timed_out = self._enforce_timeout(moment)
         if timed_out:
             reasons.append("SESSION_TIMEOUT")
@@ -431,9 +441,7 @@ class PaperExecutionEngine:
             )
             reasons.append("DATA_STALE")
             self._journal_pnl(snapshot, None)
-            reasons_out = tuple(reasons)
-            self.checkpoint()
-            return reasons_out
+            return _finish()
         for position in self.positions.open_positions():
             if position.expiry < snapshot.session_date:
                 reasons.append(self._close_position(position, snapshot, exit_reason="EXPIRED"))
@@ -456,9 +464,7 @@ class PaperExecutionEngine:
                     )
                 )
         self._journal_pnl(snapshot, None)
-        reasons_out = tuple(reason for reason in reasons if reason)
-        self.checkpoint()
-        return reasons_out
+        return _finish()
 
     def _retry_timeout_closes(self, snapshot: AgentMarketSnapshot) -> list[str]:
         """After timeout, close remaining open inventory once fresh quotes exist."""
@@ -559,7 +565,14 @@ class PaperExecutionEngine:
         risk_secret: str | None = None,
         checkpoint_path: Path | str | None = None,
     ) -> PaperExecutionEngine:
-        engine = cls(config, clock=clock, risk_secret=risk_secret, checkpoint_path=checkpoint_path)
+        # Single construction — always include checkpoint_path so restored engines
+        # keep writing the same durable file after recovery.
+        engine = cls(
+            config,
+            clock=clock,
+            risk_secret=risk_secret,
+            checkpoint_path=checkpoint_path,
+        )
         engine.session_id = str(state["session_id"])
         engine.started_at = datetime.fromisoformat(str(state["started_at"]))
         engine.journal.load(list(state["journal"]))

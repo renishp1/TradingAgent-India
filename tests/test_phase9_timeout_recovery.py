@@ -358,6 +358,99 @@ class Phase9DurableCheckpointTests(unittest.TestCase):
                 restored.journal.load(store.load()["engine"]["journal"])
 
 
+    def test_stale_snapshot_persists_before_return_for_cross_process_recovery(self) -> None:
+        """Stale on_snapshot must checkpoint before return; restore sees the mutation."""
+        config = _config()
+        clock = FrozenClock(AS_OF)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "stale-persist.json"
+            engine = PaperExecutionEngine(
+                config,
+                clock=clock,
+                risk_secret=TEST_RISK_SECRET,
+                checkpoint_path=path,
+            )
+            snap = _snapshot()
+            decision, package = _approved(config, clock, snap, cycle_id="cycle-p9-stale-ckpt")
+            self.assertTrue(engine.execute(decision, snap, package=package).accepted)
+            self.assertTrue(path.is_file())
+            before = path.read_bytes()
+            journal_len_before = len(engine.journal.records)
+
+            clock.advance(timedelta(seconds=31))
+            stale_reasons = engine.on_snapshot(
+                _snapshot(AS_OF + timedelta(minutes=1), quality=DataQualityStatus.STALE)
+            )
+            self.assertIn("SESSION_TIMEOUT", stale_reasons)
+            self.assertIn("DATA_STALE", stale_reasons)
+            self.assertTrue(engine.positions.unresolved_close)
+            self.assertTrue(engine.positions.halted)
+            self.assertGreater(len(engine.journal.records), journal_len_before)
+
+            after = path.read_bytes()
+            self.assertNotEqual(after, before, "checkpoint must change after stale mutation")
+            on_disk = load_paper_checkpoint(path)
+            self.assertTrue(on_disk["engine"]["registry"]["unresolved_close"])
+            self.assertTrue(on_disk["engine"]["registry"]["halted"])
+            self.assertGreater(len(on_disk["engine"]["journal"]), journal_len_before)
+            stale_rows = [
+                row
+                for row in on_disk["engine"]["journal"]
+                if row.get("payload", {}).get("reason") == "DATA_STALE"
+            ]
+            self.assertTrue(stale_rows)
+
+            # Fresh process: restore only from disk.
+            del engine
+            restored = restore_paper_engine(config, path, clock=clock, risk_secret=TEST_RISK_SECRET)
+            self.assertTrue(restored.positions.unresolved_close)
+            self.assertTrue(restored.positions.halted)
+            self.assertEqual(len(restored.positions.open_positions()), 1)
+            self.assertEqual(len(restored.journal.records), len(on_disk["engine"]["journal"]))
+
+            recover_at = AS_OF + timedelta(minutes=5)
+            recovered = restored.on_snapshot(
+                _snapshot(recover_at, quotes=(_quote(recover_at, ltp=105.0, bid=105.0, ask=106.0),))
+            )
+            self.assertIn(ExitReason.SESSION_TIMEOUT, recovered)
+            self.assertEqual(restored.positions.open_positions(), ())
+            self.assertFalse(restored.positions.unresolved_close)
+            self.assertTrue(restored.positions.halted)
+            self.assertEqual(restored.positions.summary().closes, 1)
+            recovery_rows = [
+                row
+                for row in restored.journal.records
+                if row.payload.get("reason") == "TIMEOUT_RECOVERY_CLOSED"
+            ]
+            self.assertEqual(len(recovery_rows), 1)
+            sell_fills = [
+                row
+                for row in restored.journal.records
+                if row.kind == "FILL" and row.payload.get("side") == "SELL"
+            ]
+            self.assertEqual(len(sell_fills), 1)
+
+            # No duplicate close on a subsequent fresh quote.
+            fills = len(restored.ledger.book.fills)
+            later = recover_at + timedelta(minutes=1)
+            restored.on_snapshot(
+                _snapshot(later, quotes=(_quote(later, ltp=104.0, bid=104.0, ask=105.0),))
+            )
+            self.assertEqual(len(restored.ledger.book.fills), fills)
+            self.assertEqual(restored.positions.summary().closes, 1)
+            self.assertEqual(
+                len(
+                    [
+                        row
+                        for row in restored.journal.records
+                        if row.payload.get("reason") == "TIMEOUT_RECOVERY_CLOSED"
+                    ]
+                ),
+                1,
+            )
+            self.assertEqual(restored.broker_order_calls, 0)
+
+
 class Phase9PartialFailureTests(unittest.TestCase):
     def test_corrupt_checkpoint_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
