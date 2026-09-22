@@ -384,7 +384,90 @@ class QualificationAndFlowTests(unittest.TestCase):
         )
         self.assertNotEqual(r1.resolution_id, r2.resolution_id)
 
+    def test_lot_size_uses_canonical_identity_not_provider_id(self) -> None:
+        from grow.history.candidate_flow import MISSING_LOT_SIZE, _require_lot
+        from grow.history.models import HistoricalOptionContract
+        from grow.history.store import CanonicalStore
+        from grow.options.models import DecisionStatus, OptionCandidate, OptionsDecision, ScoreBreakdown
+        from tests.test_history import _meta, _session
+
+        as_of = _ts(date(2026, 9, 21))
+        canonical_id = "NIFTY-2026-09-29-25000-CE"
+        provider_id = "NSE:OPTIDX-NIFTY-25000-CE-20260929"
+        self.assertNotEqual(canonical_id, provider_id)
+        store = CanonicalStore(_meta())
+        store.add_session(_session())
+        store.add_contract(
+            HistoricalOptionContract(
+                underlying="NIFTY",
+                expiry=date(2026, 9, 29),
+                strike=25000.0,
+                option_type="CE",
+                contract_id=canonical_id,
+                provider_contract_id=provider_id,
+                lot_size=75,
+                expiry_class="WEEKLY",
+                first_seen_at=datetime(2026, 9, 21, 9, 15, tzinfo=IST),
+                last_seen_at=datetime(2026, 9, 29, 15, 30, tzinfo=IST),
+                listing_status="ACTIVE",
+                source_id="t",
+                dataset_version="v1",
+            )
+        )
+        self.assertFalse(store.has_contract(provider_id))
+        self.assertEqual(store.lot_size(canonical_id), 75)
+        cand = OptionCandidate(
+            candidate_id="cand-1",
+            underlying="NIFTY",
+            direction="BULLISH",
+            option_type="CE",
+            intent="BUY",
+            expiry=date(2026, 9, 29),
+            strike=25000.0,
+            contract_symbol=provider_id,
+            spot_price=25000.0,
+            premium_reference=100.0,
+            bid=99.0,
+            ask=101.0,
+            spread=2.0,
+            spread_pct=0.02,
+            volume=10,
+            open_interest=100,
+            implied_volatility=None,
+            delta=None,
+            gamma=None,
+            theta=None,
+            vega=None,
+            intrinsic_value=0.0,
+            extrinsic_value=100.0,
+            moneyness="ATM",
+            score=ScoreBreakdown("options.score.v1", 0.5, {}, {}, "t"),
+            as_of=as_of,
+            underlying_snapshot_id="u",
+            option_chain_snapshot_id="c",
+            strategy_signal_id="s",
+            strategy_version="v1",
+            selection_version="options.select.v1",
+            reasons=("test",),
+        )
+        decision = OptionsDecision(
+            status=DecisionStatus.CANDIDATE,
+            candidate=cand,
+            rejected=(),
+            diagnostics=(),
+            as_of=as_of,
+            strategy_signal_id="s",
+            option_chain_snapshot_id="c",
+            underlying_snapshot_id="u",
+        )
+        kept = _require_lot(store, decision, "CONTRACT_MASTER")
+        self.assertIsNotNone(kept.candidate)
+        self.assertEqual(kept.status, DecisionStatus.CANDIDATE)
+        self.assertNotIn(MISSING_LOT_SIZE, kept.diagnostics)
+        self.assertEqual(kept.candidate.contract_symbol, provider_id)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

@@ -210,11 +210,16 @@ def bind_resolution(decision: OptionsDecision, resolved: ExpiryResolution) -> Op
 def _require_lot(store: CanonicalStore, decision: OptionsDecision, source: str) -> OptionsDecision:
     if decision.candidate is None or source != "CONTRACT_MASTER":
         return decision
-    cid = decision.candidate.contract_symbol
-    try:
-        lot = store.lot_size(cid) if store.has_contract(cid) else None
-    except GrowConfigError:
-        lot = None
+    cand = decision.candidate
+    resolved = store.contract_for_candidate(
+        underlying=cand.underlying,
+        expiry=cand.expiry,
+        strike=cand.strike,
+        option_type=cand.option_type,
+        as_of=cand.as_of,
+        provider_contract_id=cand.contract_symbol,
+    )
+    lot = None if resolved is None else resolved.lot_size
     if lot is None or lot < 1:
         return replace(
             decision,

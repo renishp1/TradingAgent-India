@@ -268,6 +268,34 @@ class CanonicalStore:
             raise GrowConfigError("MISSING_LOT_SIZE")
         return contract.lot_size
 
+    def contract_for_candidate(
+        self,
+        *,
+        underlying: str,
+        expiry: date,
+        strike: float,
+        option_type: str,
+        as_of: datetime,
+        provider_contract_id: str | None = None,
+    ) -> HistoricalOptionContract | None:
+        """Resolve the 2C-selected contract by canonical identity, not provider id."""
+        matches = [
+            contract
+            for contract in self._contracts.values()
+            if contract.underlying == underlying
+            and contract.expiry == expiry
+            and abs(contract.strike - strike) < 1e-9
+            and contract.option_type == option_type
+            and contract.first_seen_at <= as_of <= contract.last_seen_at
+        ]
+        if provider_contract_id:
+            by_provider = [c for c in matches if c.provider_contract_id == provider_contract_id]
+            if len(by_provider) == 1:
+                return by_provider[0]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
     def _guard(self) -> None:
         if self._published:
             raise GrowConfigError("DATASET_IMMUTABLE")

@@ -200,7 +200,12 @@ def strike_window_distance(profile: str) -> int:
 
 
 def apply_index_policy(options_config, policy: IndexPolicy):
-    """Map IndexPolicy research profiles onto 2C options config. Fail closed."""
+    """Map IndexPolicy research profiles onto 2C options config. Fail closed.
+
+    v1: strike_policy_profile sets ATM window. liquidity_policy is provenance
+    only — options.select.v1 does not change 2C min volume/OI/spread gates.
+    lot_size_source=CONTRACT_MASTER is enforced after 2C selection.
+    """
     if policy.liquidity_policy not in KNOWN_LIQUIDITY_POLICIES:
         raise GrowConfigError(f"UNKNOWN_LIQUIDITY_POLICY:{policy.liquidity_policy}")
     if policy.lot_size_source not in KNOWN_LOT_SIZE_SOURCES:

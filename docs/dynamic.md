@@ -59,10 +59,19 @@ An index in the registry but absent from the contract master is
 `resolve_nearest_expiry` is the audit resolver. Decision-time selection is
 still `choose_expiry` on the reconstructed chain, with the same profile.
 Per-index `strike_policy_profile` (`ATM_PM0`–`ATM_PM3`) sets the 2C strike
-window. `liquidity_policy=options.select.v1` uses the locked 2C liquidity
-gates. `lot_size_source=CONTRACT_MASTER` requires a historical lot size on
-the selected contract. Unknown profiles fail closed. 2C does not invent
-strikes or expiries.
+window. `lot_size_source=CONTRACT_MASTER` requires a historical lot size on
+the **canonical** selected contract (resolved by underlying/expiry/strike/
+option type, not by `provider_contract_id`). Unknown profiles fail closed.
+2C does not invent strikes or expiries.
+
+### Liquidity policy (v1)
+
+`options.select.v1` is the **single locked liquidity policy**. Per-index
+`liquidity_policy` is recorded on `IndexPolicy` and bound into
+`policy_fingerprint` / CandidateSet provenance. It does **not** change the
+2C liquidity algorithm in v1 (`min_volume`, `min_open_interest`,
+`max_spread_pct` stay the locked OptionsConfig gates). Additional named
+liquidity profiles are reserved for a later milestone.
 
 ## CE / PE
 
