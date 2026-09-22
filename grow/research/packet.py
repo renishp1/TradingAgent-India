@@ -38,6 +38,7 @@ def candidate_summary(candidate: OptionCandidate) -> dict:
         "moneyness": candidate.moneyness,
         "score_total": candidate.score.total,
         "score_version": candidate.score.version,
+        "lot_size": candidate.lot_size,
         "as_of": candidate.as_of.isoformat(),
         "underlying_snapshot_id": candidate.underlying_snapshot_id,
         "option_chain_snapshot_id": candidate.option_chain_snapshot_id,

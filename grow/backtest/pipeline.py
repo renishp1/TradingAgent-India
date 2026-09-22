@@ -170,6 +170,7 @@ class DecisionPipeline:
                 DecisionRow(as_of, ticker, "NO_TRADE", bound, signal.signal_id, candidate.candidate_id, None, self.ablation)
             )
             return
+        options = replace(options, candidate=bound)
         candidate = bound
         if signal.direction == "BULLISH" and candidate.option_type != "CE":
             self.ledger.record_decision(

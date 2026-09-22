@@ -434,7 +434,183 @@ class BacktestTests(unittest.TestCase):
         self.assertNotEqual(trade.lot_size, 1)
         self.assertNotEqual(trade.gross_pnl, contract_pnl(entry=entry.price, exit=trade.exit_fill, lots=1, lot_size=1))
 
+    def test_evaluate_propagates_historical_lot_size_to_packet_and_trade(self) -> None:
+        from grow.backtest.pipeline import DecisionPipeline
+        from grow.data.schema import BarSeries, MarketSnapshot, SnapshotQuality, SourceMeta
+        from grow.history.models import HistoricalOptionContract
+        from grow.history.store import CanonicalStore
+        from grow.options.engine import IndexOptionsEngine
+        from grow.options.models import ExpiryClass, OptionChainSnapshot, OptionContract, OptionExpiry, OptionType
+        from grow.research.orchestrator import ResearchOrchestrator
+        from grow.strategies.models import IndicatorSnapshot, MarketRegime, RegimeSnapshot, StrategyResult
+        from grow.types import SessionState
+        from tests.test_history import _meta, _session
+
+        as_of = datetime(2026, 9, 21, 11, 0, tzinfo=IST)
+        expiry = date(2026, 9, 29)
+        provider_prefix = "NSE:OPTIDX-NIFTY"
+        store = CanonicalStore(_meta(is_fixture=False, usage_scope="HISTORICAL_RESEARCH"))
+        store.add_session(_session())
+        strikes = (24900.0, 24950.0, 25000.0, 25050.0, 25100.0)
+        for strike in strikes:
+            canonical_id = f"NIFTY-{expiry.isoformat()}-{int(strike)}-CE"
+            provider_id = f"{provider_prefix}-{int(strike)}-CE-{expiry.strftime('%Y%m%d')}"
+            self.assertNotEqual(canonical_id, provider_id)
+            store.add_contract(
+                HistoricalOptionContract(
+                    underlying="NIFTY",
+                    expiry=expiry,
+                    strike=strike,
+                    option_type="CE",
+                    contract_id=canonical_id,
+                    provider_contract_id=provider_id,
+                    lot_size=75,
+                    expiry_class="WEEKLY",
+                    first_seen_at=datetime(2026, 9, 21, 9, 15, tzinfo=IST),
+                    last_seen_at=datetime(2026, 9, 29, 15, 30, tzinfo=IST),
+                    listing_status="ACTIVE",
+                    source_id="t",
+                    dataset_version="v1",
+                )
+            )
+
+        def _opt(strike: float, *, bid: float, ask: float, ts: datetime) -> OptionContract:
+            return OptionContract(
+                underlying="NIFTY",
+                expiry=expiry,
+                expiry_class=ExpiryClass.WEEKLY,
+                strike=strike,
+                option_type=OptionType.CE,
+                bid=bid,
+                ask=ask,
+                last_price=bid,
+                volume=1000,
+                open_interest=5000,
+                previous_open_interest=None,
+                implied_volatility=None,
+                delta=None,
+                gamma=None,
+                theta=None,
+                vega=None,
+                timestamp=ts,
+                provider_contract_id=f"{provider_prefix}-{int(strike)}-CE-{expiry.strftime('%Y%m%d')}",
+            )
+
+        class Hub:
+            source = type("S", (), {"store": store})()
+
+            def snapshot(self, ticker, as_of=None):
+                return MarketSnapshot(
+                    snapshot_id=f"m:{as_of.isoformat()}",
+                    symbol=Symbol("NIFTY"),
+                    as_of=as_of,
+                    session=SessionState.OPEN,
+                    last_price=25000.0,
+                    currency="INR",
+                    series={Timeframe.M15: BarSeries(Symbol("NIFTY"), Timeframe.M15, ())},
+                    quality=SnapshotQuality(True, False, 0, 0, None, ()),
+                    source=SourceMeta("t", "t", "t", False, False, "s"),
+                )
+
+        class Chains:
+            def __init__(self, hist) -> None:
+                self.store = hist
+
+            def snapshot(self, underlying, as_of, *, spot):
+                entry = as_of.hour < 15
+                contracts = tuple(
+                    _opt(strike, bid=100.0 if entry else 110.0, ask=101.0 if entry else 111.0, ts=as_of)
+                    for strike in strikes
+                )
+                return OptionChainSnapshot(
+                    snapshot_id=f"c:{as_of.isoformat()}",
+                    underlying=underlying,
+                    as_of=as_of,
+                    spot=spot,
+                    expiries=(OptionExpiry(expiry, ExpiryClass.WEEKLY),),
+                    contracts=contracts,
+                    source_id="t",
+                    is_fixture=True,
+                    provider_metadata={},
+                )
+
+        class StubStrategies:
+            def evaluate(self, snap):
+                signal = StrategySignal(
+                    symbol=snap.symbol,
+                    strategy="ema_trend",
+                    direction="BULLISH",
+                    entry=100.0,
+                    stop=90.0,
+                    target=120.0,
+                    confidence=0.6,
+                    timeframe=Timeframe.M15,
+                    reason="stub",
+                    as_of=snap.as_of,
+                    snapshot_id=snap.snapshot_id,
+                    signal_id="sig-1",
+                    strategy_version="v1",
+                )
+                return StrategyResult(
+                    snapshot_id=snap.snapshot_id,
+                    as_of=snap.as_of,
+                    symbol=snap.symbol,
+                    regime=RegimeSnapshot(MarketRegime.BULL_TREND, "up", "up", "normal", "stub"),
+                    signals=(signal,),
+                    evaluated=("ema_trend",),
+                    skipped=(),
+                    diagnostics=(),
+                    indicators=IndicatorSnapshot(
+                        Timeframe.M15, 25000.0, None, None, None, None, None, None, None, None,
+                        None, None, None, None, None, None, None, None, 0,
+                    ),
+                )
+
+        class CaptureOrch(ResearchOrchestrator):
+            packet = None
+
+            def run(self, packet):
+                type(self).packet = packet
+                self.last_packet = packet
+                return super().run(packet)
+
+        config = load_config()
+        ledger = BacktestLedger()
+        orch = CaptureOrch(config)
+        pipe = DecisionPipeline(
+            hub=Hub(),
+            strategies=StubStrategies(),
+            options=IndexOptionsEngine(config),
+            chains=Chains(store),
+            research=orch,
+            simulator=ExecutionSimulator(SlippageModel(0), quantity=1),
+            costs=CostModel(),
+            ledger=ledger,
+            run_id="lot-eval",
+            ablation="full",
+            config_version=config.version,
+            lot_size=1,
+        )
+        pipe.evaluate("NIFTY", as_of)
+        self.assertEqual(len(ledger.trades), 1)
+        trade = ledger.trades[0]
+        packet = orch.last_packet
+        self.assertIsNotNone(packet)
+        self.assertEqual(packet.option_candidate["lot_size"], 75)
+        self.assertEqual(packet.option_candidate["lot_size"], trade.lot_size)
+        self.assertEqual(trade.lot_size, 75)
+        expected_gross = contract_pnl(entry=trade.entry_fill, exit=trade.exit_fill, lots=1, lot_size=75)
+        expected_cost = CostModel().round_trip(entry=trade.entry_fill, exit=trade.exit_fill, quantity=1, lot_size=75)
+        self.assertEqual(trade.gross_pnl, expected_gross)
+        self.assertEqual(trade.total_cost, expected_cost)
+        self.assertNotEqual(trade.lot_size, 1)
+        self.assertNotEqual(
+            trade.gross_pnl,
+            contract_pnl(entry=trade.entry_fill, exit=trade.exit_fill, lots=1, lot_size=1),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
