@@ -15,6 +15,33 @@ from grow.market_data.normalized.models import DataQualityStatus, OptionQuoteVie
 from grow.market_data.snapshots.builder import build_fixture_snapshot
 
 
+def _result(snapshot, *, agent_name: str, agent_version: str, **kwargs) -> AgentResult:
+    defaults = dict(
+        agent_name=agent_name,
+        agent_version=agent_version,
+        snapshot_id=snapshot.snapshot_id,
+        snapshot_version=snapshot.version,
+        decision_timestamp=snapshot.decision_timestamp,
+        status=AgentStatus.PASS,
+        observations=("ok",),
+        calculated_metrics={},
+        interpretation=(),
+        findings=(),
+        data_quality_concerns=(),
+        assumptions=(),
+        evidence=("test",),
+        metrics_used=(),
+        candidate_action=CandidateAction.ABSTAIN,
+        candidate_instrument=None,
+        entry_reason=None,
+        invalidation_reason=None,
+        risk_flags=(),
+        missing_data=(),
+    )
+    defaults.update(kwargs)
+    return AgentResult(**defaults)
+
+
 class _FastAgent:
     def __init__(self, name: str, started: list[str], barrier: threading.Barrier | None = None) -> None:
         self.agent_name = name
@@ -22,24 +49,16 @@ class _FastAgent:
         self._started = started
         self._barrier = barrier
 
-    def analyze(self, snapshot):
+    def analyze(self, snapshot, *, cycle_id: str = ""):
         self._started.append(self.agent_name)
         if self._barrier is not None:
             self._barrier.wait(timeout=2.0)
-        return AgentResult(
+        return _result(
+            snapshot,
             agent_name=self.agent_name,
             agent_version=self.agent_version,
-            snapshot_id=snapshot.snapshot_id,
-            decision_timestamp=snapshot.decision_timestamp,
-            status=AgentStatus.PASS,
-            observations=("ok",),
-            metrics_used=(),
-            candidate_action=CandidateAction.ABSTAIN,
-            candidate_instrument=None,
+            cycle_id=cycle_id,
             entry_reason="fast",
-            invalidation_reason=None,
-            risk_flags=(),
-            missing_data=(),
         )
 
 
@@ -50,22 +69,17 @@ class _SlowAgent:
     def __init__(self, delay: float = 5.0) -> None:
         self.delay = delay
 
-    def analyze(self, snapshot):
+    def analyze(self, snapshot, *, cycle_id: str = ""):
         time.sleep(self.delay)
-        return AgentResult(
+        return _result(
+            snapshot,
             agent_name=self.agent_name,
             agent_version=self.agent_version,
-            snapshot_id=snapshot.snapshot_id,
-            decision_timestamp=snapshot.decision_timestamp,
-            status=AgentStatus.PASS,
+            cycle_id=cycle_id,
             observations=("too late",),
-            metrics_used=(),
             candidate_action=CandidateAction.PAPER_OPEN,
             candidate_instrument="NIFTY-25000-CE",
             entry_reason="should-not-apply",
-            invalidation_reason=None,
-            risk_flags=(),
-            missing_data=(),
         )
 
 
@@ -73,48 +87,17 @@ class _OpenAgent:
     agent_name = "force_open"
     agent_version = "force_open.v1"
 
-    def analyze(self, snapshot):
-        return AgentResult(
+    def analyze(self, snapshot, *, cycle_id: str = ""):
+        return _result(
+            snapshot,
             agent_name=self.agent_name,
             agent_version=self.agent_version,
-            snapshot_id=snapshot.snapshot_id,
-            decision_timestamp=snapshot.decision_timestamp,
-            status=AgentStatus.PASS,
+            cycle_id=cycle_id,
             observations=("force open",),
-            metrics_used=(),
+            findings=("FORCE_OPEN",),
             candidate_action=CandidateAction.PAPER_OPEN,
             candidate_instrument="NIFTY-25000-CE",
             entry_reason="test",
-            invalidation_reason=None,
-            risk_flags=(),
-            missing_data=(),
-        )
-
-
-class _OrderedAgent:
-    def __init__(self, name: str, hold: threading.Event, release: threading.Event) -> None:
-        self.agent_name = name
-        self.agent_version = f"{name}.v1"
-        self._hold = hold
-        self._release = release
-
-    def analyze(self, snapshot):
-        self._hold.set()
-        self._release.wait(timeout=2.0)
-        return AgentResult(
-            agent_name=self.agent_name,
-            agent_version=self.agent_version,
-            snapshot_id=snapshot.snapshot_id,
-            decision_timestamp=snapshot.decision_timestamp,
-            status=AgentStatus.PASS,
-            observations=(self.agent_name,),
-            metrics_used=(),
-            candidate_action=CandidateAction.ABSTAIN,
-            candidate_instrument=None,
-            entry_reason=None,
-            invalidation_reason=None,
-            risk_flags=(),
-            missing_data=(),
         )
 
 
@@ -188,7 +171,6 @@ class HardeningOrchestratorTests(unittest.TestCase):
         self.assertEqual(set(started), {"a", "b"})
 
     def test_deterministic_result_ordering(self) -> None:
-        # Finish order is reverse of registration; output order must stay registration order.
         hold_late = threading.Event()
         hold_early = threading.Event()
         release_all = threading.Event()
@@ -199,37 +181,25 @@ class HardeningOrchestratorTests(unittest.TestCase):
                 self.agent_version = f"{name}.v1"
                 self._hold = hold
 
-            def analyze(self, snapshot):
+            def analyze(self, snapshot, *, cycle_id: str = ""):
                 self._hold.set()
                 release_all.wait(timeout=2.0)
-                return AgentResult(
+                return _result(
+                    snapshot,
                     agent_name=self.agent_name,
                     agent_version=self.agent_version,
-                    snapshot_id=snapshot.snapshot_id,
-                    decision_timestamp=snapshot.decision_timestamp,
-                    status=AgentStatus.PASS,
+                    cycle_id=cycle_id,
                     observations=(self.agent_name,),
-                    metrics_used=(),
-                    candidate_action=CandidateAction.ABSTAIN,
-                    candidate_instrument=None,
-                    entry_reason=None,
-                    invalidation_reason=None,
-                    risk_flags=(),
-                    missing_data=(),
                 )
 
         first = _GateAgent("first", hold_late)
         second = _GateAgent("second", hold_early)
         orch = AgentCycleOrchestrator(specialists=(first, second), agent_timeout_seconds=2.0)
 
-        def _run():
-            return orch.run(_snapshot())
-
-        # Ensure both are running, then release second-finisher first via shared event.
         import concurrent.futures
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            fut = pool.submit(_run)
+            fut = pool.submit(orch.run, _snapshot())
             self.assertTrue(hold_late.wait(timeout=2.0))
             self.assertTrue(hold_early.wait(timeout=2.0))
             release_all.set()
@@ -256,22 +226,14 @@ class HardeningOrchestratorTests(unittest.TestCase):
             agent_name = "counter"
             agent_version = "counter.v1"
 
-            def analyze(self, snapshot):
+            def analyze(self, snapshot, *, cycle_id: str = ""):
                 calls["n"] += 1
-                return AgentResult(
+                return _result(
+                    snapshot,
                     agent_name=self.agent_name,
                     agent_version=self.agent_version,
-                    snapshot_id=snapshot.snapshot_id,
-                    decision_timestamp=snapshot.decision_timestamp,
-                    status=AgentStatus.PASS,
+                    cycle_id=cycle_id,
                     observations=("count",),
-                    metrics_used=(),
-                    candidate_action=CandidateAction.ABSTAIN,
-                    candidate_instrument=None,
-                    entry_reason=None,
-                    invalidation_reason=None,
-                    risk_flags=(),
-                    missing_data=(),
                 )
 
         def always(results: tuple[AgentResult, ...], debate: DebateSummary) -> bool:
