@@ -61,6 +61,7 @@ class DynamicUniverseTests(unittest.TestCase):
         self.assertTrue(reg.allows("MIDCPNIFTY"))
         self.assertFalse(reg.allows("RELIANCE"))
         self.assertEqual(reg.policy("NIFTY").expiry_policy_profile, WEEKLY_PREFERRED)
+        self.assertEqual(reg.policy("BANKNIFTY").expiry_policy_profile, MONTHLY_ONLY)
         self.assertEqual(reg.policy("MIDCPNIFTY").expiry_policy_profile, MONTHLY_ONLY)
 
     def test_discovery_respects_listing_and_excludes_stocks(self) -> None:
@@ -226,11 +227,11 @@ class QualificationAndFlowTests(unittest.TestCase):
         self.assertEqual(unauthorized["FINNIFTY"].status, "UNAUTHORIZED")
         overlay = IndexUniverseRegistry(
             default_index_policies()
-            + (_policy("FINNIFTY", name="Nifty Financial", profile=WEEKLY_PREFERRED, active_from=date(2021, 1, 1)),)
+            + (_policy("FINNIFTY", name="Nifty Financial", profile=MONTHLY_ONLY, active_from=date(2021, 1, 1)),)
         )
         approved = {r.canonical_symbol: r for r in discover_underlyings(store, as_of, overlay)}
         self.assertEqual(approved["FINNIFTY"].status, "ELIGIBLE")
-        self.assertEqual(approved["FINNIFTY"].expiry_policy_profile, WEEKLY_PREFERRED)
+        self.assertEqual(approved["FINNIFTY"].expiry_policy_profile, MONTHLY_ONLY)
 
     def test_custom_historical_and_unknown_profiles_fail_closed(self) -> None:
         store = build_2i_store()

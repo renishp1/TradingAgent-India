@@ -88,8 +88,9 @@ TrueData symbol lists usually omit `expiry_class`. Grow never infers WEEKLY
 from option-ness.
 
 Milestone 3C.1 adds `grow.live_data.expiry_class.ExpiryClassifier`
-(`expiry.class.nse.v1`) on top of the 2026 cash session calendar
-(`nse.session.cash.2026.v1`).
+(`expiry.class.nse.v2`) on top of the official 2026 NSE F&O holiday calendar
+(`nse.fo.2026.v1`, circular NSE/FAOP/71777). The cash-session seed in
+`grow.market.session` is not used for expiry classification.
 
 Precedence:
 
@@ -112,8 +113,24 @@ reuse a stale class. 2I profiles (`WEEKLY_PREFERRED`, `MONTHLY_ONLY`,
 `WEEKLY_THEN_MONTHLY`) are unchanged — they only see classified contracts.
 
 Default weekday schedules are a versioned policy overlay (not a hard-coded
-NIFTY/BANKNIFTY universe). An index without a schedule stays UNKNOWN even
-if the 2I overlay would otherwise allow it.
+NIFTY/BANKNIFTY universe):
+
+| Underlying | Weekly | Monthly |
+|---|---|---|
+| NIFTY | Tuesday | last Tuesday of the month |
+| BANKNIFTY | none | last Tuesday of the month |
+| FINNIFTY | none | last Tuesday of the month |
+| MIDCPNIFTY | none | last Tuesday of the month |
+
+When weekly and monthly share a Tuesday, the last Tuesday is MONTHLY. A
+scheduled weekday that falls on an F&O holiday moves to the previous F&O
+session. An index without a schedule stays UNKNOWN even if the 2I overlay
+would otherwise allow it. WEEKLY is never inferred from option-ness or from
+the monthly weekday alone.
+
+Live 2I overlay: NIFTY `WEEKLY_PREFERRED`, BANKNIFTY `MONTHLY_ONLY`,
+MIDCPNIFTY `MONTHLY_ONLY`. FINNIFTY is `MONTHLY_ONLY` only when added through
+the normal `IndexPolicy` overlay.
 
 ## Catalog discovery
 

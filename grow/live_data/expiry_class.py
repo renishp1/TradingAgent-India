@@ -16,11 +16,10 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from grow.clock import IST, Clock, FrozenClock
 from grow.live_data.catalog import KNOWN_EXPIRY_CLASSES, UNKNOWN_EXPIRY_CLASS
-from grow.market.session import CALENDAR_VERSION as SESSION_CALENDAR_VERSION
-from grow.market.session import CASH_HOLIDAYS_2026
+from grow.market.fo_calendar import FO_CALENDAR_VERSION, FO_HOLIDAYS_2026
 
-POLICY_VERSION = "expiry.class.nse.v1"
-CALENDAR_VERSION = SESSION_CALENDAR_VERSION
+POLICY_VERSION = "expiry.class.nse.v2"
+CALENDAR_VERSION = FO_CALENDAR_VERSION
 PROVIDER = "PROVIDER"
 CALENDAR = "CALENDAR"
 NONE = "NONE"
@@ -36,6 +35,8 @@ RULE_NOT_READY = "expiry.class.not_ready.v1"
 CLASSIFICATION_CONFLICT = "CLASSIFICATION_CONFLICT"
 CLASSIFIER_NOT_READY = "CLASSIFIER_NOT_READY"
 PROVIDER_CLASS_UNSUPPORTED = "PROVIDER_CLASS_UNSUPPORTED"
+
+TUESDAY = 1
 
 
 @dataclass(frozen=True)
@@ -87,18 +88,19 @@ class ExpiryClassification:
 
 
 def default_expiry_schedules() -> tuple[ExpirySchedule, ...]:
-    """Versioned weekday policy. Matches 2I sample dates; not an allow-list.
+    """Versioned NSE weekday policy. Not an allow-list and not a universe.
 
-    Weekly = weekday of the weekly contract. Monthly = last such weekday of
-    the month, holiday-adjusted to the previous session. When weekly and
-    monthly share a weekday, the last occurrence is MONTHLY.
+    Weekly is supported only when weekly_weekday is set. Monthly is the last
+    monthly_weekday of the month, holiday-adjusted to the previous F&O session.
+    When weekly and monthly share a weekday, the last occurrence is MONTHLY.
+    Do not infer WEEKLY from option-ness or from the monthly weekday alone.
     """
     start = date(2019, 1, 1)
     return (
-        ExpirySchedule("NIFTY", 1, 3, start),
-        ExpirySchedule("BANKNIFTY", 1, 3, start),
-        ExpirySchedule("MIDCPNIFTY", None, 1, date(2023, 1, 1)),
-        ExpirySchedule("FINNIFTY", 1, 1, date(2021, 1, 1)),
+        ExpirySchedule("NIFTY", TUESDAY, TUESDAY, start),
+        ExpirySchedule("BANKNIFTY", None, TUESDAY, start),
+        ExpirySchedule("MIDCPNIFTY", None, TUESDAY, date(2023, 1, 1)),
+        ExpirySchedule("FINNIFTY", None, TUESDAY, date(2021, 1, 1)),
     )
 
 
@@ -142,7 +144,7 @@ class ExpiryClassifier:
         calendar_version: str = CALENDAR_VERSION,
     ) -> None:
         self.schedules = tuple(schedules if schedules is not None else default_expiry_schedules())
-        self.holidays = frozenset(holidays if holidays is not None else CASH_HOLIDAYS_2026)
+        self.holidays = frozenset(holidays if holidays is not None else FO_HOLIDAYS_2026)
         self.clock = clock or FrozenClock(datetime.now(tz=IST))
         self.policy_version = policy_version
         self.calendar_version = calendar_version

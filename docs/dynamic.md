@@ -35,9 +35,9 @@ No broker. No live feed. No PaperLedger. No Risk Guard writes.
 ## Index universe
 
 `IndexUniverseRegistry` is the only place new OPTIDX names are added.
-NIFTY and BANKNIFTY stay weekly-preferred defaults. MIDCPNIFTY is registered
-as `MONTHLY_ONLY` for this sample period. RELIANCE/TCS/stock options and
-futures are rejected.
+NIFTY stays `WEEKLY_PREFERRED`. BANKNIFTY and MIDCPNIFTY are `MONTHLY_ONLY`.
+FINNIFTY is added only through the same `IndexPolicy` overlay, also
+`MONTHLY_ONLY`. RELIANCE/TCS/stock options and futures are rejected.
 
 Discovery at `as_of` uses contracts actually listed in the dataset. The
 `IndexUniverseRegistry` is a versioned **policy/approval overlay**, not the

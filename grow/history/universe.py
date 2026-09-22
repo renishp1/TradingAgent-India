@@ -1,7 +1,8 @@
 """Versioned index-option universe. OPTIDX only. Not stock options.
 
-NIFTY and BANKNIFTY remain supported defaults. Additional approved
-index underlyings are added here, not by hard-coding the provider layer.
+NIFTY remains WEEKLY_PREFERRED. BANKNIFTY and MIDCPNIFTY are MONTHLY_ONLY.
+Additional approved index underlyings are added here, not by hard-coding the
+provider layer.
 """
 
 from __future__ import annotations
@@ -119,7 +120,7 @@ def _policy(
 def default_index_policies() -> tuple[IndexPolicy, ...]:
     return (
         _policy("NIFTY", name="Nifty 50", profile=WEEKLY_PREFERRED, active_from=date(2019, 1, 1)),
-        _policy("BANKNIFTY", name="Nifty Bank", profile=WEEKLY_PREFERRED, active_from=date(2019, 1, 1)),
+        _policy("BANKNIFTY", name="Nifty Bank", profile=MONTHLY_ONLY, active_from=date(2019, 1, 1)),
         _policy("MIDCPNIFTY", name="Nifty Midcap Select", profile=MONTHLY_ONLY, active_from=date(2023, 1, 1)),
     )
 

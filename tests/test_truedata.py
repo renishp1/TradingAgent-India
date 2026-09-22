@@ -82,7 +82,7 @@ def _fin_policy() -> IndexPolicy:
         active_from=date(2020, 1, 1),
         active_to=None,
         option_supported=True,
-        expiry_policy_profile=WEEKLY_PREFERRED,
+        expiry_policy_profile=MONTHLY_ONLY,
         strike_policy_profile="ATM_PM2",
         lot_size_source="CONTRACT_MASTER",
         liquidity_policy="options.select.v1",
