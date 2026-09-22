@@ -1,7 +1,8 @@
 """In-memory paper ledger.
 
 The only venue Grow can fill. Every fill requires a RiskStamp that verifies
-against the current Risk Guard. No network, no broker, no persistence yet.
+against the current Risk Guard. No network, no broker.
+Durable session restart uses ``grow.paper.checkpoint`` (Phase 9).
 
 Architecture Review #1: cash book is long-only. Negative quantity is a
 safety error, not a short inventory. P&L is realized-at-cost; mark-to-market

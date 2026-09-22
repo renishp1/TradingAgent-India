@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import date, datetime
+from pathlib import Path
 from typing import Any, Mapping
 
 from grow.backtest.costs import CostModel
@@ -86,6 +87,7 @@ class PaperExecutionEngine:
         clock: Clock | None = None,
         risk_secret: str | None = None,
         risk_guard: RiskGuard | None = None,
+        checkpoint_path: Path | str | None = None,
     ) -> None:
         config.assert_safe()
         assert_paper_runtime(config.execution.mode, config.execution.live_trading_enabled, config.paper.venue_id)
@@ -118,6 +120,7 @@ class PaperExecutionEngine:
         self._pnl_day = self.started_at.astimezone(IST).date()
         self._timeout_recorded = False
         self._mark_sequence = 1
+        self.checkpoint_path = None if checkpoint_path is None else Path(checkpoint_path)
         self.broker_order_calls = 0
         self.last_risk_daily_pnl: float | None = None
 
@@ -410,10 +413,20 @@ class PaperExecutionEngine:
         Session timeout stops new entries and marks unresolved closes, but does
         not permanently freeze recovery: when valid fresh quotes arrive, pending
         closes are retried without fabricating prices.
+
+        Every state-mutating return path checkpoints exactly once when
+        ``checkpoint_path`` is configured (including the early DATA_STALE exit).
         """
         self._assert_runtime(snapshot)
         moment = snapshot.decision_timestamp.astimezone(IST)
         reasons: list[str] = []
+
+        def _finish() -> tuple[str, ...]:
+            # Single checkpoint exit for all mutating returns from this method.
+            out = tuple(reason for reason in reasons if reason)
+            self.checkpoint()
+            return out
+
         timed_out = self._enforce_timeout(moment)
         if timed_out:
             reasons.append("SESSION_TIMEOUT")
@@ -428,7 +441,7 @@ class PaperExecutionEngine:
             )
             reasons.append("DATA_STALE")
             self._journal_pnl(snapshot, None)
-            return tuple(reasons)
+            return _finish()
         for position in self.positions.open_positions():
             if position.expiry < snapshot.session_date:
                 reasons.append(self._close_position(position, snapshot, exit_reason="EXPIRED"))
@@ -451,7 +464,7 @@ class PaperExecutionEngine:
                     )
                 )
         self._journal_pnl(snapshot, None)
-        return tuple(reason for reason in reasons if reason)
+        return _finish()
 
     def _retry_timeout_closes(self, snapshot: AgentMarketSnapshot) -> list[str]:
         """After timeout, close remaining open inventory once fresh quotes exist."""
@@ -550,8 +563,16 @@ class PaperExecutionEngine:
         *,
         clock: Clock | None = None,
         risk_secret: str | None = None,
+        checkpoint_path: Path | str | None = None,
     ) -> PaperExecutionEngine:
-        engine = cls(config, clock=clock, risk_secret=risk_secret)
+        # Single construction — always include checkpoint_path so restored engines
+        # keep writing the same durable file after recovery.
+        engine = cls(
+            config,
+            clock=clock,
+            risk_secret=risk_secret,
+            checkpoint_path=checkpoint_path,
+        )
         engine.session_id = str(state["session_id"])
         engine.started_at = datetime.fromisoformat(str(state["started_at"]))
         engine.journal.load(list(state["journal"]))
@@ -1055,7 +1076,7 @@ class PaperExecutionEngine:
         accepted: bool,
         position_id: str | None = None,
     ) -> PaperExecutionResult:
-        return PaperExecutionResult(
+        result = PaperExecutionResult(
             accepted=accepted,
             reason=reason,
             decision_id=decision.decision_id,
@@ -1065,6 +1086,16 @@ class PaperExecutionEngine:
             price_source=None if order is None else order.price_source,
             broker_order_calls=0,
         )
+        self.checkpoint()
+        return result
+
+    def checkpoint(self) -> Path | None:
+        """Persist durable state when a checkpoint path is configured."""
+        if self.checkpoint_path is None:
+            return None
+        from grow.paper.checkpoint import save_paper_checkpoint
+
+        return save_paper_checkpoint(self.checkpoint_path, self)
 
     def _occupied(self) -> int:
         return sum(1 for row in self.positions.all() if row.state in {PositionState.OPEN, PositionState.EXIT_PENDING})
