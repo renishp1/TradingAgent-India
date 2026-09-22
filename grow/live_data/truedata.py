@@ -21,7 +21,14 @@ from grow.live_data.models import (
 from grow.live_data.provider import _FORBIDDEN_FALLBACK
 from grow.live_data.symbols import ParsedInstrument, parse_provider_symbol, parse_tick_fields
 from grow.live_data.subscribe import plan_subscriptions, resubscribe_set
-from grow.live_data.catalog import DEFAULT_CATALOG_URLS, merge_catalog, parse_catalog_text
+from grow.live_data.catalog import (
+    DEFAULT_CATALOG_URLS,
+    UNKNOWN_EXPIRY_CLASS,
+    is_tradable_expiry_class,
+    merge_catalog,
+    normalize_catalog_row,
+    parse_catalog_text,
+)
 from grow.live_data.protocol import (
     AUTH,
     CATALOG,
@@ -316,6 +323,7 @@ class TrueDataAdapter:
         self._bars: list[dict[str, Any]] = []
         self._symbol_seq: dict[str, int] = {}
         self._symbol_ids: dict[str, str] = {}
+        self._mapping_ready = False
         self._last_heartbeat_at: datetime | None = None
         self._last_activity_at: datetime | None = None
         self._desired: tuple[str, ...] = ()
@@ -342,18 +350,29 @@ class TrueDataAdapter:
                 socket_factory=socket_factory,
                 catalog_loader=catalog_loader,
             )
-        self._instruments: list[dict[str, Any]] = [dict(row) for row in (catalog or ())]
+        self._instruments: list[dict[str, Any]] = []
+        for row in catalog or ():
+            self._upsert_instrument(row)
         if not self._instruments and isinstance(self.transport, ReplayTransport):
-            self._instruments = [dict(row) for row in self.transport.catalog_rows]
+            for row in self.transport.catalog_rows:
+                self._upsert_instrument(row)
         seed_events: Sequence[Mapping[str, Any]] = events or ()
         if not seed_events and isinstance(self.transport, ReplayTransport):
             seed_events = self.transport.events
         self._seed_catalog_from_events(seed_events)
 
+    def _upsert_instrument(self, row: Mapping[str, Any]) -> dict[str, Any]:
+        item = normalize_catalog_row(row)
+        existing = {rec["provider_symbol"]: rec for rec in self._instruments}
+        existing[item["provider_symbol"]] = item
+        self._instruments = list(existing.values())
+        return item
+
     def _seed_catalog_from_events(self, events: Sequence[Mapping[str, Any]]) -> None:
         for event in events:
             if event.get("kind") == "catalog":
-                self._instruments.extend(dict(row) for row in (event.get("instruments") or ()))
+                for row in event.get("instruments") or ():
+                    self._upsert_instrument(row)
             master = event.get("contract_master")
             if master:
                 for row in master:
@@ -363,24 +382,39 @@ class TrueDataAdapter:
         provider_symbol = str(row.get("tradingsymbol") or row.get("provider_symbol") or row.get("provider_contract_id") or "")
         if not provider_symbol:
             return
-        parsed = parse_provider_symbol(provider_symbol)
-        expiry = parsed.expiry
-        if row.get("expiry"):
-            expiry = date.fromisoformat(str(row["expiry"]))
-        record = {
-            "provider_symbol": provider_symbol,
-            "canonical_symbol": str(row.get("underlying") or parsed.canonical_symbol).upper(),
-            "instrument_type": "INDEX_OPTION" if parsed.option_type else "INDEX",
-            "expiry": expiry,
-            "strike": parsed.strike if row.get("strike") is None else float(row["strike"]),
-            "option_type": parsed.option_type if row.get("option_type") is None else str(row["option_type"]).upper(),
-            "lot_size": None if row.get("lot_size") is None else int(row["lot_size"]),
-            "expiry_class": str(row.get("expiry_class") or "WEEKLY").upper(),
-        }
-        key = record["provider_symbol"]
-        existing = {item["provider_symbol"]: item for item in self._instruments}
-        existing[key] = record
-        self._instruments = list(existing.values())
+        payload = dict(row)
+        payload.setdefault("provider_symbol", provider_symbol)
+        try:
+            self._upsert_instrument(payload)
+        except GrowConfigError:
+            return
+
+    def _clear_symbol_map(self) -> None:
+        self._symbol_ids = {}
+        self._mapping_ready = False
+
+    def _subscription_mapped(self) -> bool:
+        if not self._symbol_ids:
+            return False
+        have = set(self._symbol_ids.values())
+        return all(symbol in have for symbol in self._desired)
+
+    def _note_unknown_expiry_classes(self) -> None:
+        unknown = [
+            str(row["provider_symbol"])
+            for row in self._instruments
+            if row.get("option_type") in {"CE", "PE"} and not is_tradable_expiry_class(row.get("expiry_class"))
+        ]
+        if not unknown:
+            return
+        self.subscription_events.append(
+            {
+                "type": "UNKNOWN_EXPIRY_CLASS",
+                "reason": "UNKNOWN_EXPIRY_CLASS",
+                "symbols": unknown,
+                "timestamp": self.clock.now().isoformat(),
+            }
+        )
 
     def connect(self) -> None:
         self._state = SessionHealth.CONNECTING
@@ -404,13 +438,8 @@ class TrueDataAdapter:
                 raise GrowConfigError("METADATA_UNAVAILABLE") from exc
             catalog = []
         if catalog:
-            existing = {row["provider_symbol"]: row for row in self._instruments}
             for row in catalog:
-                existing[row["provider_symbol"]] = row
-                ident = row.get("provider_symbol_id")
-                if ident:
-                    self._symbol_ids[str(ident)] = row["provider_symbol"]
-            self._instruments = list(existing.values())
+                self._upsert_instrument(row)
         bars = getattr(self.transport, "spot_bars", None)
         if bars:
             self._bars = list(bars)
@@ -424,6 +453,8 @@ class TrueDataAdapter:
             self._error = "METADATA_UNAVAILABLE"
             self._note("DEGRADED", "METADATA_UNAVAILABLE")
             raise GrowConfigError("METADATA_UNAVAILABLE")
+        self._clear_symbol_map()
+        self._note_unknown_expiry_classes()
         self._state = SessionHealth.READY
         self._note("READY", "authenticated")
         if self._instruments:
@@ -431,6 +462,7 @@ class TrueDataAdapter:
 
     def disconnect(self) -> None:
         self.transport.disconnect()
+        self._clear_symbol_map()
         self._state = SessionHealth.STOPPED
         self._note("STOPPED", "disconnect")
 
@@ -456,6 +488,7 @@ class TrueDataAdapter:
             "state": self._state.value,
             "reconnect_count": self.reconnect_count,
             "subscribed": list(self._desired),
+            "mapping_ready": self._mapping_ready,
             "live_trading": False,
         }
 
@@ -494,6 +527,7 @@ class TrueDataAdapter:
             raise GrowConfigError("SUBSCRIPTION_LIMIT")
         self.transport.subscribe(planned)
         self._desired = tuple(dict.fromkeys([*self._desired, *planned]))
+        self._mapping_ready = self._subscription_mapped()
         self.subscription_events.append(
             {
                 "type": "SUBSCRIBE",
@@ -507,6 +541,7 @@ class TrueDataAdapter:
         self.transport.unsubscribe(symbols)
         drop = set(symbols)
         self._desired = tuple(s for s in self._desired if s not in drop)
+        self._mapping_ready = self._subscription_mapped()
 
     def poll(self) -> dict[str, Any] | None:
         if self._state in {SessionHealth.DISCONNECTED, SessionHealth.STOPPED, SessionHealth.CONNECTING}:
@@ -551,7 +586,8 @@ class TrueDataAdapter:
             return {"kind": AUTH, "provider": self.identity, "ok": True}
         if message.kind == SUBSCRIBE:
             self._ingest_symbol_map(message.payload.get("mapping") or {})
-            return {"kind": SUBSCRIBE, "provider": self.identity, "mapping": dict(self._symbol_ids)}
+            self._mapping_ready = self._subscription_mapped()
+            return {"kind": SUBSCRIBE, "provider": self.identity, "mapping": dict(self._symbol_ids), "mapping_ready": self._mapping_ready}
         if message.kind == ERROR:
             self._state = SessionHealth.DEGRADED
             self._error = "PROVIDER_ERROR"
@@ -613,17 +649,15 @@ class TrueDataAdapter:
     def _resolve_provider_symbol(self, fields: Mapping[str, Any]) -> str:
         symbol = str(fields.get("provider_symbol") or "").strip()
         symbol_id = fields.get("symbol_id")
-        if symbol_id not in (None, ""):
-            mapped = self._symbol_ids.get(str(symbol_id))
+        uses_id = symbol_id not in (None, "") or symbol.isdigit()
+        if uses_id:
+            if not self._mapping_ready:
+                raise GrowConfigError("SYMBOL_MAP_NOT_READY")
+            ident = str(symbol_id) if symbol_id not in (None, "") else symbol
+            mapped = self._symbol_ids.get(ident)
             if not mapped:
                 raise GrowConfigError("UNKNOWN_SYMBOL_ID")
-            if symbol and symbol != mapped and not str(symbol).isdigit():
-                if symbol != mapped:
-                    raise GrowConfigError("UNKNOWN_SYMBOL_ID")
-            return mapped
-        if symbol.isdigit():
-            mapped = self._symbol_ids.get(symbol)
-            if not mapped:
+            if symbol and not symbol.isdigit() and symbol != mapped:
                 raise GrowConfigError("UNKNOWN_SYMBOL_ID")
             return mapped
         if not symbol:
@@ -700,6 +734,9 @@ class TrueDataAdapter:
             if row["canonical_symbol"] not in underlyings:
                 continue
             if row.get("option_type") in {"CE", "PE"}:
+                klass = row.get("expiry_class")
+                if not is_tradable_expiry_class(klass):
+                    continue
                 master.append(
                     {
                         "tradingsymbol": row["provider_symbol"],
@@ -709,7 +746,7 @@ class TrueDataAdapter:
                         "option_type": row["option_type"],
                         "instrument_type": "OPTIDX",
                         "lot_size": row.get("lot_size"),
-                        "expiry_class": row.get("expiry_class") or "WEEKLY",
+                        "expiry_class": str(klass).upper(),
                     }
                 )
                 quote = self._quotes.get(row["provider_symbol"])
@@ -745,6 +782,8 @@ class TrueDataAdapter:
         parsed = []
         for row in self._instruments:
             expiry = row.get("expiry")
+            if row.get("option_type") in {"CE", "PE"} and not is_tradable_expiry_class(row.get("expiry_class")):
+                continue
             parsed.append(
                 ParsedInstrument(
                     provider_symbol=str(row["provider_symbol"]),
@@ -755,8 +794,7 @@ class TrueDataAdapter:
                     option_type=None if row.get("option_type") is None else str(row["option_type"]),
                 )
             )
-            if row.get("option_type") in {"CE", "PE"} and row.get("expiry") is not None:
-                continue
+        self._note_unknown_expiry_classes()
         as_of = self.clock.now()
         for symbol in allowed:
             records = self._expiry_records(symbol)
@@ -780,6 +818,7 @@ class TrueDataAdapter:
             self.transport.subscribe(add)
         if planned != self._desired:
             self._desired = planned
+            self._mapping_ready = self._subscription_mapped()
             self.subscription_events.append(
                 {
                     "type": "PLAN",
@@ -790,6 +829,7 @@ class TrueDataAdapter:
             )
         else:
             self._desired = planned
+            self._mapping_ready = self._subscription_mapped()
 
     def _expiry_records(self, symbol: str) -> tuple[HistoricalExpiryRecord, ...]:
         grouped: dict[tuple[date, str], list[datetime]] = {}
@@ -798,7 +838,9 @@ class TrueDataAdapter:
             if row["canonical_symbol"] != symbol or row.get("expiry") is None:
                 continue
             expiry = row["expiry"] if isinstance(row["expiry"], date) else date.fromisoformat(str(row["expiry"]))
-            klass = str(row.get("expiry_class") or "WEEKLY").upper()
+            klass = str(row.get("expiry_class") or UNKNOWN_EXPIRY_CLASS).upper()
+            if klass in {"", "NONE"}:
+                klass = UNKNOWN_EXPIRY_CLASS
             grouped.setdefault((expiry, klass), []).append(as_of)
         rows = []
         for (expiry, klass), _times in grouped.items():
@@ -818,6 +860,8 @@ class TrueDataAdapter:
 
     def _on_feed_error(self, reason: str) -> dict[str, Any] | None:
         self._error = reason
+        if reason == "FEED_DISCONNECTED":
+            self._clear_symbol_map()
         if self.settings.reconnect_policy == "bounded_backoff" and reason == "FEED_DISCONNECTED":
             self._state = SessionHealth.DEGRADED
             self._note("RECONNECTING", reason)
@@ -838,6 +882,7 @@ class TrueDataAdapter:
             return None
         self._attempts += 1
         self.reconnect_count += 1
+        self._clear_symbol_map()
         try:
             self.transport.resubscribe(self._desired)
         except GrowConfigError as exc:
@@ -853,6 +898,7 @@ class TrueDataAdapter:
                 "type": "RESUBSCRIBE",
                 "symbols": list(self._desired),
                 "reconnect_count": self.reconnect_count,
+                "mapping_ready": False,
                 "timestamp": now.isoformat(),
             }
         )

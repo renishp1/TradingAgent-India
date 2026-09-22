@@ -68,12 +68,36 @@ within `max_staleness_seconds`, the adapter goes `DEGRADED` with
 ## Symbol-ID mapping
 
 Live ticks often carry a numeric Symbol ID, not the tradingsymbol.
+The map is **connection-scoped**:
 
-1. `addsymbol` / `symbolsadded` responses store `symbol_id → provider_symbol`.
-2. Catalog rows may also contribute `provider_symbol_id`.
-3. A tick with an unknown id fails closed: `UNKNOWN_SYMBOL_ID`.
-4. `provider_symbol` stays the vendor identity. Canonical contract id
+1. `disconnect` / reconnect start **clears** `_symbol_ids` and sets `mapping_ready=False`.
+2. Fresh authenticate, then resubscribe the desired set.
+3. `symbolsadded` rebuilds `symbol_id → provider_symbol` for this connection only.
+4. `mapping_ready=True` only after that ack covers the current subscription.
+5. A tick with `symbol_id` while `mapping_ready=False` fails closed: `SYMBOL_MAP_NOT_READY`.
+6. An id absent from the **current** map fails closed: `UNKNOWN_SYMBOL_ID`.
+7. Catalog `provider_symbol_id` is metadata only. It is never reused as a live tick map.
+8. `provider_symbol` stays the vendor identity. Canonical contract id
    (`NIFTY-2026-09-22-25000-CE`) is never used as the vendor symbol.
+
+Previous-connection ids (e.g. `101` after a reconnect that mapped `201`) are rejected.
+
+## Expiry class
+
+TrueData symbol lists do not carry `expiry_class`. Grow does not invent one.
+
+| Provider value | Stored class | Eligible for 2I selection / trading |
+|---|---|---|
+| `WEEKLY` | `WEEKLY` | yes |
+| `MONTHLY` | `MONTHLY` | yes |
+| missing / anything else | `UNKNOWN` | **no** |
+
+`UNKNOWN` is never coerced to `WEEKLY` in catalog normalization, snapshot
+`contract_master`, or `_expiry_records()`. 2I profiles (`WEEKLY_PREFERRED`,
+`MONTHLY_ONLY`, `WEEKLY_THEN_MONTHLY`) therefore cannot treat an unknown
+contract as weekly or monthly. The adapter records `UNKNOWN_EXPIRY_CLASS`
+on the subscription log. There is no NSE expiry-calendar classifier in this
+tree; adding one is a later milestone, not a silent fallback.
 
 ## Catalog discovery
 

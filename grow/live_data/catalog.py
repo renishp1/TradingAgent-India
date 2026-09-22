@@ -17,6 +17,32 @@ DEFAULT_CATALOG_URLS = (
     "https://www.truedata.in/downloads/symbol_lists/5.WEB_SOCKET_API_NSE_INDICES_OPTIONS.txt",
 )
 
+KNOWN_EXPIRY_CLASSES = frozenset({"WEEKLY", "MONTHLY"})
+UNKNOWN_EXPIRY_CLASS = "UNKNOWN"
+# TrueData symbol lists do not carry expiry_class. This project has no
+# authoritative NSE expiry-calendar classifier, so a missing class stays
+# UNKNOWN and is ineligible for expiry selection / trading. Never coerce
+# UNKNOWN → WEEKLY.
+
+
+def normalize_expiry_class(raw: Any, *, is_option: bool) -> str | None:
+    """Preserve WEEKLY/MONTHLY when the provider supplies them. Never invent WEEKLY."""
+    if not is_option:
+        if raw in (None, ""):
+            return None
+        text = str(raw).strip().upper()
+        return text or None
+    if raw in (None, ""):
+        return UNKNOWN_EXPIRY_CLASS
+    text = str(raw).strip().upper()
+    if text in KNOWN_EXPIRY_CLASSES:
+        return text
+    return UNKNOWN_EXPIRY_CLASS
+
+
+def is_tradable_expiry_class(klass: Any) -> bool:
+    return str(klass or "").upper() in KNOWN_EXPIRY_CLASSES
+
 
 def parse_catalog_text(text: str, *, source: str = OPTION_LIST) -> list[dict[str, Any]]:
     if text is None:
@@ -38,6 +64,7 @@ def parse_catalog_text(text: str, *, source: str = OPTION_LIST) -> list[dict[str
         raise GrowConfigError("METADATA_UNAVAILABLE")
     rows: list[dict[str, Any]] = []
     header: list[str] | None = None
+    header_tokens = {"symbol", "lot", "lot_size", "expiry", "expiry_class", "class"}
     for line in body.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
@@ -45,7 +72,7 @@ def parse_catalog_text(text: str, *, source: str = OPTION_LIST) -> list[dict[str
         if "," in stripped:
             parts = [p.strip() for p in stripped.split(",")]
             if header is None and any(not p.replace(".", "", 1).isdigit() for p in parts[1:] or [""]) and any(
-                token.lower() in {"symbol", "lot", "lot_size", "expiry"} for token in parts
+                token.lower() in header_tokens for token in parts
             ):
                 header = [p.lower() for p in parts]
                 continue
@@ -77,7 +104,9 @@ def normalize_catalog_row(row: Mapping[str, Any] | str) -> dict[str, Any]:
     except (TypeError, ValueError) as exc:
         raise GrowConfigError("INVALID_LOT_SIZE") from exc
     ident = row.get("symbol_id") or row.get("symbolid") or row.get("provider_symbol_id")
-    klass = str(row.get("expiry_class") or ("WEEKLY" if parsed.option_type else "")).upper() or None
+    option_type = parsed.option_type if row.get("option_type") in (None, "") else str(row["option_type"]).upper()
+    is_option = option_type in {"CE", "PE"} or parsed.instrument_type == "INDEX_OPTION"
+    klass = normalize_expiry_class(row.get("expiry_class") if "expiry_class" in row else row.get("class"), is_option=is_option)
     return {
         "provider_symbol": provider_symbol,
         "provider_symbol_id": None if ident in (None, "") else str(ident),
@@ -85,7 +114,7 @@ def normalize_catalog_row(row: Mapping[str, Any] | str) -> dict[str, Any]:
         "instrument_type": str(row.get("instrument_type") or parsed.instrument_type),
         "expiry": expiry,
         "strike": parsed.strike if row.get("strike") in (None, "") else float(row["strike"]),
-        "option_type": parsed.option_type if row.get("option_type") in (None, "") else str(row["option_type"]).upper(),
+        "option_type": option_type,
         "lot_size": lot_size,
         "expiry_class": klass,
     }

@@ -11,13 +11,15 @@ from grow.clock import FrozenClock, IST
 from grow.config import load_config
 from grow.errors import GrowConfigError
 from grow.execution.lock import LIVE_TRADING_COMPILED
+from grow.history.resolver import DISALLOWED_CLASS, NO_ELIGIBLE_EXPIRY, resolve_nearest_expiry
 from grow.history.universe import (
     IndexPolicy,
     IndexUniverseRegistry,
+    MONTHLY_ONLY,
     WEEKLY_PREFERRED,
     default_index_policies,
 )
-from grow.live_data.catalog import parse_catalog_text, merge_catalog
+from grow.live_data.catalog import UNKNOWN_EXPIRY_CLASS, normalize_catalog_row, parse_catalog_text, merge_catalog
 from grow.live_data.loop import LivePaperLoop
 from grow.live_data.mock import bullish_event
 from grow.live_data.models import TRUEDATA_PROVIDER_ID, CycleStatus, SessionHealth
@@ -428,6 +430,10 @@ def _auth_ok() -> str:
     return '{"success": true, "message": "TrueData Real Time Data Service"}'
 
 
+def _symbolsadded(pairs) -> str:
+    return json.dumps({"success": True, "message": "symbols added", "symbolsadded": pairs})
+
+
 def _td_symbol(underlying: str, expiry, strike, kind: str) -> str:
     day = date.fromisoformat(expiry) if isinstance(expiry, str) else expiry
     return f"{underlying}{day.strftime('%y%m%d')}{int(strike)}{kind}"
@@ -582,9 +588,11 @@ class RealTransportTests(unittest.TestCase):
         ]
         adapter, _sock = _real_adapter(incoming, catalog)
         adapter.connect()
+        self.assertFalse(adapter._mapping_ready)
         ack = adapter.poll()
         self.assertEqual(ack["kind"], "subscribe")
         self.assertEqual(adapter._symbol_ids[str(index_id)], "NIFTY 50")
+        self.assertTrue(adapter._mapping_ready)
         snap = adapter.poll()
         self.assertIsNotNone(snap)
         self.assertEqual(snap["spots"]["NIFTY"], 25040.0)
@@ -650,14 +658,20 @@ class RealTransportTests(unittest.TestCase):
         catalog["spot_bars"] = []
         index_id = catalog["mapping"][0][1]
         spot = float(catalog["spots"]["NIFTY"])
-        adapter, _sock = _real_adapter([_auth_ok(), _trade(index_id, spot, seq=1)], catalog)
+        incoming = [_auth_ok(), _symbolsadded([catalog["mapping"][0]]), _trade(index_id, spot, seq=1)]
+        adapter, _sock = _real_adapter(incoming, catalog)
         adapter.connect()
         self.assertIn("NIFTY 50", adapter._desired)
         self.assertFalse(any(symbol.endswith(("CE", "PE")) for symbol in adapter._desired))
+        self.assertFalse(adapter._mapping_ready)
+        ack = adapter.poll()
+        self.assertEqual(ack["kind"], "subscribe")
+        self.assertTrue(adapter._mapping_ready)
         snap = adapter.poll()
         self.assertIsNotNone(snap)
         self.assertEqual(snap["spots"]["NIFTY"], spot)
         self.assertTrue(any(symbol.endswith("CE") for symbol in adapter._desired))
+        self.assertFalse(adapter._mapping_ready)
 
     def test_stale_without_heartbeat_or_ticks(self) -> None:
         catalog = _nifty_catalog()
@@ -824,6 +838,9 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(rows[1]["lot_size"], 75)
         self.assertEqual(rows[1]["expiry"], date(2026, 9, 22))
         self.assertEqual(rows[2]["canonical_symbol"], "FINNIFTY")
+        self.assertEqual(rows[1]["expiry_class"], UNKNOWN_EXPIRY_CLASS)
+        self.assertNotEqual(rows[1]["expiry_class"], "WEEKLY")
+        self.assertIsNone(rows[0]["expiry_class"])
         merged = merge_catalog(rows)
         self.assertEqual(len(merged), 3)
 
@@ -854,6 +871,229 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(rows[0]["provider_symbol_id"], "42")
         self.assertEqual(rows[0]["provider_symbol"], "NIFTY26092225000CE")
         self.assertNotEqual(rows[0]["provider_symbol"], "NIFTY-2026-09-22-25000-CE")
+        self.assertEqual(rows[0]["expiry_class"], "WEEKLY")
+
+
+class ExpiryClassTests(unittest.TestCase):
+    def test_explicit_weekly_remains_weekly(self) -> None:
+        row = normalize_catalog_row(
+            {
+                "provider_symbol": "NIFTY26092225000CE",
+                "lot_size": 75,
+                "expiry_class": "WEEKLY",
+            }
+        )
+        self.assertEqual(row["expiry_class"], "WEEKLY")
+
+    def test_explicit_monthly_remains_monthly(self) -> None:
+        row = normalize_catalog_row(
+            {
+                "provider_symbol": "NIFTY26092925000CE",
+                "lot_size": 75,
+                "expiry_class": "MONTHLY",
+            }
+        )
+        self.assertEqual(row["expiry_class"], "MONTHLY")
+
+    def test_missing_expiry_class_is_unknown_not_weekly(self) -> None:
+        row = normalize_catalog_row({"provider_symbol": "NIFTY26092225000CE", "lot_size": 75})
+        self.assertEqual(row["expiry_class"], UNKNOWN_EXPIRY_CLASS)
+        self.assertNotEqual(row["expiry_class"], "WEEKLY")
+        adapter = TrueDataAdapter(
+            events=(),
+            catalog=[row, {"provider_symbol": "NIFTY 50", "lot_size": None}],
+            settings=_settings(),
+            clock=FrozenClock(AS_OF),
+        )
+        adapter._spots["NIFTY"] = 25000.0
+        adapter.connect()
+        classes = {item["expiry_class"] for item in adapter.instrument_catalog() if item.get("option_type") == "CE"}
+        self.assertEqual(classes, {UNKNOWN_EXPIRY_CLASS})
+        self.assertNotIn("WEEKLY", classes)
+        self.assertTrue(any(ev.get("reason") == "UNKNOWN_EXPIRY_CLASS" for ev in adapter.subscription_events))
+        self.assertFalse(any(symbol.endswith("CE") for symbol in adapter._desired))
+        records = adapter._expiry_records("NIFTY")
+        self.assertTrue(records)
+        self.assertTrue(all(rec.expiry_class == UNKNOWN_EXPIRY_CLASS for rec in records))
+
+    def test_monthly_only_rejects_unknown_class(self) -> None:
+        catalog = [
+            {"provider_symbol": "NIFTY 50", "lot_size": None},
+            {"provider_symbol": "NIFTY26092225000CE", "lot_size": 75, "expiry": date(2026, 9, 22), "option_type": "CE"},
+        ]
+        policies = tuple(
+            replace(policy, expiry_policy_profile=MONTHLY_ONLY) if policy.canonical_symbol == "NIFTY" else policy
+            for policy in default_index_policies()
+        )
+        adapter = TrueDataAdapter(
+            events=(),
+            catalog=catalog,
+            settings=_settings(),
+            clock=FrozenClock(AS_OF),
+            registry=IndexUniverseRegistry(policies),
+        )
+        records = adapter._expiry_records("NIFTY")
+        self.assertTrue(all(rec.expiry_class == UNKNOWN_EXPIRY_CLASS for rec in records))
+        resolved = resolve_nearest_expiry("NIFTY", AS_OF, records, MONTHLY_ONLY, allow_same_day=False)
+        self.assertIsNone(resolved.selected_expiry)
+        self.assertIsNone(resolved.selected_expiry_class)
+        self.assertTrue(any(DISALLOWED_CLASS in reason or NO_ELIGIBLE_EXPIRY in reason for reason in resolved.exclusion_reasons))
+        self.assertNotEqual(resolved.selected_expiry_class, "MONTHLY")
+        self.assertNotEqual(resolved.selected_expiry_class, "WEEKLY")
+
+    def test_weekly_preferred_does_not_treat_unknown_as_weekly(self) -> None:
+        catalog = [
+            {"provider_symbol": "NIFTY 50", "lot_size": None},
+            {
+                "provider_symbol": "NIFTY26092225000CE",
+                "lot_size": 75,
+                "expiry": date(2026, 9, 22),
+                "option_type": "CE",
+                "expiry_class": UNKNOWN_EXPIRY_CLASS,
+            },
+            {
+                "provider_symbol": "NIFTY26092425000CE",
+                "lot_size": 75,
+                "expiry": date(2026, 9, 24),
+                "option_type": "CE",
+                "expiry_class": "MONTHLY",
+            },
+        ]
+        adapter = TrueDataAdapter(events=(), catalog=catalog, settings=_settings(), clock=FrozenClock(AS_OF))
+        adapter._spots["NIFTY"] = 25000.0
+        adapter.connect()
+        records = adapter._expiry_records("NIFTY")
+        by_class = {rec.expiry.isoformat(): rec.expiry_class for rec in records}
+        self.assertEqual(by_class["2026-09-22"], UNKNOWN_EXPIRY_CLASS)
+        self.assertEqual(by_class["2026-09-24"], "MONTHLY")
+        resolved = resolve_nearest_expiry("NIFTY", AS_OF, records, WEEKLY_PREFERRED, allow_same_day=False)
+        self.assertIsNone(resolved.selected_expiry)
+        self.assertNotEqual(resolved.selected_expiry_class, "WEEKLY")
+        self.assertFalse(any("NIFTY26092225000CE" in symbol for symbol in adapter._desired))
+        snap_classes = [
+            row.get("expiry_class")
+            for row in adapter._instruments
+            if row["provider_symbol"] == "NIFTY26092225000CE"
+        ]
+        self.assertEqual(snap_classes, [UNKNOWN_EXPIRY_CLASS])
+
+
+class SymbolMapReconnectTests(unittest.TestCase):
+    def _index_catalog(self):
+        return {
+            "instruments": [
+                {"provider_symbol": "NIFTY 50", "canonical_symbol": "NIFTY", "instrument_type": "INDEX", "lot_size": None}
+            ],
+            "spot_bars": [],
+            "quotes": [],
+            "spots": {"NIFTY": 25040.0},
+        }
+
+    def test_tick_before_symbolsadded_is_rejected(self) -> None:
+        catalog = self._index_catalog()
+        adapter, _sock = _real_adapter([_auth_ok(), _trade(101, 25040.0, seq=1)], catalog)
+        adapter.connect()
+        self.assertFalse(adapter._mapping_ready)
+        self.assertEqual(adapter._symbol_ids, {})
+        with self.assertRaises(GrowConfigError) as ctx:
+            adapter.poll()
+        self.assertIn("SYMBOL_MAP_NOT_READY", str(ctx.exception))
+
+    def test_symbol_map_is_connection_scoped(self) -> None:
+        catalog = self._index_catalog()
+        incoming = [
+            _auth_ok(),
+            _symbolsadded([["NIFTY 50", 101]]),
+            _trade(101, 25040.0, seq=1),
+            _auth_ok(),
+            _symbolsadded([["NIFTY 50", 201]]),
+            _trade(201, 25041.0, seq=2),
+            _trade(101, 25042.0, seq=3),
+        ]
+        adapter, _sock = _real_adapter(
+            incoming,
+            catalog,
+            reconnect_policy="bounded_backoff",
+        )
+        adapter.connect()
+        ack = adapter.poll()
+        self.assertEqual(ack["kind"], "subscribe")
+        self.assertEqual(adapter._symbol_ids, {"101": "NIFTY 50"})
+        self.assertTrue(adapter._mapping_ready)
+        snap = adapter.poll()
+        self.assertEqual(snap["spots"]["NIFTY"], 25040.0)
+        adapter.transport.connected = False
+        adapter._state = SessionHealth.DEGRADED
+        adapter._on_feed_error("FEED_DISCONNECTED")
+        self.assertFalse(adapter._mapping_ready)
+        self.assertEqual(adapter._symbol_ids, {})
+        adapter.clock.advance(timedelta(seconds=2))
+        ack2 = adapter.poll()
+        self.assertEqual(ack2["kind"], "subscribe")
+        self.assertEqual(adapter._symbol_ids, {"201": "NIFTY 50"})
+        self.assertNotIn("101", adapter._symbol_ids)
+        self.assertTrue(adapter._mapping_ready)
+        snap2 = adapter.poll()
+        self.assertEqual(snap2["spots"]["NIFTY"], 25041.0)
+        with self.assertRaises(GrowConfigError) as ctx:
+            adapter.poll()
+        self.assertIn("UNKNOWN_SYMBOL_ID", str(ctx.exception))
+
+    def test_tick_before_new_symbolsadded_after_reconnect(self) -> None:
+        catalog = self._index_catalog()
+        incoming = [
+            _auth_ok(),
+            _symbolsadded([["NIFTY 50", 101]]),
+            _trade(101, 25040.0, seq=1),
+            _auth_ok(),
+            _trade(201, 25041.0, seq=2),
+        ]
+        adapter, _sock = _real_adapter(incoming, catalog, reconnect_policy="bounded_backoff")
+        adapter.connect()
+        adapter.poll()
+        adapter.poll()
+        adapter.transport.connected = False
+        adapter._state = SessionHealth.DEGRADED
+        adapter._on_feed_error("FEED_DISCONNECTED")
+        adapter.clock.advance(timedelta(seconds=2))
+        self.assertFalse(adapter._mapping_ready)
+        with self.assertRaises(GrowConfigError) as ctx:
+            adapter.poll()
+        self.assertIn("SYMBOL_MAP_NOT_READY", str(ctx.exception))
+        self.assertNotIn("101", adapter._symbol_ids)
+
+    def test_reconnect_respects_max_symbols(self) -> None:
+        catalog = _nifty_catalog()
+        socket = ScriptedSocket([_auth_ok(), _auth_ok()])
+        adapter = TrueDataAdapter(
+            settings=TrueDataSettings(
+                mode="real",
+                reconnect_policy="bounded_backoff",
+                max_attempts=3,
+                max_backoff_seconds=8,
+                max_symbols=3,
+            ),
+            environ={"TRUEDATA_USERNAME": "user", "TRUEDATA_PASSWORD": "pass"},
+            socket_factory=lambda: socket,
+            catalog_loader=lambda: catalog,
+            clock=FrozenClock(AS_OF),
+        )
+        adapter._spots["NIFTY"] = float(catalog["spots"]["NIFTY"])
+        adapter.connect()
+        self.assertLessEqual(len(adapter._desired), 3)
+        before = adapter._desired
+        adapter.transport.connected = False
+        adapter._state = SessionHealth.DEGRADED
+        adapter._on_feed_error("FEED_DISCONNECTED")
+        adapter.clock.advance(timedelta(seconds=2))
+        adapter.poll()
+        self.assertLessEqual(len(adapter._desired), 3)
+        self.assertEqual(adapter._desired, before)
+        addsymbol = [item for item in socket.sent if item.startswith("addsymbol:")]
+        self.assertTrue(addsymbol)
+        for payload in addsymbol:
+            symbols = payload.split(":", 1)[1].split("+") if ":" in payload else []
+            self.assertLessEqual(len([s for s in symbols if s]), 3)
 
 
 class SmokeScriptTests(unittest.TestCase):
