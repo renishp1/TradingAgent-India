@@ -66,6 +66,10 @@ def validate_chain(
         )
     if config.allow_live_chain or config.provider == "live" or "live" in chain.source_id.lower():
         return (), (), ("LIVE_CHAIN_FORBIDDEN",)
+    if config.provider == "fixture" and chain.is_fixture is False:
+        return (), (), ("LIVE_CHAIN_FORBIDDEN",)
+    if config.provider not in {"fixture", "historical"}:
+        return (), (), ("LIVE_CHAIN_FORBIDDEN",)
     age = (as_of - chain.as_of).total_seconds() / 60.0
     if chain.as_of > as_of:
         return (), (), ("CHAIN_FROM_FUTURE",)

@@ -282,9 +282,26 @@ class OptionsEngineTests(unittest.TestCase):
         live = replace(self.chain, source_id="zerodha-live", is_fixture=False)
         decision = self.engine.evaluate(_signal("NIFTY", "BULLISH", self.as_of), self.snap, live)
         self.assertEqual(decision.status, DecisionStatus.NO_TRADE)
+        self.assertIn("LIVE_CHAIN_FORBIDDEN", decision.diagnostics)
         object.__setattr__(self.config.options, "allow_live_chain", True)
         with self.assertRaises(GrowConfigError):
             self.config.assert_safe()
+
+    def test_fixture_provider_rejects_non_fixture_chain(self) -> None:
+        chain = replace(self.chain, is_fixture=False, source_id="t")
+        decision = self.engine.evaluate(_signal("NIFTY", "BULLISH", self.as_of), self.snap, chain)
+        self.assertEqual(decision.status, DecisionStatus.NO_TRADE)
+        self.assertIn("LIVE_CHAIN_FORBIDDEN", decision.diagnostics)
+
+    def test_historical_provider_accepts_non_fixture_chain(self) -> None:
+        cfg = replace(self.config, options=replace(self.config.options, provider="historical", allow_live_chain=False))
+        engine = IndexOptionsEngine(cfg)
+        chain = replace(self.chain, is_fixture=False, source_id="t")
+        decision = engine.evaluate(_signal("NIFTY", "BULLISH", self.as_of), self.snap, chain)
+        self.assertNotIn("LIVE_CHAIN_FORBIDDEN", decision.diagnostics)
+        live = replace(chain, source_id="vendor-live")
+        blocked = engine.evaluate(_signal("NIFTY", "BULLISH", self.as_of), self.snap, live)
+        self.assertIn("LIVE_CHAIN_FORBIDDEN", blocked.diagnostics)
 
     def test_no_eligible_expiry_no_trade(self) -> None:
         chain = replace(

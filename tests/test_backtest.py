@@ -574,7 +574,10 @@ class BacktestTests(unittest.TestCase):
                 self.last_packet = packet
                 return super().run(packet)
 
-        config = load_config()
+        config = replace(
+            load_config(),
+            options=replace(load_config().options, provider="historical", allow_live_chain=False),
+        )
         ledger = BacktestLedger()
         orch = CaptureOrch(config)
         pipe = DecisionPipeline(
