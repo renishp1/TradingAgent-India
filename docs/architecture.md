@@ -9,6 +9,7 @@ Milestone 2A (data plane, fixture only) lives in [`docs/milestone-2a.md`](milest
 Milestone 2H (provider evaluation, nearest weekly) lives in [`docs/provider.md`](provider.md).
 Milestone 2I (dynamic index/expiry discovery) lives in [`docs/dynamic.md`](dynamic.md).
 Milestone 3A (live stream → paper) lives in [`docs/live_data.md`](live_data.md).
+Milestone 3B (paper MTM + exits) lives in [`docs/positions.md`](positions.md).
 
 ## Product split
 

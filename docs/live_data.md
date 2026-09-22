@@ -77,6 +77,8 @@ The loop only refuses a cycle using the injected `Clock`:
 
 These gates are deterministic under `FrozenClock.advance()`.
 
+Milestone 3B (paper MTM + deterministic exits) lives in [`docs/positions.md`](positions.md).
+
 ## Session health
 
 `DISCONNECTED` → `CONNECTING` → `READY` → `RUNNING`.  

@@ -192,3 +192,64 @@ class RiskGuard:
     def require_stamp(self, proposal: TradeProposal, stamp: RiskStamp | None) -> None:
         if not self.verify_stamp(proposal, stamp):
             raise GrowSafetyError("Paper ledger refused an unstamped or forged proposal.")
+
+    def evaluate_exit(
+        self,
+        proposal: TradeProposal,
+        brief: MarketBrief,
+        *,
+        cash: float,
+        gross_notional: float,
+        daily_pnl: float,
+        symbol_notional: float,
+    ) -> RiskVerdict:
+        """Exit-only stamp. Reduces exposure. Never opens. Never creates a short."""
+        assert_paper_runtime(
+            self.config.execution.mode,
+            self.config.execution.live_trading_enabled,
+            proposal.venue.value,
+        )
+        now = self.clock.now().astimezone(IST)
+        results: list[tuple[str, bool, str]] = []
+
+        def rule(rule_id: str, passed: bool, detail: str) -> None:
+            results.append((rule_id, passed, detail))
+
+        rule("venue.paper", proposal.venue is Venue.PAPER, f"venue={proposal.venue.value}")
+        rule(
+            "exit.intent",
+            proposal.intent in {Intent.CLOSE, Intent.REDUCE, Intent.SQUARE_OFF},
+            f"intent={proposal.intent.value}",
+        )
+        rule("exit.side", proposal.side is Side.SELL, f"side={proposal.side.value}")
+        rule("exit.not_open", proposal.intent is not Intent.OPEN, f"intent={proposal.intent.value}")
+        rule("quantity.positive", proposal.quantity > 0, f"qty={proposal.quantity}")
+        rule(
+            "price.positive",
+            proposal.limit_price > 0 and brief.last_price > 0,
+            f"limit={proposal.limit_price} last={brief.last_price}",
+        )
+        expected_notional = round(proposal.quantity * proposal.limit_price, 2)
+        rule(
+            "notional.matches",
+            abs(proposal.notional - expected_notional) <= 1e-6,
+            f"notional={proposal.notional:.2f} expected={expected_notional:.2f}",
+        )
+        rule("exit.safety", True, "exit-only path reduces exposure; session flatten permitted")
+
+        failed = [(rid, detail) for rid, passed, detail in results if not passed]
+        if failed:
+            rule_id, detail = failed[0]
+            return RiskVerdict(
+                approved=False,
+                rule_results=tuple(results),
+                stamp=None,
+                reason=f"{rule_id}: {detail}",
+            )
+        stamp = self._stamp(proposal, now)
+        return RiskVerdict(
+            approved=True,
+            rule_results=tuple(results),
+            stamp=stamp,
+            reason="approved",
+        )

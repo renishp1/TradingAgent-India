@@ -258,6 +258,11 @@ class LiveDataConfig:
     live_trading: bool
     quantity: int
     allowed_underlyings: tuple[str, ...]
+    stop_loss_pct: float
+    take_profit_pct: float
+    session_close_square_off: bool
+    position_exit_quote_source: str
+    allow_trailing_stop: bool
 
 
 @dataclass(frozen=True)
@@ -392,6 +397,16 @@ class GrowConfig:
             raise GrowConfigError("live_data.snapshot_interval_seconds must be >= 0")
         if self.live_data.quantity < 1:
             raise GrowConfigError("live_data.quantity (lots) must be >= 1")
+        if self.live_data.stop_loss_pct <= 0 or self.live_data.stop_loss_pct >= 1:
+            raise GrowConfigError("live_data.stop_loss_pct must be in (0, 1)")
+        if self.live_data.take_profit_pct <= 0:
+            raise GrowConfigError("live_data.take_profit_pct must be > 0")
+        if (1.0 + self.live_data.take_profit_pct) <= (1.0 - self.live_data.stop_loss_pct):
+            raise GrowConfigError("live_data take_profit price must exceed stop_loss price")
+        if self.live_data.allow_trailing_stop:
+            raise GrowConfigError("3B trailing stop is not implemented")
+        if self.live_data.position_exit_quote_source not in {"bid_then_ltp"}:
+            raise GrowConfigError("live_data.position_exit_quote_source must be bid_then_ltp")
         if self.live_data.enabled:
             if self.data.allow_live_feed:
                 raise GrowConfigError("3A must not flip data.allow_live_feed. live_data is a separate plane.")
@@ -590,6 +605,11 @@ def _live_data_config(raw: dict[str, Any]) -> LiveDataConfig:
         live_trading=_as_bool(raw.get("live_trading", False), "live_data.live_trading"),
         quantity=_as_int(raw.get("quantity", 1), "live_data.quantity"),
         allowed_underlyings=tuple(str(s).strip().upper() for s in allowed),
+        stop_loss_pct=_as_float(raw.get("stop_loss_pct", 0.20), "live_data.stop_loss_pct"),
+        take_profit_pct=_as_float(raw.get("take_profit_pct", 0.20), "live_data.take_profit_pct"),
+        session_close_square_off=_as_bool(raw.get("session_close_square_off", True), "live_data.session_close_square_off"),
+        position_exit_quote_source=str(raw.get("position_exit_quote_source", "bid_then_ltp")).lower(),
+        allow_trailing_stop=_as_bool(raw.get("allow_trailing_stop", False), "live_data.allow_trailing_stop"),
     )
 
 

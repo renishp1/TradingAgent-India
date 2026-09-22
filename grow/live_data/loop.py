@@ -29,8 +29,10 @@ from grow.live_data.normalize import normalize_event
 from grow.live_data.provider import LiveDataProvider, open_provider
 from grow.market.session import SessionCalendar
 from grow.options.engine import IndexOptionsEngine
-from grow.options.models import DecisionStatus, OptionCandidate, OptionCandidate
+from grow.options.models import DecisionStatus
+from grow.paper.exits import ExitDecision, ExitReason
 from grow.paper.ledger import PaperLedger, expected_notional
+from grow.paper.positions import PositionRegistry, PositionState
 from grow.research.models import CEOVerdict
 from grow.research.orchestrator import ResearchOrchestrator
 from grow.research.packet import build_packet
@@ -110,6 +112,12 @@ class LivePaperLoop:
         self.ledger = PaperLedger(config, self.guard, clock=self.clock)
         self.simulator = ExecutionSimulator(SlippageModel(config.backtest.slippage_bps), quantity=config.live_data.quantity)
         self.costs = CostModel()
+        self.positions = PositionRegistry(
+            starting_cash=config.paper.starting_cash,
+            clock=self.clock,
+            calendar=self.calendar,
+            session_close_square_off=config.live_data.session_close_square_off,
+        )
         self.session = LiveSessionRecord(
             session_id=uuid4().hex[:12],
             provider_id=provider.identity,
@@ -121,6 +129,7 @@ class LivePaperLoop:
         self._last_cycle_at: datetime | None = None
         self._seen_events: set[str] = set()
         self._open_contracts: set[str] = set()
+        self._closed_this_cycle: set[str] = set()
         self.cycles: list[LiveCycleReport] = []
         self.snapshots: list[LiveSnapshot] = []
         self.last_snapshot: LiveSnapshot | None = None
@@ -278,10 +287,28 @@ class LivePaperLoop:
             self._complete_cycle()
             return reports
         self._transition(SessionHealth.RUNNING)
-        targets = [underlying] if underlying else list(snapshot.underlyings)
-        reports: list[LiveCycleReport] = []
-        for symbol in targets:
-            reports.append(self._evaluate(symbol, snapshot))
+        self._closed_this_cycle = set()
+        reports: list[LiveCycleReport] = list(self._manage_positions(snapshot, underlying))
+        if self._allows_new_entries(snapshot):
+            targets = [underlying] if underlying else list(snapshot.underlyings)
+            for symbol in targets:
+                reports.append(self._evaluate(symbol, snapshot))
+        elif not reports:
+            report = _no_trade(
+                session_id=self.session.session_id,
+                event_id=_event_id(self.session.session_id, snapshot, underlying or "*", "blocked"),
+                sequence=snapshot.sequence,
+                as_of=snapshot.event_time,
+                underlying=underlying or "*",
+                reason="NEW_ENTRIES_BLOCKED",
+                provider_id=snapshot.provider_id,
+                health=self._state,
+                snapshot_id=snapshot.snapshot_id,
+                extras={"session_summary": self.positions.summary().to_dict()},
+            )
+            self.cycles.append(report)
+            self.positions.note_no_trade()
+            reports.append(report)
         self._complete_cycle()
         return reports
 
@@ -364,7 +391,7 @@ class LivePaperLoop:
             report = _no_trade(**base, reason=why, candidate_id=candidate.candidate_id, decision_id=ceo.decision_id)
             self.cycles.append(report)
             return report
-        if ident in self._open_contracts:
+        if ident in self._open_contracts or ident in self._closed_this_cycle or self.positions.has_open(ident):
             report = _no_trade(
                 **base,
                 reason="DUPLICATE_OPEN_POSITION",
@@ -372,6 +399,7 @@ class LivePaperLoop:
                 decision_id=ceo.decision_id,
             )
             self.cycles.append(report)
+            self.positions.note_no_trade()
             return report
         filled = self.simulator.enter(candidate, as_of=snapshot.event_time)
         if isinstance(filled, str):
@@ -381,6 +409,8 @@ class LivePaperLoop:
         lots = self.config.live_data.quantity
         quantity = lots * lot
         ticker = ident
+        sl_pct = self.config.live_data.stop_loss_pct
+        tp_pct = self.config.live_data.take_profit_pct
         self._ensure_universe(ticker)
         proposal = TradeProposal(
             proposal_id=f"lp-{ceo.decision_id}",
@@ -389,8 +419,8 @@ class LivePaperLoop:
             intent=Intent.OPEN,
             quantity=quantity,
             limit_price=filled.price,
-            stop_loss=round(filled.price * 0.8, 2),
-            take_profit=round(filled.price * 1.2, 2),
+            stop_loss=round(filled.price * (1.0 - sl_pct), 2),
+            take_profit=round(filled.price * (1.0 + tp_pct), 2),
             thesis=ceo.rationale_summary,
             confidence=ceo.confidence,
             venue=Venue.PAPER,
@@ -436,6 +466,25 @@ class LivePaperLoop:
         fill = self.ledger.submit(proposal, verdict.stamp)
         self._seen_events.add(event_id)
         self._open_contracts.add(ident)
+        position = self.positions.register_open(
+            session_id=self.session.session_id,
+            candidate_id=candidate.candidate_id,
+            contract_id=ident,
+            underlying=symbol,
+            expiry=candidate.expiry,
+            strike=candidate.strike,
+            option_type=str(candidate.option_type),
+            provider_id=snapshot.provider_id,
+            lot_size=lot,
+            lots=lots,
+            quantity=quantity,
+            entry_price=fill.price,
+            opened_at=fill.filled_at,
+            stop_loss_price=proposal.stop_loss or round(fill.price * (1.0 - sl_pct), 2),
+            take_profit_price=proposal.take_profit or round(fill.price * (1.0 + tp_pct), 2),
+            fill_id=fill.fill_id,
+            snapshot_id=snapshot.snapshot_id,
+        )
         report = LiveCycleReport(
             session_id=self.session.session_id,
             event_id=event_id,
@@ -462,6 +511,177 @@ class LivePaperLoop:
                 "entry_reference": filled.reference,
                 "pnl_formula": "price_delta * lots * lot_size",
                 "contract_pnl_if_flat": contract_pnl(entry=fill.price, exit=fill.price, lots=lots, lot_size=lot),
+                "position_id": position.position_id,
+                "stop_loss_price": position.stop_loss_price,
+                "take_profit_price": position.take_profit_price,
+                "session_summary": self.positions.summary().to_dict(),
+            },
+        )
+        self.cycles.append(report)
+        return report
+
+    def _allows_new_entries(self, snapshot: LiveSnapshot) -> bool:
+        if self._state in {SessionHealth.STALE, SessionHealth.DEGRADED, SessionHealth.STOPPED}:
+            return False
+        if self.positions.halted or self.positions.unresolved_close:
+            return False
+        return self.calendar.allows_new_entries(snapshot.event_time)
+
+    def _manage_positions(self, snapshot: LiveSnapshot, underlying: str | None) -> list[LiveCycleReport]:
+        del underlying
+        reports: list[LiveCycleReport] = []
+        self.positions.mark(snapshot)
+        for decision in self.positions.exits(snapshot):
+            reports.append(self._close_position(decision, snapshot))
+        if self.positions.halted:
+            self._transition(SessionHealth.DEGRADED)
+        return reports
+
+    def _close_position(self, decision: ExitDecision, snapshot: LiveSnapshot) -> LiveCycleReport:
+        position = self.positions.get(decision.position_id)
+        event_id = f"{self.session.session_id}:{snapshot.sequence}:{decision.position_id}:close"
+        base = dict(
+            session_id=self.session.session_id,
+            event_id=event_id,
+            sequence=snapshot.sequence,
+            as_of=snapshot.event_time,
+            underlying=position.underlying if position else "*",
+            provider_id=snapshot.provider_id,
+            health=self._state,
+            snapshot_id=snapshot.snapshot_id,
+            candidate_id=None if position is None else position.candidate_id,
+        )
+        if position is None or position.state is PositionState.CLOSED:
+            report = _no_trade(**base, reason="DUPLICATE_CLOSE")
+            self.cycles.append(report)
+            return report
+        pending = self.positions.begin_exit(position.position_id)
+        if pending is None:
+            report = _no_trade(**base, reason="DUPLICATE_CLOSE")
+            self.cycles.append(report)
+            return report
+        filled = self.simulator.exit(None, as_of=snapshot.event_time, reason=decision.reason, fallback_bid=decision.mark_price)
+        if isinstance(filled, str):
+            self.positions.abort_exit(position.position_id, filled)
+            if decision.reason == ExitReason.SESSION_CLOSE:
+                self.positions.unresolved_close = True
+                self.positions.halted = True
+                self._transition(SessionHealth.DEGRADED)
+            report = _no_trade(
+                **base,
+                reason=filled,
+                extras={"position_id": position.position_id, "exit_reason": decision.reason},
+            )
+            self.cycles.append(report)
+            return report
+        ticker = position.contract_id
+        self._ensure_universe(ticker)
+        intent = Intent.SQUARE_OFF if decision.reason == ExitReason.SESSION_CLOSE else Intent.CLOSE
+        proposal = TradeProposal(
+            proposal_id=f"px-{position.position_id}-{decision.reason}",
+            symbol=Symbol(ticker),
+            side=Side.SELL,
+            intent=intent,
+            quantity=position.quantity,
+            limit_price=filled.price,
+            stop_loss=None,
+            take_profit=None,
+            thesis=f"3B deterministic {decision.reason}",
+            confidence=1.0,
+            venue=Venue.PAPER,
+            created_at=snapshot.event_time,
+            notional=expected_notional(position.quantity, filled.price),
+            extras={
+                "position_id": position.position_id,
+                "exit_reason": decision.reason,
+                "lot_size": position.lot_size,
+                "lots": position.lots,
+            },
+        )
+        brief = MarketBrief(
+            symbol=proposal.symbol,
+            as_of=snapshot.event_time,
+            session=self.calendar.state(snapshot.event_time),
+            last_price=filled.price,
+            currency="INR",
+            regime=Regime.UNKNOWN,
+            source=snapshot.provider_id,
+        )
+        book = self.ledger.book
+        verdict = self.guard.evaluate_exit(
+            proposal,
+            brief,
+            cash=book.cash,
+            gross_notional=book.gross_notional,
+            daily_pnl=book.realized_pnl,
+            symbol_notional=book.symbol_notional(ticker),
+        )
+        if not verdict.approved:
+            self.positions.abort_exit(position.position_id, f"RISK_GUARD:{verdict.reason}")
+            if decision.reason == ExitReason.SESSION_CLOSE:
+                self.positions.unresolved_close = True
+                self.positions.halted = True
+                self._transition(SessionHealth.DEGRADED)
+            report = _no_trade(**base, reason=f"RISK_GUARD:{verdict.reason}", extras={"position_id": position.position_id})
+            report = replace(report, verdict=verdict)
+            self.cycles.append(report)
+            return report
+        try:
+            fill = self.ledger.submit(proposal, verdict.stamp)
+        except Exception as exc:
+            self.positions.abort_exit(position.position_id, f"LEDGER:{exc}")
+            report = _no_trade(**base, reason=f"LEDGER:{exc}", extras={"position_id": position.position_id})
+            self.cycles.append(report)
+            return report
+        if fill.side is Side.SELL and fill.quantity > position.quantity:
+            raise RuntimeError("exit quantity exceeded open quantity")
+        costs = self.costs.round_trip(
+            entry=position.entry_price,
+            exit=fill.price,
+            quantity=position.lots,
+            lot_size=position.lot_size,
+        )
+        closed = self.positions.complete_close(
+            position.position_id,
+            exit_reason=decision.reason,
+            exit_price=fill.price,
+            closed_at=fill.filled_at,
+            costs=costs,
+            close_fill_id=fill.fill_id,
+            snapshot_id=snapshot.snapshot_id,
+        )
+        self._open_contracts.discard(position.contract_id)
+        self._closed_this_cycle.add(position.contract_id)
+        report = LiveCycleReport(
+            session_id=self.session.session_id,
+            event_id=event_id,
+            sequence=snapshot.sequence,
+            as_of=snapshot.event_time,
+            underlying=position.underlying,
+            status=CycleStatus.PAPER_CLOSE,
+            reason=decision.reason,
+            provider_id=snapshot.provider_id,
+            snapshot_id=snapshot.snapshot_id,
+            candidate_id=position.candidate_id,
+            decision_id=None,
+            option_type=position.option_type,
+            expiry=position.expiry.isoformat(),
+            strike=position.strike,
+            lots=position.lots,
+            lot_size=position.lot_size,
+            fill=fill,
+            verdict=verdict,
+            health=self._state,
+            extras={
+                "position_id": closed.position_id,
+                "exit_reason": closed.exit_reason,
+                "exit_price": fill.price,
+                "quantity": closed.quantity,
+                "gross_pnl": closed.realized_gross,
+                "costs": closed.total_costs,
+                "net_pnl": closed.realized_pnl,
+                "price_source": decision.price_source,
+                "session_summary": self.positions.summary().to_dict(),
             },
         )
         self.cycles.append(report)

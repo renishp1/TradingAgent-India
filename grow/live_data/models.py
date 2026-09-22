@@ -29,6 +29,7 @@ class SessionHealth(str, Enum):
 
 class CycleStatus(str, Enum):
     PAPER_FILL = "PAPER_FILL"
+    PAPER_CLOSE = "PAPER_CLOSE"
     NO_TRADE = "NO_TRADE"
 
 
@@ -158,6 +159,7 @@ class LiveCycleReport:
             "health": self.health.value,
             "paper_only": True,
             "live_trading": False,
+            "extras": dict(self.extras),
         }
 
 

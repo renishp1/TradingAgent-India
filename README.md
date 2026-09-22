@@ -35,6 +35,7 @@ Milestone 2H is provider evaluation ([`docs/provider.md`](docs/provider.md)).
 Milestone 2I is dynamic index/expiry discovery ([`docs/dynamic.md`](docs/dynamic.md)).
 Milestone 2J is recorded historical provider integration ([`docs/integrate.md`](docs/integrate.md)).
 Milestone 3A is live market-data → paper trading ([`docs/live_data.md`](docs/live_data.md)).
+Milestone 3B is paper position management and real-time P&L ([`docs/positions.md`](docs/positions.md)).
 Do not attach a live broker or real-money execution.
 
 
