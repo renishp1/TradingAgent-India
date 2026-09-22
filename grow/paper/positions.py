@@ -8,7 +8,7 @@ from enum import Enum
 from typing import Any
 from uuid import uuid4
 
-from grow.clock import Clock
+from grow.clock import IST, Clock
 from grow.live_data.models import LiveSnapshot
 from grow.market.session import SessionCalendar
 from grow.paper.exits import ExitDecision, ExitReason, choose_exit, session_close_due
@@ -544,6 +544,23 @@ class PositionRegistry:
             halted=self.halted,
             unresolved_close=self.unresolved_close,
         )
+
+    def trading_day_realized_pnl(self, moment: datetime) -> float:
+        """Net realized P&L for closes on the IST calendar day of ``moment`` only."""
+        day = moment.astimezone(IST).date()
+        total = 0.0
+        for pos in self._positions.values():
+            if pos.state is not PositionState.CLOSED or pos.closed_at is None:
+                continue
+            if pos.closed_at.astimezone(IST).date() != day:
+                continue
+            total += pos.realized_pnl
+        return round(total, 4)
+
+    def trading_day_total_pnl(self, moment: datetime) -> float:
+        """Trading-day realized + current unrealized (open marks are attributed to today)."""
+        unrealized = round(sum(p.unrealized_pnl for p in self.open_positions()), 4)
+        return round(self.trading_day_realized_pnl(moment) + unrealized, 4)
 
     def note_no_trade(self) -> None:
         self.no_trade_count += 1

@@ -138,12 +138,13 @@ class RiskGuard:
             proposal.intent is not Intent.OPEN or proposal.notional <= cash,
             f"cash={cash:.2f} need={proposal.notional:.2f}",
         )
-        # `daily_pnl` is currently lifetime realized-at-cost of the in-memory
-        # book, not a trading-day accumulator. See docs/safety.md.
+        # Callers must pass trading-day P&L for paper campaign paths.
+        # PaperExecutionEngine supplies IST calendar-day realized (+ open marks
+        # at the entry gate). Lifetime book totals are not accepted as "daily".
         rule(
             "loss.daily",
             daily_pnl >= -abs(self.config.risk.max_daily_loss),
-            f"daily_pnl={daily_pnl:.2f} floor={-abs(self.config.risk.max_daily_loss):.2f} (lifetime realized-at-cost until daily accumulator)",
+            f"daily_pnl={daily_pnl:.2f} floor={-abs(self.config.risk.max_daily_loss):.2f} (trading-day)",
         )
 
         # Review #1: this is cost-notional, not mark-to-market equity.

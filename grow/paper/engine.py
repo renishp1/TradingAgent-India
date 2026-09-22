@@ -10,7 +10,7 @@ This module does not call a broker. Live order placement is not imported.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Mapping
 
 from grow.backtest.costs import CostModel
@@ -115,6 +115,7 @@ class PaperExecutionEngine:
         self._by_decision: dict[str, str] = {}
         self._seen: set[str] = set()
         self._daily_loss_halt = False
+        self._pnl_day = self.started_at.astimezone(IST).date()
         self._timeout_recorded = False
         self._mark_sequence = 1
         self.broker_order_calls = 0
@@ -183,11 +184,13 @@ class PaperExecutionEngine:
             return self._reject(decision, snapshot, outputs, "SNAPSHOT_MISMATCH", moment)
         if self._enforce_timeout(moment):
             return self._reject(decision, snapshot, outputs, "SESSION_TIMEOUT", moment)
+        self._roll_trading_day(moment)
         if self.positions.halted or self.positions.unresolved_close or self._daily_loss_halt:
             return self._reject(decision, snapshot, outputs, "NEW_ENTRIES_BLOCKED", moment)
-        summary = self.positions.summary()
         floor = -abs(self.config.risk.max_daily_loss)
-        unrealized_only = summary.total_pnl < floor - 1e-9 and summary.net_realized_pnl >= floor - 1e-9
+        day_realized = self.positions.trading_day_realized_pnl(moment)
+        day_total = self.positions.trading_day_total_pnl(moment)
+        unrealized_only = day_total < floor - 1e-9 and day_realized >= floor - 1e-9
         if unrealized_only:
             self._daily_loss_halt = True
             return self._reject(decision, snapshot, outputs, "DAILY_LOSS_LIMIT", moment)
@@ -307,7 +310,7 @@ class PaperExecutionEngine:
         self.ledger.clock = moment_clock
         proposal = self._entry_proposal(order, decision, simulated, stop, moment)
         brief = self._brief(proposal.symbol, moment, simulated.price, decision.direction)
-        self.last_risk_daily_pnl = self._authoritative_net()
+        self.last_risk_daily_pnl = self._authoritative_net(moment)
         try:
             verdict = self.guard.evaluate(
                 proposal,
@@ -504,6 +507,7 @@ class PaperExecutionEngine:
             "broker_order_calls": 0,
             "seen": sorted(self._seen),
             "daily_loss_halt": self._daily_loss_halt,
+            "pnl_day": None if self._pnl_day is None else self._pnl_day.isoformat(),
             "timeout_recorded": self._timeout_recorded,
             "mark_sequence": self._mark_sequence,
             "last_risk_daily_pnl": self.last_risk_daily_pnl,
@@ -553,6 +557,8 @@ class PaperExecutionEngine:
         engine.journal.load(list(state["journal"]))
         engine._seen = set(state["seen"])
         engine._daily_loss_halt = bool(state["daily_loss_halt"])
+        raw_day = state.get("pnl_day")
+        engine._pnl_day = None if raw_day in (None, "") else date.fromisoformat(str(raw_day))
         engine._timeout_recorded = bool(state["timeout_recorded"])
         engine._mark_sequence = int(state["mark_sequence"])
         engine.last_risk_daily_pnl = state.get("last_risk_daily_pnl")
@@ -662,12 +668,12 @@ class PaperExecutionEngine:
                 brief,
                 cash=self.ledger.book.cash,
                 gross_notional=self.ledger.book.gross_notional,
-                daily_pnl=self._authoritative_net(),
+                daily_pnl=self._authoritative_net(moment),
                 symbol_notional=self.ledger.book.symbol_notional(position.contract_id),
             )
         except (GrowLiveTradingDisabled, GrowSafetyError) as exc:
             return self._abort_exit(position, snapshot, exit_reason, str(exc), started=True)
-        self.last_risk_daily_pnl = self._authoritative_net()
+        self.last_risk_daily_pnl = self._authoritative_net(moment)
         if not verdict.approved or verdict.stamp is None:
             return self._abort_exit(position, snapshot, exit_reason, f"RISK_GUARD:{verdict.reason}", started=True)
         try:
@@ -1068,13 +1074,28 @@ class PaperExecutionEngine:
             return self.config.risk.max_open_positions
         return self.config.backtest.max_open_positions
 
-    def _authoritative_net(self) -> float:
-        return self.positions.summary().net_realized_pnl
+    def _authoritative_net(self, moment: datetime | None = None) -> float:
+        """Trading-day realized P&L fed to Risk Guard (excludes prior days)."""
+        when = moment if moment is not None else self.clock.now()
+        return self.positions.trading_day_realized_pnl(when)
 
-    def _loss_breached(self) -> bool:
-        summary = self.positions.summary()
+    def _loss_breached(self, moment: datetime | None = None) -> bool:
+        when = moment if moment is not None else self.clock.now()
+        self._roll_trading_day(when)
         floor = -abs(self.config.risk.max_daily_loss)
-        return summary.total_pnl < floor - 1e-9 or summary.net_realized_pnl < floor - 1e-9
+        day_total = self.positions.trading_day_total_pnl(when)
+        day_realized = self.positions.trading_day_realized_pnl(when)
+        return day_total < floor - 1e-9 or day_realized < floor - 1e-9
+
+    def _roll_trading_day(self, moment: datetime) -> None:
+        """Advance the loss budget to the IST calendar day; prior-day halt does not carry over."""
+        day = moment.astimezone(IST).date()
+        if self._pnl_day is None:
+            self._pnl_day = day
+            return
+        if day != self._pnl_day:
+            self._pnl_day = day
+            self._daily_loss_halt = False
 
     def _enforce_timeout(self, moment: datetime) -> bool:
         elapsed = (self.clock.now() - self.started_at).total_seconds()
@@ -1151,30 +1172,30 @@ def _fee_assumptions(costs: CostModel) -> dict[str, Any]:
 
 
 def _resolve_sizing(decision: IntegratedDecision, quote) -> tuple[int, int, int] | str:
-    """lot_size from contract metadata; lots from decision; quantity = lot_size × lots."""
+    """lot_size from contract metadata only; lots must be explicit on the decision.
+
+    Phase 5 fail-closed rules:
+    - Never fall back to decision.lot_size when quote.lot_size is missing.
+    - Missing quote lot_size → MISSING_LOT_SIZE.
+    - Missing decision lots → MISSING_LOTS (quantity alone is not enough).
+    - quantity = lot_size × lots; optional quantity metric must match.
+    """
     lot_size = quote.lot_size
     metric_lot = _int_metric(decision, "lot_size")
-    if lot_size is None:
-        lot_size = metric_lot
-    elif metric_lot is not None and metric_lot != lot_size:
-        return "LOT_SIZE_MISMATCH"
     if lot_size is None or lot_size < 1:
         return "MISSING_LOT_SIZE"
+    if metric_lot is not None and metric_lot != lot_size:
+        return "LOT_SIZE_MISMATCH"
     lots = _int_metric(decision, "lots")
-    quantity_metric = _int_metric(decision, "quantity")
     if lots is None:
-        # Backward-compatible: quantity means lots when lots is omitted.
-        if quantity_metric is None or quantity_metric < 1:
-            return "INCOMPLETE_CANDIDATE"
-        lots = quantity_metric
-        quantity = lots * lot_size
-    else:
-        if lots < 1:
-            return "INCOMPLETE_CANDIDATE"
-        quantity = lots * lot_size
-        if quantity_metric is not None and quantity_metric != quantity:
-            return "LOT_QUANTITY_MISMATCH"
-    if quantity != lots * lot_size or quantity < 1:
+        return "MISSING_LOTS"
+    if lots < 1:
+        return "MISSING_LOTS"
+    quantity = lots * lot_size
+    quantity_metric = _int_metric(decision, "quantity")
+    if quantity_metric is not None and quantity_metric != quantity:
+        return "LOT_QUANTITY_MISMATCH"
+    if quantity < 1:
         return "LOT_QUANTITY_MISMATCH"
     return lot_size, lots, quantity
 
