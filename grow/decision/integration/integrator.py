@@ -13,10 +13,13 @@ from grow.clock import FrozenClock
 from grow.config import GrowConfig
 from grow.decision.integration.contract import (
     DECISION_SCHEMA,
+    DecisionAction,
     DecisionBookState,
     IntegratedDecision,
     IntegratedDecisionStatus,
+    build_trade_candidate,
     digest_payload,
+    resolve_decision_action,
 )
 from grow.decision.integration.policy import PolicyResult, evaluate_policy
 from grow.errors import GrowConfigError, GrowLiveTradingDisabled, GrowSafetyError
@@ -290,6 +293,29 @@ class DecisionIntegrator:
     ) -> IntegratedDecision:
         candidate = policy.candidate if candidate_fields else None
         gates = policy.gates + (("risk_guard", risk_result == "APPROVED", risk_reason),)
+        agent_versions = tuple(
+            (ref.agent_name, ref.agent_version) for ref in policy.refs if ref.relied_upon
+        )
+        if not agent_versions and candidate is not None:
+            agent_versions = tuple((ref.agent_name, ref.agent_version) for ref in policy.refs)
+        trade_candidate = None
+        if candidate is not None and status is IntegratedDecisionStatus.CANDIDATE:
+            trade_candidate = build_trade_candidate(
+                candidate,
+                package_digest=package.package_digest,
+                agent_versions=agent_versions,
+                snapshot_id=snapshot.snapshot_id,
+                snapshot_version=snapshot.version,
+                analysis_cycle_id=package.cycle_id,
+            )
+        action = resolve_decision_action(
+            status,
+            option_type=None if candidate is None else candidate.option_type,
+            trade_candidate=trade_candidate,
+        )
+        # BUY_CE/BUY_PE require full TradeCandidate provenance; otherwise fail closed to NO_TRADE action.
+        if action in {DecisionAction.BUY_CE, DecisionAction.BUY_PE} and trade_candidate is None:
+            action = DecisionAction.NO_TRADE
         identity = {
             "schema": DECISION_SCHEMA,
             "analysis_cycle_id": package.cycle_id,
@@ -297,6 +323,7 @@ class DecisionIntegrator:
             "snapshot_version": snapshot.version,
             "as_of": snapshot.decision_timestamp.isoformat(),
             "status": status.value,
+            "action": action.value,
             "reason_codes": list(reasons),
             "candidate_strategy": None if candidate is None else candidate.strategy,
             "candidate_instrument": None if candidate is None else candidate.instrument,
@@ -311,6 +338,7 @@ class DecisionIntegrator:
             "agent_output_refs": [row.to_dict() for row in policy.refs],
             "gate_results": [{"gate": g, "passed": p, "detail": d} for g, p, d in gates],
             "conflicting_findings": list(policy.conflicting_findings),
+            "trade_candidate": None if trade_candidate is None else trade_candidate.to_dict(),
         }
         decision_id = "dec-" + digest_payload(identity)
         audit_references = (
@@ -335,6 +363,8 @@ class DecisionIntegrator:
             supporting_findings=policy.supporting_findings if candidate is not None else (),
             conflicting_findings=policy.conflicting_findings,
             status=status,
+            action=action,
+            trade_candidate=trade_candidate if action is not DecisionAction.NO_TRADE else None,
             reason_codes=tuple(dict.fromkeys(reasons)),
             risk_guard_result=risk_result,
             risk_guard_reason=risk_reason,
@@ -415,7 +445,7 @@ def _proposal(
         quantity=candidate.quantity,
         limit_price=candidate.limit_price,
         stop_loss=candidate.stop_loss,
-        take_profit=None,
+        take_profit=candidate.target,
         thesis=f"4C paper candidate {candidate.strategy} {candidate.instrument}",
         confidence=candidate.confidence,
         venue=Venue.PAPER,
@@ -427,6 +457,9 @@ def _proposal(
             "strategy": candidate.strategy,
             "direction": candidate.direction,
             "instrument": candidate.instrument,
+            "option_type": candidate.option_type,
+            "strike": candidate.strike,
+            "expiry": candidate.expiry,
             "executed": False,
         },
     )

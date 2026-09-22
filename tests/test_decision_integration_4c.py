@@ -130,7 +130,9 @@ class DecisionIntegrationTests(unittest.TestCase):
         payload = decision.to_dict()
         for key in REQUIRED_DECISION_FIELDS:
             self.assertIn(key, payload)
-        self.assertEqual(payload["schema_version"], "grow.decision.integration.v1")
+        self.assertEqual(payload["schema_version"], "grow.decision.integration.v2")
+        self.assertIn("action", payload)
+        self.assertIn("trade_candidate", payload)
         self.assertIn(payload["status"], {item.value for item in IntegratedDecisionStatus})
         self.assertEqual(payload["status"], "CANDIDATE")
         self.assertTrue(payload["paper_trade_candidate"])
