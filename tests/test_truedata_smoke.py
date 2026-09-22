@@ -897,7 +897,7 @@ class OptionRejectionDiagnosticTests(unittest.TestCase):
         self.assertTrue(report["option_tick_ok"])
         self.assertEqual(report["first_option_tick"], accepted)
         self.assertEqual(report["first_tick"]["provider_symbol"], accepted["provider_symbol"])
-        self.assertEqual(report["first_tick"]["strike"], accepted["strike"])
+        self.assertEqual(report["first_tick"]["contracts"][0]["strike"], accepted["strike"])
         self.assertIn(report["result"], {PASS, PASS_WITH_NO_TRADE})
         for sample in report["option_tick_rejection_samples"]:
             self.assertEqual(sample["reason"], "stale_option_quote")
