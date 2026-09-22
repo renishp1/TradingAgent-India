@@ -21,6 +21,7 @@ from grow.market_data.provenance import (
     MarketDataSource,
     classify_fixture_flags,
 )
+from grow.live_data.health import MarketDataHealth, market_data_health_from_quality
 from grow.options.models import OptionChainSnapshot, OptionContract
 
 
@@ -139,6 +140,10 @@ def build_agent_snapshot(
         quality = DataQualityStatus.REJECTED
         notes.append(MIXED_MARKET_DATA_SOURCE)
 
+    feed_health = market_data_health_from_quality(quality)
+    if not live.freshness_ok and feed_health is MarketDataHealth.HEALTHY:
+        feed_health = MarketDataHealth.STALE
+
     source_ids = {
         "live": live.snapshot_id,
         **{f"market:{sym}": snap.snapshot_id for sym, snap in live.market.items()},
@@ -151,6 +156,7 @@ def build_agent_snapshot(
             "provider": live.provider_id,
             "sequence": live.sequence,
             "market_data_source": source.value,
+            "market_data_health": feed_health.value,
         }
     )
     return AgentMarketSnapshot(
@@ -179,6 +185,7 @@ def build_agent_snapshot(
             ),
             "fixture": source is MarketDataSource.FIXTURE,
             "market_data_source": source.value,
+            "market_data_health": feed_health.value,
         },
         is_fixture=source is MarketDataSource.FIXTURE,
         market_data_source=source,

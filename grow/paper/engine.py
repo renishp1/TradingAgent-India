@@ -23,6 +23,7 @@ from grow.market.session import SessionCalendar
 from grow.market_data.normalized.models import AgentMarketSnapshot, DataQualityStatus
 from grow.market_data.provenance import reject_mixed_market_data
 from grow.market_data.snapshots.builder import gate_snapshot_quality
+from grow.live_data.health import MARKET_DATA_NOT_HEALTHY, reject_unhealthy_market_data
 from grow.orchestration.models import AggregateAnalysisPackage
 from grow.paper.exits import ExitReason
 from grow.paper.fills import (
@@ -196,6 +197,13 @@ class PaperExecutionEngine:
         mixed = reject_mixed_market_data(snapshot)
         if mixed:
             return self._reject(decision, snapshot, outputs, mixed, moment)
+        unhealthy = reject_unhealthy_market_data(
+            data_quality=snapshot.data_quality,
+            diagnostics=dict(snapshot.diagnostics or {}),
+            freshness_ok=bool((snapshot.diagnostics or {}).get("freshness_ok", True)),
+        )
+        if unhealthy:
+            return self._reject(decision, snapshot, outputs, unhealthy, moment)
         if not self.calendar.allows_new_entries(moment):
             return self._reject(decision, snapshot, outputs, "SESSION_CLOSED", moment)
         if self._occupied() >= self._cap():

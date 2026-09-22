@@ -19,7 +19,7 @@ import io
 import json
 import struct
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping, Sequence
 from uuid import uuid4
 
@@ -40,6 +40,25 @@ INDEX_QUERY = {"NIFTY": "NSE:NIFTY 50", "BANKNIFTY": "NSE:NIFTY BANK"}
 INDEX_TOKEN = {"NIFTY": 256265, "BANKNIFTY": 260105}
 INDICES_SEGMENT = 9
 _PACKET_LENGTHS = frozenset({8, 28, 32, 44, 184})
+
+
+@dataclass(frozen=True)
+class KiteMarketSettings:
+    """Reconnect / freshness knobs for the Kite market-data adapter."""
+
+    reconnect_policy: str = "bounded_backoff"
+    max_attempts: int = 5
+    max_backoff_seconds: int = 30
+    max_staleness_seconds: int = 30
+
+
+def settings_from_live_config(live: Any) -> KiteMarketSettings:
+    return KiteMarketSettings(
+        reconnect_policy=str(getattr(live, "reconnect_policy", "bounded_backoff")),
+        max_attempts=int(getattr(live, "reconnect_max_attempts", 5)),
+        max_backoff_seconds=int(getattr(live, "reconnect_max_backoff_seconds", 30)),
+        max_staleness_seconds=int(getattr(live, "max_staleness_seconds", 30)),
+    )
 
 
 @dataclass(frozen=True)
@@ -560,10 +579,12 @@ class KiteMarketProvider:
         clock: Clock | None = None,
         registry: IndexUniverseRegistry | None = None,
         classifier: ExpiryClassifier | None = None,
+        settings: KiteMarketSettings | None = None,
     ) -> None:
         self.clock = clock or FrozenClock(datetime.now(tz=IST))
         self.registry = registry or default_index_registry()
         self.classifier = classifier or ExpiryClassifier(clock=self.clock)
+        self.settings = settings or KiteMarketSettings()
         self._api_key = api_key or ""
         self._access_token = access_token or ""
         self.transport = transport
@@ -573,11 +594,14 @@ class KiteMarketProvider:
         self._last_seq: int | None = None
         self._adapter_seq = 0
         self.reconnect_count = 0
+        self._attempts = 0
+        self._retry_at: datetime | None = None
         self.connection_events: list[dict[str, Any]] = []
         self.subscription_events: list[dict[str, Any]] = []
         self._symbol_ids: dict[str, str] = {}
         self._mapping_ready = False
         self._desired: tuple[str, ...] = ()
+        self._desired_tokens: tuple[int, ...] = ()
         self._instruments: list[dict[str, Any]] = []
         self._options: tuple[NfoOption, ...] = ()
         self._chain: tuple[NfoOption, ...] = ()
@@ -588,6 +612,7 @@ class KiteMarketProvider:
         self._spots: dict[str, float] = {}
         self._index_tokens: dict[int, str] = {}
         self._quote: NormalizedOptionQuote | None = None
+        self._last_valid_quote: NormalizedOptionQuote | None = None
         self._last_heartbeat_at: datetime | None = None
 
     def connect(self) -> None:
@@ -646,9 +671,10 @@ class KiteMarketProvider:
             str(put.instrument_token): put.tradingsymbol,
         }
         self._desired = (call.tradingsymbol, put.tradingsymbol)
+        self._desired_tokens = (index_token, call.instrument_token, put.instrument_token)
         try:
             self.transport.subscribe(
-                (index_token, call.instrument_token, put.instrument_token),
+                self._desired_tokens,
                 mode="full",
             )
         except GrowConfigError as exc:
@@ -657,6 +683,8 @@ class KiteMarketProvider:
             self._note("DEGRADED", "SUBSCRIPTION_FAILED")
             raise GrowConfigError("SUBSCRIPTION_FAILED") from exc
         self._mapping_ready = True
+        self._attempts = 0
+        self._retry_at = None
         self.subscription_events.append(
             {
                 "type": "SUBSCRIBE",
@@ -707,15 +735,21 @@ class KiteMarketProvider:
     def poll(self) -> dict[str, Any] | None:
         if self._state in {SessionHealth.DISCONNECTED, SessionHealth.STOPPED, SessionHealth.CONNECTING}:
             return None
+        if self._state is SessionHealth.DEGRADED and self.settings.reconnect_policy == "bounded_backoff":
+            return self._reconnect_poll()
         if self.transport is None:
             return None
         try:
             raw = self.transport.recv()
         except GrowConfigError as exc:
-            self._error = str(exc)
-            self._state = SessionHealth.DEGRADED
-            raise
+            return self._on_feed_error(str(exc))
         if raw is None:
+            if self._last_at is not None:
+                age = (self.clock.now() - self._last_at).total_seconds()
+                if age > self.settings.max_staleness_seconds and self._state is SessionHealth.RUNNING:
+                    self._state = SessionHealth.STALE
+                    self._error = "STALE_FEED"
+                    self._note("STALE", "STALE_FEED")
             return None
         if isinstance(raw, str) or _looks_text(raw):
             return self._on_text(raw)
@@ -743,6 +777,7 @@ class KiteMarketProvider:
             if quote is None:
                 continue
             self._quote = quote
+            self._last_valid_quote = quote
             self._side_quotes[quote.option_type] = quote
             saw_option = True
             if event_time is None or quote.quote_time > event_time:
@@ -753,6 +788,75 @@ class KiteMarketProvider:
             event_time = index_time if index_time is not None and index_time <= self.clock.now() else self.clock.now()
             return self._assemble(event_time, include_quote=False)
         return self._control("UNSUPPORTED_MESSAGE")
+
+    def _on_feed_error(self, reason: str) -> dict[str, Any] | None:
+        self._error = reason
+        if reason in {"AUTH_FAILED", "AUTH_MISSING"}:
+            self._state = SessionHealth.STOPPED
+            self._note("FAILED", reason)
+            raise GrowConfigError(reason)
+        if reason == "FEED_DISCONNECTED" and self.settings.reconnect_policy == "bounded_backoff":
+            self._state = SessionHealth.DEGRADED
+            self._note("RECONNECTING", reason)
+            return self._reconnect_poll()
+        if reason == "SUBSCRIPTION_FAILED":
+            self._state = SessionHealth.DEGRADED
+            self._note("DEGRADED", reason)
+            raise GrowConfigError(reason)
+        self._state = SessionHealth.DEGRADED
+        self._note("DEGRADED", reason)
+        raise GrowConfigError(reason)
+
+    def _reconnect_poll(self) -> dict[str, Any] | None:
+        if self._attempts >= self.settings.max_attempts:
+            self._state = SessionHealth.STOPPED
+            self._error = "FEED_DISCONNECTED"
+            self._note("FAILED", "RECONNECT_EXHAUSTED")
+            raise GrowConfigError("FEED_DISCONNECTED")
+        delay = min(self.settings.max_backoff_seconds, max(1, 2 ** self._attempts))
+        now = self.clock.now()
+        if self._retry_at is None:
+            self._retry_at = now + timedelta(seconds=delay)
+        if now < self._retry_at:
+            return None
+        self._attempts += 1
+        self.reconnect_count += 1
+        if self.transport is None:
+            self._state = SessionHealth.STOPPED
+            raise GrowConfigError("FEED_DISCONNECTED")
+        try:
+            self.transport.disconnect()
+            self.transport.connect()
+            tokens = self._desired_tokens
+            if not tokens and self.selected is not None and self.selected_put is not None:
+                index_token = next(iter(self._index_tokens)) if self._index_tokens else INDEX_TOKEN[self.selected.underlying]
+                tokens = (index_token, self.selected.instrument_token, self.selected_put.instrument_token)
+                self._desired_tokens = tokens
+            self.transport.subscribe(tokens, mode="full")
+        except GrowConfigError as exc:
+            self._retry_at = now + timedelta(
+                seconds=min(self.settings.max_backoff_seconds, 2 ** self._attempts)
+            )
+            self._error = str(exc)
+            self._state = SessionHealth.DEGRADED
+            self._note("DEGRADED", str(exc))
+            return None
+        self._retry_at = None
+        self._mapping_ready = True
+        self._state = SessionHealth.RUNNING
+        self._error = None
+        self._note("RUNNING", "resubscribed")
+        self.subscription_events.append(
+            {
+                "type": "RESUBSCRIBE",
+                "symbols": list(self._desired),
+                "instrument_tokens": list(self._desired_tokens),
+                "reconnect_count": self.reconnect_count,
+                "mapping_ready": True,
+                "timestamp": now.isoformat(),
+            }
+        )
+        return self.poll()
 
     def _option_quote(self, tick: MarketTick) -> NormalizedOptionQuote | None:
         row = self._contracts.get(tick.instrument_token)
@@ -821,8 +925,26 @@ class KiteMarketProvider:
                     quotes.append(quote.to_stream_quote())
         if self._state is SessionHealth.READY:
             self._state = SessionHealth.RUNNING
+        age = (self.clock.now().astimezone(IST) - event_time.astimezone(IST)).total_seconds()
+        if age > self.settings.max_staleness_seconds:
+            self._state = SessionHealth.STALE
+            self._error = "DELAYED_TICK"
+            self._note("STALE", "DELAYED_TICK")
+        elif self._state is SessionHealth.STALE:
+            self._state = SessionHealth.RUNNING
+            self._error = None
         self._last_at = event_time
         self._last_seq = self._adapter_seq
+        missing_fields: list[str] = []
+        for row in quotes:
+            if row.get("ltp") is None:
+                missing_fields.append(f"MISSING_LTP:{row.get('option_type')}")
+            if row.get("bid") is None:
+                missing_fields.append(f"MISSING_BID:{row.get('option_type')}")
+            if row.get("ask") is None:
+                missing_fields.append(f"MISSING_ASK:{row.get('option_type')}")
+            if row.get("oi") is None:
+                missing_fields.append(f"MISSING_OI:{row.get('option_type')}")
         return {
             "provider": self.identity,
             "adapter_version": self.adapter_version,
@@ -841,6 +963,11 @@ class KiteMarketProvider:
             "is_fixture": False,
             "snapshot_id": f"zd-{self._adapter_seq}-{uuid4().hex[:8]}",
             "classification": classification_counts(self._instruments),
+            "missing_quote_fields": missing_fields,
+            "market_data_health": self.health().market_data_health,
+            "last_valid_quote": None
+            if self._last_valid_quote is None
+            else self._last_valid_quote.to_stream_quote(),
         }
 
     def _on_text(self, raw: bytes | str) -> dict[str, Any]:
@@ -857,9 +984,7 @@ class KiteMarketProvider:
             raise GrowConfigError("FIXTURE_FALLBACK_FORBIDDEN")
         kind = str(data.get("type") or "").lower()
         if kind == "error":
-            self._error = "AUTH_FAILED"
-            self._state = SessionHealth.STOPPED
-            raise GrowConfigError("AUTH_FAILED")
+            return self._on_feed_error("AUTH_FAILED")
         if kind == "order":
             return self._control("ORDER_IGNORED")
         return self._control("CONTROL")

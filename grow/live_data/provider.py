@@ -54,12 +54,14 @@ def open_provider(provider_id: str, **kwargs: Any) -> LiveDataProvider:
             settings = settings_from_live_config(live)
         return TrueDataAdapter(settings=settings, **kwargs)
     if name == "kite_market":
-        from grow.live_data.kite_market import KiteMarketProvider
+        from grow.live_data.kite_market import KiteMarketProvider, settings_from_live_config
 
-        kwargs.pop("settings", None)
-        kwargs.pop("live_config", None)
+        settings = kwargs.pop("settings", None)
+        live = kwargs.pop("live_config", None)
         kwargs.pop("events", None)
-        return KiteMarketProvider(**kwargs)
+        if settings is None and live is not None:
+            settings = settings_from_live_config(live)
+        return KiteMarketProvider(settings=settings, **kwargs)
     from grow.live_data.mock import MockStreamProvider
 
     return MockStreamProvider(**kwargs)

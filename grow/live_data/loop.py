@@ -16,6 +16,7 @@ from grow.data.boundary import research_view
 from grow.errors import GrowConfigError, GrowLiveTradingDisabled
 from grow.execution.lock import LIVE_TRADING_COMPILED, assert_paper_runtime
 from grow.history.universe import default_index_registry
+from grow.live_data.health import MARKET_DATA_NOT_HEALTHY, reject_unhealthy_market_data
 from grow.live_data.models import (
     APPROVED_STREAM_IDS,
     CycleStatus,
@@ -323,18 +324,22 @@ class LivePaperLoop:
         self._transition(SessionHealth.RUNNING)
         self._closed_this_cycle = set()
         reports: list[LiveCycleReport] = list(self._manage_positions(snapshot, underlying))
+        health_block = reject_unhealthy_market_data(
+            session_state=self._state, freshness_ok=snapshot.freshness_ok
+        )
         if self._allows_new_entries(snapshot):
             targets = [underlying] if underlying else list(snapshot.underlyings)
             for symbol in targets:
                 reports.append(self._evaluate(symbol, snapshot))
         elif not reports:
+            reason = health_block or "NEW_ENTRIES_BLOCKED"
             report = _no_trade(
                 session_id=self.session.session_id,
                 event_id=_event_id(self.session.session_id, snapshot, underlying or "*", "blocked"),
                 sequence=snapshot.sequence,
                 as_of=snapshot.event_time,
                 underlying=underlying or "*",
-                reason="NEW_ENTRIES_BLOCKED",
+                reason=reason,
                 provider_id=snapshot.provider_id,
                 health=self._state,
                 snapshot_id=snapshot.snapshot_id,
@@ -555,7 +560,7 @@ class LivePaperLoop:
         return report
 
     def _allows_new_entries(self, snapshot: LiveSnapshot) -> bool:
-        if self._state in {SessionHealth.STALE, SessionHealth.DEGRADED, SessionHealth.STOPPED}:
+        if reject_unhealthy_market_data(session_state=self._state, freshness_ok=snapshot.freshness_ok):
             return False
         if self.positions.halted or self.positions.unresolved_close:
             return False
@@ -767,6 +772,10 @@ def open_loop(config: GrowConfig, *, clock: Clock | None = None, risk_secret: st
         kwargs["clock"] = clock
         kwargs["live_config"] = config.live_data
     elif config.live_data.provider == "kite_market":
+        from grow.live_data.kite_market import settings_from_live_config
+
+        kwargs["settings"] = settings_from_live_config(config.live_data)
         kwargs["clock"] = clock
+        kwargs["live_config"] = config.live_data
     provider = open_provider(config.live_data.provider, **kwargs)
     return LivePaperLoop(config, provider, clock=clock, risk_secret=risk_secret)
