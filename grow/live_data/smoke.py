@@ -15,6 +15,7 @@ from grow.execution.lock import LIVE_TRADING_COMPILED, inspect_environment
 from grow.live_data.catalog import UNKNOWN_EXPIRY_CLASS
 from grow.live_data.expiry_class import CALENDAR_UNSUPPORTED_YEAR
 from grow.live_data.models import CycleStatus, LiveCycleReport
+from grow.market_data.provenance import MIXED_MARKET_DATA_SOURCE, MarketDataSource
 from grow.risk.secret import resolve_risk_secret
 
 
@@ -724,7 +725,10 @@ def _pipeline_outcome(reports: Sequence[LiveCycleReport]) -> dict[str, Any]:
 
 def _is_hard_fail_error(error: str | None) -> bool:
     text = str(error or "")
-    return any(token in text for token in ("FIXTURE_FALLBACK", "LIVE_TRADING", "LIVE_EXECUTION", "BROKER"))
+    return any(
+        token in text
+        for token in ("FIXTURE_FALLBACK", "LIVE_TRADING", "LIVE_EXECUTION", "BROKER", MIXED_MARKET_DATA_SOURCE)
+    )
 
 
 def _smoke_rejection_diagnostics(check: OptionTickCheck, *, fixture_fallback: bool) -> dict[str, Any]:
@@ -771,6 +775,9 @@ def build_smoke_report(
     health = loop.health.to_dict()
     reasons = [row.reason for row in reports]
     fixture_fallback = any("FIXTURE_FALLBACK" in reason for reason in reasons) or "FIXTURE_FALLBACK" in str(error or "")
+    mixed_source = any(MIXED_MARKET_DATA_SOURCE in reason for reason in reasons) or MIXED_MARKET_DATA_SOURCE in str(
+        error or ""
+    )
     broker_hits = scan_broker_source(root) if root is not None else ()
     loaded = broker_modules_loaded()
     authenticated = any(
@@ -788,10 +795,10 @@ def build_smoke_report(
     )
     if quote_fixture or tick_check.fixture_rejected:
         fixture_fallback = True
-    option_tick_ok = tick_check.ok and not fixture_fallback
+    option_tick_ok = tick_check.ok and not fixture_fallback and not mixed_source
     rejection_diagnostics = _smoke_rejection_diagnostics(tick_check, fixture_fallback=fixture_fallback)
     paper_fill = any(row.status is CycleStatus.PAPER_FILL for row in reports)
-    hard_fail = bool(broker_hits or loaded or fixture_fallback or _is_hard_fail_error(error))
+    hard_fail = bool(broker_hits or loaded or fixture_fallback or mixed_source or _is_hard_fail_error(error))
     result = classify_smoke_result(
         authenticated=authenticated,
         catalog_ok=catalog_ok,
@@ -801,8 +808,18 @@ def build_smoke_report(
         hard_fail=hard_fail,
         fixture_fallback=fixture_fallback,
     )
+    if mixed_source:
+        result = HARD_FAIL
     sample_map = {ident: symbol_ids[ident] for ident in list(symbol_ids)[:4]}
     first = None if not option_tick_ok else dict(tick_check.quotes[0])
+    if mixed_source:
+        market_data_source = MarketDataSource.MIXED.value
+    elif fixture_fallback:
+        market_data_source = MarketDataSource.FIXTURE.value
+    elif option_tick_ok:
+        market_data_source = MarketDataSource.LIVE.value
+    else:
+        market_data_source = None
     payload: dict[str, Any] = {
         "schema": SMOKE_SCHEMA,
         "session_id": loop.session.session_id,
@@ -843,6 +860,7 @@ def build_smoke_report(
         "option_tick_rejection_count": rejection_diagnostics["option_tick_rejection_count"],
         "option_tick_rejection_counts": rejection_diagnostics["option_tick_rejection_counts"],
         "option_tick_rejection_samples": rejection_diagnostics["option_tick_rejection_samples"],
+        "market_data_source": market_data_source,
         "first_option_tick": first,
         "first_tick": None
         if first is None or snapshot is None

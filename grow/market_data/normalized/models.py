@@ -14,6 +14,8 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Mapping
 
+from grow.market_data.provenance import MarketDataSource, classify_fixture_flags
+
 
 SCHEMA = "grow.agent.market_snapshot.v1"
 
@@ -100,6 +102,8 @@ class OptionQuoteView:
     theta: float | None = None
     vega: float | None = None
     expiry_class: str | None = None
+    # Per-quote market-data provenance. Mixing True and False → MIXED snapshot.
+    is_fixture: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -124,6 +128,7 @@ class OptionQuoteView:
             "theta": self.theta,
             "vega": self.vega,
             "expiry_class": self.expiry_class,
+            "is_fixture": self.is_fixture,
         }
 
 
@@ -149,13 +154,23 @@ class AgentMarketSnapshot:
     live_trading: bool = False
     # Fixture vs live classification of the *market data* source.
     # Paper execution is simulated; that does not make the quotes fixtures.
+    # True only when market_data_source is FIXTURE (never when MIXED).
     is_fixture: bool = False
+    market_data_source: MarketDataSource = MarketDataSource.LIVE
 
     def __post_init__(self) -> None:
         if self.live_trading:
             raise ValueError("AgentMarketSnapshot.live_trading must be false")
         if not self.paper_mode:
             raise ValueError("AgentMarketSnapshot.paper_mode must be true")
+        source = self.market_data_source
+        if not isinstance(source, MarketDataSource):
+            source = MarketDataSource(str(source))
+        if self.option_contracts:
+            source = classify_fixture_flags(row.is_fixture for row in self.option_contracts)
+        object.__setattr__(self, "market_data_source", source)
+        # Fully fixture only when classification is FIXTURE — never when MIXED.
+        object.__setattr__(self, "is_fixture", source is MarketDataSource.FIXTURE)
         object.__setattr__(self, "underlyings", MappingProxyType(dict(self.underlyings)))
         object.__setattr__(self, "source_snapshot_ids", freeze_map(dict(self.source_snapshot_ids)))
         object.__setattr__(self, "diagnostics", freeze_map(dict(self.diagnostics)))
@@ -179,6 +194,7 @@ class AgentMarketSnapshot:
             "paper_mode": True,
             "live_trading": False,
             "is_fixture": self.is_fixture,
+            "market_data_source": self.market_data_source.value,
         }
 
 

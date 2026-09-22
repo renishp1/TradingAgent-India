@@ -27,6 +27,7 @@ from grow.live_data.models import (
     LiveSnapshot,
 )
 from grow.market.session import SessionCalendar
+from grow.market_data.provenance import MIXED_MARKET_DATA_SOURCE, MarketDataSource, classify_fixture_flags
 from grow.options.models import ExpiryClass, FieldSource, OptionChainSnapshot, OptionContract, OptionExpiry, OptionType
 from grow.types import SessionState, Symbol
 
@@ -242,6 +243,7 @@ def _chain_for(
     contracts: list[OptionContract] = []
     expiries: dict[date, ExpiryClass] = {}
     lots: dict[str, int] = {}
+    quote_fixture_flags: dict[str, bool] = {}
     for row in rows:
         if str(row.get("instrument_type") or "OPTIDX") != "OPTIDX":
             raise GrowConfigError(f"UNSUPPORTED_INSTRUMENT_TYPE:{row.get('instrument_type')}")
@@ -267,14 +269,22 @@ def _chain_for(
         lot = row.get("lot_size")
         if lot is not None:
             try:
-                lots[cid] = int(lot)
-                lots[provider_id] = int(lot)
+                lot_i = int(lot)
             except (TypeError, ValueError) as exc:
                 raise GrowConfigError("INVALID_LOT_SIZE") from exc
+            if lot_i < 1:
+                raise GrowConfigError("INVALID_LOT_SIZE")
+            lots[cid] = lot_i
+            lots[provider_id] = lot_i
         klass = ExpiryClass.MONTHLY if str(row.get("expiry_class") or "WEEKLY").upper() == "MONTHLY" else ExpiryClass.WEEKLY
         expiries[expiry] = klass
         quote = quotes.get((symbol, expiry.isoformat(), strike, kind), {})
-        ts = _aware(quote.get("ts") or as_of, "quote.ts") if quote else as_of
+        if quote:
+            ts = _aware(quote.get("ts") or as_of, "quote.ts")
+            quote_fixture = bool(quote.get("is_fixture") is True)
+            quote_fixture_flags[provider_id] = quote_fixture
+        else:
+            ts = as_of
         bid = None if quote.get("bid") is None else float(quote["bid"])
         ask = None if quote.get("ask") is None else float(quote["ask"])
         ltp = None if quote.get("ltp") is None else float(quote["ltp"])
@@ -310,6 +320,12 @@ def _chain_for(
         )
     if spot is None:
         raise GrowConfigError(f"MISSING_SPOT:{symbol}")
+    source = classify_fixture_flags(quote_fixture_flags.values())
+    if source is MarketDataSource.MIXED:
+        raise GrowConfigError(MIXED_MARKET_DATA_SOURCE)
+    if source is MarketDataSource.FIXTURE:
+        # Live stream payloads must not smuggle an all-fixture option book.
+        raise GrowConfigError("FIXTURE_FALLBACK_FORBIDDEN")
     chain_id = _digest(f"chain:{symbol}:{as_of.isoformat()}:{raw.get('sequence')}")
     chain = OptionChainSnapshot(
         snapshot_id=chain_id,
@@ -320,6 +336,11 @@ def _chain_for(
         contracts=tuple(contracts),
         source_id=provider,
         is_fixture=False,
-        provider_metadata={"provider": provider, "schema": SCHEMA},
+        provider_metadata={
+            "provider": provider,
+            "schema": SCHEMA,
+            "market_data_source": MarketDataSource.LIVE.value,
+            "quote_fixture_flags": dict(quote_fixture_flags),
+        },
     )
     return chain, lots

@@ -16,6 +16,11 @@ from grow.market_data.normalized.models import (
     UnderlyingQuoteView,
     snapshot_digest,
 )
+from grow.market_data.provenance import (
+    MIXED_MARKET_DATA_SOURCE,
+    MarketDataSource,
+    classify_fixture_flags,
+)
 from grow.options.models import OptionChainSnapshot, OptionContract
 
 
@@ -104,11 +109,35 @@ def build_agent_snapshot(
             if lot is None:
                 ident = f"{contract.underlying}-{contract.expiry.isoformat()}-{int(contract.strike)}-{contract.option_type.value}"
                 lot = live.lot_sizes.get(ident)
-            options.append(_option_from_contract(contract, age, contract_quality, lot_size=lot))
+            quote_fixture = bool(chain.is_fixture) or bool(
+                (chain.provider_metadata or {}).get("quote_fixture_flags", {}).get(
+                    contract.provider_contract_id, False
+                )
+            )
+            options.append(
+                _option_from_contract(
+                    contract,
+                    age,
+                    contract_quality,
+                    lot_size=lot,
+                    is_fixture=quote_fixture,
+                )
+            )
 
     if not underlyings:
         quality = DataQualityStatus.INSUFFICIENT
         notes.append("NO_UNDERLYINGS")
+
+    source = classify_fixture_flags(row.is_fixture for row in options)
+    if not options:
+        source = (
+            MarketDataSource.FIXTURE
+            if (bool(live.chains) and all(chain.is_fixture for chain in live.chains.values()))
+            else MarketDataSource.LIVE
+        )
+    if source is MarketDataSource.MIXED:
+        quality = DataQualityStatus.REJECTED
+        notes.append(MIXED_MARKET_DATA_SOURCE)
 
     source_ids = {
         "live": live.snapshot_id,
@@ -121,9 +150,9 @@ def build_agent_snapshot(
             "live": live.snapshot_id,
             "provider": live.provider_id,
             "sequence": live.sequence,
+            "market_data_source": source.value,
         }
     )
-    is_fixture = bool(live.chains) and all(chain.is_fixture for chain in live.chains.values())
     return AgentMarketSnapshot(
         snapshot_id=f"agent-{version}",
         version=version,
@@ -148,9 +177,11 @@ def build_agent_snapshot(
             "fresh_option_count": sum(
                 1 for row in options if row.quality is DataQualityStatus.OK
             ),
-            "fixture": is_fixture,
+            "fixture": source is MarketDataSource.FIXTURE,
+            "market_data_source": source.value,
         },
-        is_fixture=is_fixture,
+        is_fixture=source is MarketDataSource.FIXTURE,
+        market_data_source=source,
     )
 
 
@@ -199,6 +230,7 @@ def build_fixture_snapshot(
                 (decision_ts - contract.timestamp.astimezone(IST)).total_seconds(),
                 DataQualityStatus.OK,
                 lot_size=None,
+                is_fixture=True,
             )
             for contract in chain.contracts
         )
@@ -216,6 +248,40 @@ def build_fixture_snapshot(
             "include_underlying": include_underlying,
         }
     )
+    stamped_options = tuple(
+        row
+        if row.is_fixture
+        else OptionQuoteView(
+            underlying=row.underlying,
+            expiry=row.expiry,
+            strike=row.strike,
+            option_type=row.option_type,
+            ltp=row.ltp,
+            bid=row.bid,
+            ask=row.ask,
+            open_interest=row.open_interest,
+            volume=row.volume,
+            quote_timestamp=row.quote_timestamp,
+            quote_age_seconds=row.quote_age_seconds,
+            provider_contract_id=row.provider_contract_id,
+            quality=row.quality,
+            lot_size=row.lot_size,
+            previous_open_interest=row.previous_open_interest,
+            implied_volatility=row.implied_volatility,
+            delta=row.delta,
+            gamma=row.gamma,
+            theta=row.theta,
+            vega=row.vega,
+            expiry_class=row.expiry_class,
+            is_fixture=True,
+        )
+        for row in option_contracts
+    )
+    source = (
+        classify_fixture_flags(row.is_fixture for row in stamped_options)
+        if stamped_options
+        else MarketDataSource.FIXTURE
+    )
     return AgentMarketSnapshot(
         snapshot_id=f"agent-{version}",
         version=version,
@@ -226,21 +292,23 @@ def build_fixture_snapshot(
         decision_timestamp=decision_ts,
         session_date=decision_ts.date(),
         underlyings=underlyings,
-        option_contracts=option_contracts,
+        option_contracts=stamped_options,
         data_quality=quality,
         quality_notes=notes,
         source_snapshot_ids=source_ids,
         diagnostics={
-            "fixture": True,
+            "fixture": source is MarketDataSource.FIXTURE,
+            "market_data_source": source.value,
             "stale_option_count": sum(
-                1 for row in option_contracts if row.quality is DataQualityStatus.STALE
+                1 for row in stamped_options if row.quality is DataQualityStatus.STALE
             ),
             "fresh_option_count": sum(
-                1 for row in option_contracts if row.quality is DataQualityStatus.OK
+                1 for row in stamped_options if row.quality is DataQualityStatus.OK
             ),
             **(diagnostics or {}),
         },
-        is_fixture=True,
+        is_fixture=source is MarketDataSource.FIXTURE,
+        market_data_source=source,
     )
 
 
@@ -280,6 +348,7 @@ def _option_from_contract(
     quality: DataQualityStatus,
     *,
     lot_size: int | None = None,
+    is_fixture: bool = False,
 ) -> OptionQuoteView:
     return OptionQuoteView(
         underlying=contract.underlying,
@@ -303,4 +372,5 @@ def _option_from_contract(
         theta=contract.theta,
         vega=contract.vega,
         expiry_class=contract.expiry_class.value if contract.expiry_class is not None else None,
+        is_fixture=bool(is_fixture),
     )

@@ -85,6 +85,9 @@ class NormalizedOptionQuote:
     ask: float | None
     volume: int | None
     open_interest: int | None
+    lot_size: int | None = None
+    provider_timestamp: datetime | None = None
+    is_fixture: bool = False
 
     def to_stream_quote(self) -> dict[str, Any]:
         row: dict[str, Any] = {
@@ -94,7 +97,15 @@ class NormalizedOptionQuote:
             "option_type": self.option_type,
             "ts": self.quote_time.isoformat(),
             "provider_symbol": self.provider_symbol,
+            "provider_symbol_id": self.provider_symbol_id,
+            "canonical_id": self.canonical_id,
+            "received_time": self.received_time.isoformat(),
+            "is_fixture": False,
         }
+        if self.provider_timestamp is not None:
+            row["provider_timestamp"] = self.provider_timestamp.isoformat()
+        if self.lot_size is not None:
+            row["lot_size"] = self.lot_size
         if self.ltp is not None:
             row["ltp"] = self.ltp
         if self.bid is not None:
@@ -769,6 +780,9 @@ class KiteMarketProvider:
             ask=tick.ask,
             volume=tick.volume,
             open_interest=tick.open_interest,
+            lot_size=row.lot_size,
+            provider_timestamp=tick.exchange_timestamp,
+            is_fixture=False,
         )
 
     def _assemble(self, event_time: datetime, *, include_quote: bool) -> dict[str, Any]:

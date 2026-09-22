@@ -21,6 +21,7 @@ from grow.errors import GrowLiveTradingDisabled, GrowSafetyError
 from grow.execution.lock import assert_paper_runtime
 from grow.market.session import SessionCalendar
 from grow.market_data.normalized.models import AgentMarketSnapshot, DataQualityStatus
+from grow.market_data.provenance import reject_mixed_market_data
 from grow.market_data.snapshots.builder import gate_snapshot_quality
 from grow.orchestration.models import AggregateAnalysisPackage
 from grow.paper.exits import ExitReason
@@ -192,6 +193,9 @@ class PaperExecutionEngine:
         quality = gate_snapshot_quality(snapshot)
         if quality is not DataQualityStatus.OK:
             return self._reject(decision, snapshot, outputs, f"DATA_{quality.value}", moment)
+        mixed = reject_mixed_market_data(snapshot)
+        if mixed:
+            return self._reject(decision, snapshot, outputs, mixed, moment)
         if not self.calendar.allows_new_entries(moment):
             return self._reject(decision, snapshot, outputs, "SESSION_CLOSED", moment)
         if self._occupied() >= self._cap():

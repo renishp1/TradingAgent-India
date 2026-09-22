@@ -632,6 +632,87 @@ class TransportFailureTests(unittest.TestCase):
         self.assertNotIn("SUPERSECRETKEY", text)
         self.assertIn("[REDACTED]", text)
 
+    def test_subscription_failure_degrades_provider(self) -> None:
+        from grow.live_data.models import SessionHealth
+
+        transport = ScriptedKiteTransport(instruments_csv=CSV, spots={"NIFTY": 24210.0}, frames=[])
+
+        def _boom(tokens, mode="full"):
+            raise GrowConfigError("SUBSCRIPTION_FAILED")
+
+        transport.subscribe = _boom  # type: ignore[method-assign]
+        provider = KiteMarketProvider(transport=transport, clock=FrozenClock(AS_OF))
+        with self.assertRaises(GrowConfigError) as ctx:
+            provider.connect()
+        self.assertEqual(str(ctx.exception), "SUBSCRIPTION_FAILED")
+        self.assertEqual(provider.health().state, SessionHealth.DEGRADED)
+
+    def test_provider_failure_emits_degraded_control(self) -> None:
+        from grow.live_data.models import SessionHealth
+
+        class _Broken(ScriptedKiteTransport):
+            def recv(self):
+                raise GrowConfigError("PROVIDER_UNAVAILABLE")
+
+        transport = _Broken(instruments_csv=CSV, spots={"NIFTY": 24210.0}, frames=[])
+        provider = KiteMarketProvider(transport=transport, clock=FrozenClock(AS_OF))
+        provider.connect()
+        with self.assertRaises(GrowConfigError):
+            provider.poll()
+        self.assertEqual(provider.health().state, SessionHealth.DEGRADED)
+
+    def test_reconnect_after_disconnect_resubscribes(self) -> None:
+        when = AS_OF - timedelta(seconds=2)
+        frames = [
+            _frame(_full_packet(CE_TOKEN, ltp=101.5, bid=101.0, ask=102.0, volume=40, oi=80, when=when)),
+        ]
+        transport = ScriptedKiteTransport(instruments_csv=CSV, spots={"NIFTY": 24210.0}, frames=frames)
+        provider = KiteMarketProvider(transport=transport, clock=FrozenClock(AS_OF))
+        provider.connect()
+        first_sub = set(transport.subscribed)
+        self.assertIn(CE_TOKEN, first_sub)
+        self.assertIn(PE_TOKEN, first_sub)
+        provider.disconnect()
+        transport.frames = [
+            _frame(_full_packet(PE_TOKEN, ltp=88.0, bid=87.5, ask=88.5, volume=12, oi=30, when=when)),
+        ]
+        transport._index = 0
+        transport.subscribed = []
+        provider.connect()
+        self.assertIn(CE_TOKEN, transport.subscribed)
+        self.assertIn(PE_TOKEN, transport.subscribed)
+        payload = provider.poll()
+        self.assertTrue(payload.get("option_quotes"))
+        self.assertEqual(payload["option_quotes"][0]["option_type"], "PE")
+        self.assertFalse(payload.get("is_fixture"))
+
+
+class NormalizedQuoteFieldTests(unittest.TestCase):
+    def test_normalized_quote_carries_token_lot_and_timestamps(self) -> None:
+        when = AS_OF - timedelta(seconds=2)
+        provider = _provider(
+            [_frame(_full_packet(CE_TOKEN, ltp=101.5, bid=101.0, ask=102.0, volume=40, oi=80, when=when))]
+        )
+        payload = provider.poll()
+        quote = payload["option_quotes"][0]
+        self.assertEqual(quote["provider_symbol"], "NIFTY26SEP24200CE")
+        self.assertEqual(quote["provider_symbol_id"], str(CE_TOKEN))
+        self.assertEqual(quote["canonical_id"], "NIFTY-2026-09-22-24200-CE")
+        self.assertEqual(quote["lot_size"], 75)
+        self.assertEqual(quote["ts"], when.isoformat())
+        self.assertEqual(quote["provider_timestamp"], when.isoformat())
+        self.assertNotEqual(quote["received_time"], quote["ts"])
+        self.assertFalse(quote["is_fixture"])
+        snapshot = _normalize(payload)
+        agent = __import__("grow.market_data.snapshots.builder", fromlist=["build_agent_snapshot"]).build_agent_snapshot(
+            snapshot, decision_timestamp=AS_OF, max_quote_age_seconds=30
+        )
+        self.assertEqual(agent.market_data_source.value, "LIVE")
+        ce = next(row for row in agent.option_contracts if row.option_type == "CE" and row.ltp is not None)
+        self.assertEqual(ce.lot_size, 75)
+        self.assertEqual(ce.volume, 40)
+        self.assertEqual(ce.open_interest, 80)
+
 
 if __name__ == "__main__":
     unittest.main()
