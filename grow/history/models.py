@@ -20,6 +20,9 @@ RETIRED = "RETIRED"
 SYNTHETIC = "SYNTHETIC"
 FRAMEWORK_TEST_ONLY = "FRAMEWORK_TEST_ONLY"
 HISTORICAL_RESEARCH = "HISTORICAL_RESEARCH"
+ADAPTER_TESTING = "ADAPTER_TESTING"
+RECORDED_SAMPLE_DATASET_ID = "grow.history.recorded.nse_fo.v1"
+RECORDED_SAMPLE_PROVIDER = "recorded.nse_fo.v1"
 
 MISSING_IV = "MISSING_IV"
 BID_ASK_GAPS = "BID_ASK_GAPS"
@@ -42,6 +45,7 @@ TESTING = "TESTING"
 QUALIFIED = "QUALIFIED"
 QUALIFIED_WITH_WARNINGS = "QUALIFIED_WITH_WARNINGS"
 QUALIFIED_WITH_LIMITATIONS = "QUALIFIED_WITH_LIMITATIONS"
+QUALIFIED_FOR_ADAPTER_TESTING = "QUALIFIED_FOR_ADAPTER_TESTING"
 APPROVED_FOR_2E = "APPROVED_FOR_2E"
 QUALIFICATION_STATES = frozenset(
     {
@@ -51,6 +55,7 @@ QUALIFICATION_STATES = frozenset(
         QUALIFIED,
         QUALIFIED_WITH_WARNINGS,
         QUALIFIED_WITH_LIMITATIONS,
+        QUALIFIED_FOR_ADAPTER_TESTING,
         REJECTED,
         APPROVED_FOR_2E,
         RETIRED,
@@ -294,6 +299,15 @@ class DatasetVersion:
             "qualification_status": self.qualification_status,
             "label": "HISTORICAL DATA / RESEARCH ONLY",
         }
+
+
+def is_recorded_integration_sample(meta: DatasetVersion) -> bool:
+    """Recorded 2J sample is adapter/framework test data, never a licensed 2E dataset."""
+    if meta.usage_scope == ADAPTER_TESTING:
+        return True
+    if meta.source_id == RECORDED_SAMPLE_PROVIDER or meta.provider_name == RECORDED_SAMPLE_PROVIDER:
+        return True
+    return meta.dataset_id == RECORDED_SAMPLE_DATASET_ID
 
 
 @dataclass(frozen=True)

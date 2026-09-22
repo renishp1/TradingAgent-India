@@ -17,16 +17,19 @@ from grow.history.models import (
     BID_ASK_GAPS,
     CANDIDATE,
     FRAMEWORK_TEST_ONLY,
+    HISTORICAL_RESEARCH,
     MISSING_IV,
     MISSING_OI,
     MISSING_SESSIONS,
     MISSING_VOLUME,
     OPTION_SNAPSHOT_GAPS,
     QUALIFIED,
+    QUALIFIED_FOR_ADAPTER_TESTING,
     QUALIFIED_WITH_WARNINGS,
     REJECTED,
     HistoricalOptionContract,
     HistoricalOptionQuote,
+    is_recorded_integration_sample,
 )
 from grow.history.store import CanonicalStore
 from grow.history.universe import default_index_registry
@@ -248,16 +251,24 @@ class ProviderEvaluationRunner:
             status = QUALIFIED_WITH_WARNINGS
         else:
             status = QUALIFIED
+        recorded = is_recorded_integration_sample(meta)
+        framework = meta.usage_scope == FRAMEWORK_TEST_ONLY or meta.is_fixture
         approved = (
             status == QUALIFIED
             and meta.license_status == "APPROVED"
-            and meta.usage_scope != FRAMEWORK_TEST_ONLY
-            and not meta.is_fixture
+            and meta.usage_scope == HISTORICAL_RESEARCH
+            and not framework
+            and not recorded
             and meta.qualification_status != "RETIRED"
         )
-        if meta.usage_scope == FRAMEWORK_TEST_ONLY or meta.is_fixture:
+        if framework:
             limitations.append("FRAMEWORK_TEST_ONLY cannot become APPROVED_FOR_2E")
             approved = False
+        if recorded:
+            limitations.append("RECORDED_SAMPLE cannot become APPROVED_FOR_2E")
+            approved = False
+            if status == QUALIFIED:
+                status = QUALIFIED_FOR_ADAPTER_TESTING
         if approved:
             status = APPROVED_FOR_2E
         return ProviderEvaluationResult(

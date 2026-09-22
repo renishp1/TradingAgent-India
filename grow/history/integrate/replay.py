@@ -12,7 +12,14 @@ from grow.errors import GrowConfigError
 from grow.history.bridge import HistoricalMarketSource, HistoricalOptionSource
 from grow.history.calendar import calendar_for
 from grow.history.eval import DatasetQualificationRecord
-from grow.history.models import APPROVED_FOR_2E, FRAMEWORK_TEST_ONLY, QUALIFIED
+from grow.history.models import (
+    ADAPTER_TESTING,
+    APPROVED_FOR_2E,
+    FRAMEWORK_TEST_ONLY,
+    QUALIFIED,
+    QUALIFIED_FOR_ADAPTER_TESTING,
+    is_recorded_integration_sample,
+)
 from grow.history.store import CanonicalStore
 
 READY = frozenset({QUALIFIED, APPROVED_FOR_2E})
@@ -21,6 +28,10 @@ READY = frozenset({QUALIFIED, APPROVED_FOR_2E})
 def require_qualified_real(store: CanonicalStore, record: DatasetQualificationRecord) -> None:
     if store.meta.is_fixture or store.meta.usage_scope == FRAMEWORK_TEST_ONLY:
         raise GrowConfigError("FIXTURE_FALLBACK_FORBIDDEN")
+    if store.meta.usage_scope == ADAPTER_TESTING or is_recorded_integration_sample(store.meta):
+        raise GrowConfigError("NOT_APPROVED_FOR_2E")
+    if record.qualification_status == QUALIFIED_FOR_ADAPTER_TESTING:
+        raise GrowConfigError("NOT_APPROVED_FOR_2E")
     if record.dataset_id != store.meta.dataset_id:
         raise GrowConfigError("QUALIFICATION_DATASET_MISMATCH")
     if record.dataset_version != store.meta.version:

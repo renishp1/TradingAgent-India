@@ -15,9 +15,11 @@ Normalizer  nse.fo.recorded.v1 → CanonicalStore
         ↓
 publish + PIT + ProviderEvaluationRunner
         ↓
-QUALIFIED / APPROVED_FOR_2E  (or REJECTED)
+QUALIFIED_FOR_ADAPTER_TESTING  (recorded sample — never APPROVED_FOR_2E)
+  or QUALIFIED / APPROVED_FOR_2E  (licensed historical research only)
+  or REJECTED
         ↓
-2E BacktestRunner / 2F catalog freeze
+2E BacktestRunner / 2F catalog freeze  (QUALIFIED / APPROVED_FOR_2E only)
 ======== STOP 2J ========
 No broker. No live feed. No PaperLedger. No Risk Guard writes.
 No silent fallback to fixture data.
@@ -39,7 +41,7 @@ No silent fallback to fixture data.
 | Lot size | historical contract metadata; drives 2E P&L and costs |
 | IV / Greeks | ingested only when present; never fabricated |
 | Timestamps | timezone-aware at the canonical boundary; naive ISO fails |
-| 2E consume | `QUALIFIED` or `APPROVED_FOR_2E` only |
+| 2E consume | `QUALIFIED` or `APPROVED_FOR_2E` only; recorded sample is ineligible |
 | 2E `backtest.provider` | remains `fixture` (execution simulation). `options.provider=historical` |
 | 2F | freeze binds dataset fingerprint + version; cannot override rejection |
 
@@ -50,12 +52,20 @@ from recorded contracts and approved as `MONTHLY_ONLY` by the existing
 ## Lifecycle
 
 `RAW_ACQUIRED` → `NORMALIZED` → `PIT_VALIDATED` → `QUALIFICATION_REVIEW` →
-`QUALIFIED` / `REJECTED`.
+`QUALIFIED` / `QUALIFIED_FOR_ADAPTER_TESTING` / `REJECTED`.
+
+`PIT_VALIDATED` is emitted only after `ProviderEvaluationRunner` records
+`PIT:PASS`. A PIT failure never includes `PIT_VALIDATED` in the lifecycle.
+
+The recorded `recorded.nse_fo.v1` payload is integration/adapter-test data:
+`usage_scope=ADAPTER_TESTING`, `license_status=NOT_APPROVED`. It can reach
+`QUALIFIED_FOR_ADAPTER_TESTING` after a passing PIT check, but it cannot
+become `APPROVED_FOR_2E` and cannot pass `require_qualified_real()`.
 
 A dataset fingerprint is immutable after publish. Incomplete coverage,
 identity ambiguity, naive timestamps, unverifiable provenance, and PIT
 failures fail closed. `QUALIFIED_WITH_WARNINGS` is not admitted to 2E
-replay (`DATASET_NOT_QUALIFIED`).
+replay (`DATASET_NOT_QUALIFIED` / `NOT_APPROVED_FOR_2E`).
 
 ## 2E / 2F
 

@@ -10,7 +10,12 @@ from grow.history.eval import DatasetQualificationRecord, ProviderEvaluationRunn
 from grow.history.integrate.contract import AcquireScope, RawArtifact
 from grow.history.integrate.normalize import normalize_artifact
 from grow.history.integrate.recorded import open_provider
-from grow.history.models import APPROVED_FOR_2E, FRAMEWORK_TEST_ONLY, QUALIFIED
+from grow.history.models import (
+    APPROVED_FOR_2E,
+    FRAMEWORK_TEST_ONLY,
+    QUALIFIED,
+    QUALIFIED_FOR_ADAPTER_TESTING,
+)
 from grow.history.qualify_store import DatasetQualificationStore
 from grow.history.store import CanonicalStore
 from grow.history.universe import default_index_registry
@@ -58,12 +63,16 @@ def ingest(
     if store.meta.is_fixture or store.meta.usage_scope == FRAMEWORK_TEST_ONLY:
         raise GrowConfigError("FIXTURE_FALLBACK_FORBIDDEN")
     store.publish()
-    steps.append("PIT_VALIDATED")
-    steps.append("QUALIFICATION_REVIEW")
     record = ProviderEvaluationRunner().qualify(store)
     if qualifications is not None:
         qualifications.put(record)
-    if record.qualification_status in {QUALIFIED, APPROVED_FOR_2E}:
+    pit_passed = "PIT:PASS" in record.checks
+    if pit_passed:
+        steps.append("PIT_VALIDATED")
+    steps.append("QUALIFICATION_REVIEW")
+    if record.qualification_status == QUALIFIED_FOR_ADAPTER_TESTING:
+        steps.append("QUALIFIED_FOR_ADAPTER_TESTING")
+    elif record.qualification_status in {QUALIFIED, APPROVED_FOR_2E}:
         steps.append("QUALIFIED")
     else:
         steps.append("REJECTED")

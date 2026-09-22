@@ -3,7 +3,6 @@ from __future__ import annotations
 import ast
 import pathlib
 import unittest
-from dataclasses import replace
 from datetime import date, datetime
 
 from grow.backtest.costs import CostModel, SlippageModel, contract_pnl
@@ -14,9 +13,7 @@ from grow.clock import IST
 from grow.config import load_config
 from grow.data.factory import open_data_hub
 from grow.data.schema import Timeframe
-from grow.director.catalog import consume_qualification
 from grow.director.director import FixtureDirector
-from grow.director.models import FROZEN, READY, WindowSpec
 from grow.errors import GrowConfigError
 from grow.execution.lock import LIVE_TRADING_COMPILED
 from grow.history.bridge import HistoricalMarketSource, HistoricalOptionSource
@@ -33,7 +30,6 @@ from grow.history.integrate.replay import (
     require_qualified_real,
 )
 from grow.history.integrate.sample import (
-    DATASET_ID,
     END,
     START,
     WEEKLY_NEXT,
@@ -42,7 +38,13 @@ from grow.history.integrate.sample import (
     recorded_scope,
 )
 from grow.history.integrate.secrets import provider_secret, strip_secret_headers, strip_secrets
-from grow.history.models import APPROVED_FOR_2E, OPTION_SNAPSHOT_GAPS, QUALIFIED
+from grow.history.models import (
+    ADAPTER_TESTING,
+    APPROVED_FOR_2E,
+    OPTION_SNAPSHOT_GAPS,
+    QUALIFIED,
+    QUALIFIED_FOR_ADAPTER_TESTING,
+)
 from grow.history.universe import discover_underlyings
 from grow.options.engine import IndexOptionsEngine
 from grow.options.models import DecisionStatus
@@ -210,10 +212,19 @@ class QualificationTests(unittest.TestCase):
         result = _ingest()
         self.assertEqual(
             result.lifecycle,
-            ("RAW_ACQUIRED", "NORMALIZED", "PIT_VALIDATED", "QUALIFICATION_REVIEW", "QUALIFIED"),
+            (
+                "RAW_ACQUIRED",
+                "NORMALIZED",
+                "PIT_VALIDATED",
+                "QUALIFICATION_REVIEW",
+                "QUALIFIED_FOR_ADAPTER_TESTING",
+            ),
         )
-        self.assertIn(result.qualification.qualification_status, {QUALIFIED, APPROVED_FOR_2E})
-        self.assertTrue(result.qualification.approved_for_2e)
+        self.assertEqual(result.qualification.qualification_status, QUALIFIED_FOR_ADAPTER_TESTING)
+        self.assertNotEqual(result.qualification.qualification_status, APPROVED_FOR_2E)
+        self.assertFalse(result.qualification.approved_for_2e)
+        self.assertEqual(result.store.meta.usage_scope, ADAPTER_TESTING)
+        self.assertEqual(result.store.meta.license_status, "NOT_APPROVED")
         self.assertEqual(result.store.meta.fingerprint, result.qualification.fingerprint)
         self.assertNotEqual(result.store.meta.fingerprint, "pending")
         self.assertFalse(result.store.meta.is_fixture)
@@ -223,6 +234,26 @@ class QualificationTests(unittest.TestCase):
         again = _ingest()
         self.assertEqual(again.store.meta.fingerprint, result.store.meta.fingerprint)
 
+    def test_recorded_sample_cannot_pass_require_qualified_real(self) -> None:
+        result = _ingest()
+        self.assertEqual(result.qualification.qualification_status, QUALIFIED_FOR_ADAPTER_TESTING)
+        self.assertFalse(result.qualification.approved_for_2e)
+        with self.assertRaises(GrowConfigError) as ctx:
+            require_qualified_real(result.store, result.qualification)
+        self.assertIn("NOT_APPROVED_FOR_2E", str(ctx.exception))
+
+    def test_pit_failure_does_not_emit_pit_validated(self) -> None:
+        from unittest.mock import patch
+
+        from grow.history.eval import CheckResult
+
+        with patch("grow.history.eval._pit", return_value=CheckResult("PIT", "FAIL", "injected", True)):
+            result = _ingest()
+        self.assertNotIn("PIT_VALIDATED", result.lifecycle)
+        self.assertIn("PIT:FAIL", result.qualification.checks)
+        self.assertEqual(result.lifecycle[-1], "REJECTED")
+        self.assertNotEqual(result.qualification.qualification_status, APPROVED_FOR_2E)
+
     def test_incomplete_coverage_is_not_qualified_for_replay(self) -> None:
         result = _ingest(incomplete=True)
         self.assertEqual(result.lifecycle[-1], "REJECTED")
@@ -230,7 +261,7 @@ class QualificationTests(unittest.TestCase):
         self.assertIn(OPTION_SNAPSHOT_GAPS, result.qualification.quality_warnings)
         with self.assertRaises(GrowConfigError) as ctx:
             require_qualified_real(result.store, result.qualification)
-        self.assertIn("DATASET_NOT_QUALIFIED", str(ctx.exception))
+        self.assertIn("NOT_APPROVED_FOR_2E", str(ctx.exception))
 
     def test_future_contract_is_invisible_before_listed_from(self) -> None:
         result = _ingest(extra_future=True)
@@ -265,7 +296,6 @@ class QualificationTests(unittest.TestCase):
 class ReplayE2ETests(unittest.TestCase):
     def test_2c_2d_2e_replay_uses_historical_lot_size_not_config_default(self) -> None:
         result = _ingest()
-        require_qualified_real(result.store, result.qualification)
         base_config = load_config()
         config = historical_config(base_config)
         self.assertEqual(config.options.provider, "historical")
@@ -371,47 +401,24 @@ class ReplayE2ETests(unittest.TestCase):
             trade.gross_pnl, contract_pnl(entry=trade.entry_fill, exit=trade.exit_fill, lots=1, lot_size=1)
         )
 
-        runner = open_qualified_runner(store, result.qualification, start=START, end=END, config=config)
-        run = runner.run(start=START, end=END, underlyings=("NIFTY",))
-        self.assertEqual(run.manifest.dataset_id, DATASET_ID)
-        self.assertNotEqual(run.manifest.dataset_id, "grow.data.fixture.v1")
-        self.assertEqual(run.manifest.provider_name, RECORDED_PROVIDER_ID)
-        self.assertEqual(run.manifest.dataset_fingerprint, store.meta.fingerprint)
-        self.assertEqual(run.coverage["dataset"], DATASET_ID)
+        runner_ctx = self.assertRaises(GrowConfigError)
+        with runner_ctx as ctx:
+            require_qualified_real(store, result.qualification)
+        self.assertIn("NOT_APPROVED_FOR_2E", str(ctx.exception))
+        with self.assertRaises(GrowConfigError) as ctx:
+            open_qualified_runner(store, result.qualification, start=START, end=END, config=config)
+        self.assertIn("NOT_APPROVED_FOR_2E", str(ctx.exception))
 
-    def test_2f_freezes_against_qualified_fingerprint(self) -> None:
+    def test_2f_recorded_sample_cannot_enter_approved_catalog(self) -> None:
         result = _ingest()
+        self.assertEqual(result.qualification.fingerprint, result.store.meta.fingerprint)
+        self.assertNotEqual(result.qualification.qualification_status, APPROVED_FOR_2E)
         director = FixtureDirector()
-        row = bind_director_catalog(director, result.store, result.qualification)
-        self.assertEqual(row.fingerprint, result.store.meta.fingerprint)
-        self.assertEqual(row.qualification_status, result.qualification.qualification_status)
-        self.assertFalse(row.is_fixture)
-        plan = director.plan(
-            question="Does recorded NIFTY BUY-CE keep positive expectancy after costs?",
-            hypothesis="Expectancy stays positive across the unseen test window without one outlier.",
-            dataset_id=row.dataset_id,
-            start=START,
-            end=END,
-            universe=("NIFTY",),
-        )
-        ready = replace(
-            plan,
-            status=READY,
-            dataset_version=row.dataset_version,
-            train_window=WindowSpec(START, date(2026, 9, 14)),
-            validation_window=WindowSpec(date(2026, 9, 16), date(2026, 9, 16)),
-            test_window=WindowSpec(END, END),
-        )
-        frozen = director.freeze(ready)
-        self.assertEqual(frozen.status, FROZEN)
-        self.assertEqual(frozen.dataset_id, DATASET_ID)
-        self.assertEqual(frozen.dataset_version, row.dataset_version)
-        self.assertEqual(frozen.freeze_hash, ready.fingerprint())
-        changed = replace(ready, dataset_version="other.version")
-        self.assertNotEqual(changed.fingerprint(), frozen.freeze_hash)
-        consume_qualification(row, result.qualification)
+        with self.assertRaises(GrowConfigError) as ctx:
+            bind_director_catalog(director, result.store, result.qualification)
+        self.assertIn("NOT_APPROVED_FOR_2E", str(ctx.exception))
         with self.assertRaises(GrowConfigError):
-            consume_qualification(replace(row, fingerprint="deadbeef" * 8), result.qualification)
+            require_qualified_real(result.store, result.qualification)
 
 
 class SafetyTests(unittest.TestCase):
