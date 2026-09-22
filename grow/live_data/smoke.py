@@ -254,6 +254,7 @@ class OptionTickCheck:
 
     quotes: tuple[Mapping[str, Any], ...] = ()
     fixture_rejected: bool = False
+    rejections: tuple[Mapping[str, Any], ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -285,6 +286,44 @@ def _snapshot_marked_fixture(snapshot: Any) -> bool:
     return False
 
 
+NO_OPTION_QUOTE = "no_option_quote"
+STALE_OPTION_QUOTE = "stale_option_quote"
+FUTURE_OPTION_QUOTE = "future_option_quote"
+QUOTE_AFTER_EVENT = "quote_after_event_time"
+MISSING_SYMBOL_MAPPING = "missing_symbol_mapping"
+FIXTURE_QUOTE = "fixture_quote"
+INVALID_OPTION_TYPE = "invalid_option_type"
+INVALID_QUOTE_TIMESTAMP = "invalid_quote_timestamp"
+
+
+def _option_quote_freshness_failure(
+    quote_time: Any,
+    event_time: Any,
+    now: Any,
+    max_staleness_seconds: int | None,
+) -> str | None:
+    """Why a quote fails 3C.2 freshness. None means the quote is fresh.
+
+    Snapshot freshness_ok is not consulted here.
+    """
+    if max_staleness_seconds is None:
+        return INVALID_QUOTE_TIMESTAMP
+    if not all(_valid_timestamp(item) for item in (quote_time, event_time, now)):
+        return INVALID_QUOTE_TIMESTAMP
+    try:
+        limit = float(max_staleness_seconds)
+    except (TypeError, ValueError):
+        return INVALID_QUOTE_TIMESTAMP
+    if quote_time > now:
+        return FUTURE_OPTION_QUOTE
+    if quote_time > event_time:
+        return QUOTE_AFTER_EVENT
+    age = (now - quote_time).total_seconds()
+    if age > limit:
+        return STALE_OPTION_QUOTE
+    return None
+
+
 def _option_quote_is_fresh(
     quote_time: Any,
     event_time: Any,
@@ -292,18 +331,7 @@ def _option_quote_is_fresh(
     max_staleness_seconds: int | None,
 ) -> bool:
     """Per-contract freshness. Snapshot freshness_ok is not a substitute."""
-    if max_staleness_seconds is None:
-        return False
-    if not all(_valid_timestamp(item) for item in (quote_time, event_time, now)):
-        return False
-    try:
-        limit = float(max_staleness_seconds)
-    except (TypeError, ValueError):
-        return False
-    if quote_time > now or quote_time > event_time:
-        return False
-    age = (now - quote_time).total_seconds()
-    return age <= limit
+    return _option_quote_freshness_failure(quote_time, event_time, now, max_staleness_seconds) is None
 
 
 def _staleness_limit(loop: Any) -> int | None:
@@ -327,6 +355,21 @@ def _evaluation_now(loop: Any) -> datetime | None:
     return None
 
 
+def _diagnostic(reason: str, **fields: Any) -> dict[str, Any]:
+    row: dict[str, Any] = {"reason": reason}
+    for key, value in fields.items():
+        if value is None or value == "":
+            continue
+        row[key] = value
+    return row
+
+
+def _quote_age_ms(quote_time: Any, now: Any) -> int | None:
+    if not _valid_timestamp(quote_time) or not _valid_timestamp(now):
+        return None
+    return int(round((now - quote_time).total_seconds() * 1000))
+
+
 def _live_option_quote(
     snapshot: Any,
     contract: Any,
@@ -334,46 +377,59 @@ def _live_option_quote(
     *,
     now: datetime | None,
     max_staleness_seconds: int | None,
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Return (accepted quote, rejection). A rejection is never an accepted tick."""
     option_type = str(_scalar(getattr(contract, "option_type", "")) or "")
-    if option_type not in {"CE", "PE"}:
-        return None
     bid = getattr(contract, "bid", None)
     ask = getattr(contract, "ask", None)
     ltp = getattr(contract, "last_price", None)
-    if bid is None and ask is None and ltp is None:
-        return None
+    priced = bid is not None or ask is not None or ltp is not None
+    if option_type not in {"CE", "PE"}:
+        if not priced:
+            return None, None
+        return None, _diagnostic(INVALID_OPTION_TYPE, option_type=option_type or None)
+    if not priced:
+        return None, None
     provider_symbol = str(getattr(contract, "provider_contract_id", "") or "").strip()
-    if not provider_symbol:
-        return None
-    provider_symbol_id = reverse.get(provider_symbol)
-    if provider_symbol_id in (None, ""):
-        return None
+    provider_symbol_id = reverse.get(provider_symbol) if provider_symbol else None
     underlying = str(getattr(contract, "underlying", "") or "").strip()
     expiry = getattr(contract, "expiry", None)
     strike = getattr(contract, "strike", None)
-    if not underlying or expiry is None or strike is None:
-        return None
-    try:
-        strike_value = float(strike)
-    except (TypeError, ValueError):
-        return None
-    if strike_value <= 0:
-        return None
-    expiry_text = expiry.isoformat() if hasattr(expiry, "isoformat") else str(expiry)
-    canonical_id = f"{underlying}-{expiry_text}-{int(strike_value)}-{option_type}"
-    if not canonical_id or canonical_id == provider_symbol:
-        return None
+    expiry_text = expiry.isoformat() if hasattr(expiry, "isoformat") else (None if expiry is None else str(expiry))
+    canonical_id = None
+    if underlying and expiry_text and strike is not None:
+        try:
+            canonical_id = f"{underlying}-{expiry_text}-{int(float(strike))}-{option_type}"
+        except (TypeError, ValueError):
+            canonical_id = None
     event_time = getattr(snapshot, "event_time", None)
     received_time = getattr(snapshot, "received_time", None)
     quote_time = getattr(contract, "timestamp", None)
+    detail = _diagnostic(
+        "",
+        option_type=option_type,
+        provider_symbol=provider_symbol or None,
+        provider_symbol_id=None if provider_symbol_id in (None, "") else str(provider_symbol_id),
+        canonical_id=canonical_id,
+        underlying=underlying or None,
+        expiry=expiry_text,
+        strike=strike,
+        quote_timestamp=quote_time.isoformat() if _valid_timestamp(quote_time) else None,
+        event_time=event_time.isoformat() if _valid_timestamp(event_time) else None,
+        quote_age_ms=_quote_age_ms(quote_time, now),
+    )
+    detail.pop("reason", None)
+    if not provider_symbol or provider_symbol_id in (None, ""):
+        return None, _diagnostic(MISSING_SYMBOL_MAPPING, **detail)
+    if canonical_id is None or canonical_id == provider_symbol:
+        return None, _diagnostic(NO_OPTION_QUOTE, **detail)
     if not _valid_timestamp(received_time):
-        return None
-    fresh = _option_quote_is_fresh(quote_time, event_time, now, max_staleness_seconds)
-    if not fresh:
-        return None
+        return None, _diagnostic(INVALID_QUOTE_TIMESTAMP, **detail)
+    failure = _option_quote_freshness_failure(quote_time, event_time, now, max_staleness_seconds)
+    if failure is not None:
+        return None, _diagnostic(failure, **detail)
     age_seconds = (now - quote_time).total_seconds()
-    return {
+    accepted = {
         "snapshot_id": snapshot.snapshot_id,
         "event_time": event_time.isoformat(),
         "received_time": received_time.isoformat(),
@@ -390,9 +446,10 @@ def _live_option_quote(
         "quote_timestamp": quote_time.isoformat(),
         "quote_age_seconds": age_seconds,
         "quote_age_ms": int(round(age_seconds * 1000)),
-        "quote_freshness": fresh,
+        "quote_freshness": True,
         "sequence": snapshot.sequence,
     }
+    return accepted, None
 
 
 def assess_option_ticks(
@@ -404,33 +461,38 @@ def assess_option_ticks(
 ) -> OptionTickCheck:
     """A first live tick is one CE/PE contract with a fresh quote, not merely a snapshot."""
     if snapshot is None:
-        return OptionTickCheck()
+        return OptionTickCheck(rejections=({"reason": NO_OPTION_QUOTE},))
     if _snapshot_marked_fixture(snapshot):
-        return OptionTickCheck(fixture_rejected=True)
+        return OptionTickCheck(fixture_rejected=True, rejections=({"reason": FIXTURE_QUOTE},))
     if getattr(snapshot, "freshness_ok", False) is not True:
-        return OptionTickCheck()
+        return OptionTickCheck(rejections=({"reason": NO_OPTION_QUOTE},))
     if not _valid_timestamp(getattr(snapshot, "event_time", None)):
-        return OptionTickCheck()
+        return OptionTickCheck(rejections=({"reason": NO_OPTION_QUOTE},))
     reverse = _reverse_symbol_ids(dict(symbol_ids or {}))
     quotes: list[dict[str, Any]] = []
+    rejections: list[dict[str, Any]] = []
     for chain in (getattr(snapshot, "chains", {}) or {}).values():
         for contract in getattr(chain, "contracts", ()) or ():
-            row = _live_option_quote(
+            accepted, rejection = _live_option_quote(
                 snapshot,
                 contract,
                 reverse,
                 now=now,
                 max_staleness_seconds=max_staleness_seconds,
             )
-            if row is not None:
-                quotes.append(row)
-    return OptionTickCheck(tuple(quotes))
+            if accepted is not None:
+                quotes.append(accepted)
+            elif rejection is not None:
+                rejections.append(rejection)
+    if not quotes and not rejections:
+        rejections.append({"reason": NO_OPTION_QUOTE})
+    return OptionTickCheck(tuple(quotes), rejections=tuple(rejections))
 
 
 def _loop_option_check(loop: Any) -> OptionTickCheck:
     provider = getattr(loop, "provider", None)
     if _provider_quotes_marked_fixture(provider):
-        return OptionTickCheck(fixture_rejected=True)
+        return OptionTickCheck(fixture_rejected=True, rejections=({"reason": FIXTURE_QUOTE},))
     symbol_ids = dict(getattr(provider, "_symbol_ids", {}) or {})
     return assess_option_ticks(
         getattr(loop, "last_snapshot", None),
@@ -581,6 +643,16 @@ def build_smoke_report(
     if quote_fixture or tick_check.fixture_rejected:
         fixture_fallback = True
     option_tick_ok = tick_check.ok and not fixture_fallback
+    rejections = [dict(item) for item in tick_check.rejections]
+    if fixture_fallback and not any(item.get("reason") == FIXTURE_QUOTE for item in rejections):
+        rejections.insert(0, {"reason": FIXTURE_QUOTE})
+    if option_tick_ok:
+        option_tick_rejection = None
+    elif rejections:
+        option_tick_rejection = str(rejections[0].get("reason") or NO_OPTION_QUOTE)
+    else:
+        option_tick_rejection = NO_OPTION_QUOTE
+        rejections = [{"reason": NO_OPTION_QUOTE}]
     paper_fill = any(row.status is CycleStatus.PAPER_FILL for row in reports)
     hard_fail = bool(broker_hits or loaded or fixture_fallback or _is_hard_fail_error(error))
     result = classify_smoke_result(
@@ -630,6 +702,8 @@ def build_smoke_report(
             "events": list(getattr(provider, "subscription_events", ()) or ())[-8:],
         },
         "option_tick_ok": option_tick_ok,
+        "option_tick_rejection": option_tick_rejection,
+        "option_tick_rejections": rejections if not option_tick_ok else [item for item in rejections if item.get("reason") != NO_OPTION_QUOTE],
         "first_option_tick": first,
         "first_tick": None
         if first is None or snapshot is None
@@ -730,6 +804,16 @@ def format_option_tick_evidence(report: Mapping[str, Any]) -> str:
         f"Option tick: {'PASS' if option_ok else 'FAIL'}",
         f"Smoke result: {result}",
     ]
+    rejection = report.get("option_tick_rejection")
+    if rejection:
+        lines.append(f"Rejection: {rejection}")
+    raw_rejections = report.get("option_tick_rejections")
+    detail = raw_rejections[0] if isinstance(raw_rejections, list) and raw_rejections else None
+    if isinstance(detail, Mapping):
+        if detail.get("quote_timestamp"):
+            lines.append(f"Rejected quote timestamp: {detail['quote_timestamp']}")
+        if detail.get("quote_age_ms") is not None:
+            lines.append(f"Rejected quote age: {detail['quote_age_ms']} ms")
     return "\n".join(lines)
 
 
