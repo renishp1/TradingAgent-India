@@ -24,7 +24,9 @@ No broker. No live feed. No PaperLedger. No Risk Guard writes.
 |---|---|
 | Vendor | none — file adapter + `grow.history.sample.v1` |
 | Sample usage | `FRAMEWORK_TEST_ONLY` / `SYNTHETIC` — not historical research |
-| Calendar | dataset `HistoricalSession` for snapshot state; **not** config SessionCalendar |
+| Warnings | `APPROVED_WITH_WARNINGS` needs `ACCEPT_DATASET_WARNINGS` on the research plan |
+| Calendar | dataset `HistoricalSession`; missing weekday → `CALENDAR_MISSING` / `DATA_UNAVAILABLE` |
+| Option cadence | `snapshot_cadence` (sample: 11:00 and 15:15 IST); one quote/day is not 100% |
 | Universe | NIFTY / BANKNIFTY only |
 | Availability | `as_of_available_at`; sample uses observation timestamp |
 | Calendar | dataset sessions, **not** weekday inference |

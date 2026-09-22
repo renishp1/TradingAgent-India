@@ -31,15 +31,19 @@ class DatasetRegistry:
             raise GrowConfigError("DATASET_UNAVAILABLE")
         return self._stores[key]
 
-    def require_approved(self, dataset_id: str, version: str) -> CanonicalStore:
+    def require_approved(self, dataset_id: str, version: str, *, accept_warnings: bool = False) -> CanonicalStore:
         store = self.get(dataset_id, version)
         if store.meta.usage_scope != "HISTORICAL_RESEARCH" or store.meta.is_fixture:
             raise GrowConfigError(f"DATASET_FRAMEWORK_ONLY:{dataset_id}")
         if store.meta.license_status not in {"APPROVED", "APPROVED_WITH_WARNINGS"}:
             raise GrowConfigError(f"DATASET_NOT_APPROVED:{dataset_id}")
-        if store.meta.quality_status in {"REJECTED", "RETIRED", "DRAFT"}:
-            raise GrowConfigError(f"DATASET_NOT_APPROVED:{dataset_id}")
-        return store
+        if store.meta.quality_status == "APPROVED":
+            return store
+        if store.meta.quality_status == "APPROVED_WITH_WARNINGS":
+            if not accept_warnings:
+                raise GrowConfigError("WARNINGS_NOT_ACKNOWLEDGED")
+            return store
+        raise GrowConfigError(f"DATASET_NOT_APPROVED:{dataset_id}")
 
     def catalog_rows(self) -> tuple[dict, ...]:
         rows = []

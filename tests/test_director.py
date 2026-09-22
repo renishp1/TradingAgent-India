@@ -7,10 +7,18 @@ from datetime import date, datetime, timedelta
 
 from grow.clock import IST
 from grow.config import load_config
-from grow.director.catalog import FIXTURE_DATASET, UNAPPROVED_STUB
+from grow.director.catalog import (
+    ACCEPT_DATASET_WARNINGS,
+    APPROVED_WITH_WARNINGS,
+    ApprovedDataSource,
+    FIXTURE_DATASET,
+    UNAPPROVED_STUB,
+    default_catalog,
+)
 from grow.director.coordinator import BacktestCoordinator
 from grow.director.director import FixtureDirector, LogicalClock
 from grow.director.models import FROZEN, HOLD, READY, REJECT, ResearchResult, WindowSpec
+from grow.director.validate import ResearchPlanValidator
 from grow.errors import GrowConfigError
 from tests.helpers import make_runtime
 
@@ -353,6 +361,43 @@ class DirectorCoordinatorTests(unittest.TestCase):
         self.assertEqual(frozen.test_freeze_at, "2026-02-01T11:00:00+05:30")
         self.assertNotEqual(frozen.test_freeze_at, frozen.created_at)
         self.assertNotEqual(frozen.test_freeze_at, frozen.historical_period.start.isoformat())
+
+
+class DirectorWarningAckTests(unittest.TestCase):
+    def test_approved_with_warnings_needs_plan_ack(self) -> None:
+        _, plan = _valid_plan()
+        hist = ApprovedDataSource(
+            dataset_id="hist.warn",
+            provider="file",
+            instrument_scope=("NIFTY", "BANKNIFTY"),
+            date_coverage=(date(2026, 1, 1), date(2026, 12, 31)),
+            timestamp_granularity=("M5", "M15", "D1"),
+            timezone="Asia/Kolkata",
+            option_chain_depth="atm_pm2",
+            bid_ask_available=True,
+            oi_available=True,
+            volume_available=True,
+            iv_available=False,
+            greeks_available=False,
+            historical_contract_metadata=True,
+            session_calendar_version=plan.session_calendar_version,
+            quality_status=APPROVED_WITH_WARNINGS,
+            licensing_status="APPROVED",
+            dataset_version="v1",
+            provenance="test",
+            usage_scope="HISTORICAL_RESEARCH",
+            is_fixture=False,
+        )
+        allowed = replace(hist, dataset_id="hist.ok", quality_status="APPROVED")
+        cat = {**default_catalog(), hist.dataset_id: hist, allowed.dataset_id: allowed}
+        warned = replace(plan, dataset_id=hist.dataset_id, dataset_version="v1")
+        with self.assertRaises(GrowConfigError) as ctx:
+            ResearchPlanValidator().validate(warned, cat)
+        self.assertIn("WARNINGS_NOT_ACKNOWLEDGED", str(ctx.exception))
+        acked = replace(warned, acceptance_rules=plan.acceptance_rules + (ACCEPT_DATASET_WARNINGS,))
+        ResearchPlanValidator().validate(acked, cat)
+        clean = replace(plan, dataset_id=allowed.dataset_id, dataset_version="v1")
+        ResearchPlanValidator().validate(clean, cat)
 
 
 if __name__ == "__main__":

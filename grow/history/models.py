@@ -192,6 +192,7 @@ class DatasetVersion:
     timezone: str
     usage_scope: str
     is_fixture: bool
+    snapshot_cadence: tuple[str, ...]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -222,6 +223,7 @@ class DatasetVersion:
             "timezone": self.timezone,
             "usage_scope": self.usage_scope,
             "is_fixture": self.is_fixture,
+            "snapshot_cadence": list(self.snapshot_cadence),
             "label": "HISTORICAL DATA / RESEARCH ONLY",
         }
 

@@ -10,7 +10,9 @@ from grow.backtest.calendar import FIXTURE_CALENDAR
 from grow.errors import GrowConfigError
 
 APPROVED = "APPROVED"
+APPROVED_WITH_WARNINGS = "APPROVED_WITH_WARNINGS"
 NOT_APPROVED = "NOT_APPROVED"
+ACCEPT_DATASET_WARNINGS = "ACCEPT_DATASET_WARNINGS"
 FIXTURE_DATASET = "grow.data.fixture.v1"
 UNAPPROVED_STUB = "grow.data.unapproved.stub.v1"
 
@@ -150,10 +152,19 @@ def require_approved(catalog: Mapping[str, ApprovedDataSource], dataset_id: str)
     return source
 
 
-def require_historical_research(catalog: Mapping[str, ApprovedDataSource], dataset_id: str) -> ApprovedDataSource:
+def require_historical_research(
+    catalog: Mapping[str, ApprovedDataSource],
+    dataset_id: str,
+    *,
+    accept_warnings: bool = False,
+) -> ApprovedDataSource:
     source = require_approved(catalog, dataset_id)
     if source.usage_scope != "HISTORICAL_RESEARCH" or source.is_fixture:
         raise GrowConfigError(f"DATASET_FRAMEWORK_ONLY:{dataset_id}")
-    if source.quality_status in {"SYNTHETIC", "REJECTED", "DRAFT", "RETIRED"}:
-        raise GrowConfigError(f"DATASET_FRAMEWORK_ONLY:{dataset_id}")
-    return source
+    if source.quality_status == "APPROVED":
+        return source
+    if source.quality_status == APPROVED_WITH_WARNINGS:
+        if not accept_warnings:
+            raise GrowConfigError("WARNINGS_NOT_ACKNOWLEDGED")
+        return source
+    raise GrowConfigError(f"DATASET_FRAMEWORK_ONLY:{dataset_id}")

@@ -76,6 +76,7 @@ def build_sample_store() -> CanonicalStore:
         timezone="Asia/Kolkata",
         usage_scope=FRAMEWORK_TEST_ONLY,
         is_fixture=True,
+        snapshot_cadence=("11:00", "15:15"),
     )
     store = CanonicalStore(meta)
     for day in _weekdays(START, END):

@@ -65,6 +65,7 @@ def load_payload(raw: dict) -> CanonicalStore:
         timezone="Asia/Kolkata",
         usage_scope=str(meta_raw.get("usage_scope", FRAMEWORK_TEST_ONLY)),
         is_fixture=bool(meta_raw.get("is_fixture", False)),
+        snapshot_cadence=tuple(meta_raw.get("snapshot_cadence") or ()),
     )
     store = CanonicalStore(meta)
     for row in raw.get("sessions", []):

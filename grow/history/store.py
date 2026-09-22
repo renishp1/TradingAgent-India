@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import date, datetime
+from datetime import date, datetime, time
+
+from grow.clock import IST
 
 from grow.errors import GrowConfigError
 from grow.history.fingerprint import fingerprint
@@ -101,20 +103,26 @@ class CanonicalStore:
         expected_quotes = 0
         observed_quotes = 0
         missing_snaps: list[str] = []
-        quotes_by_key: dict[tuple[str, date], list[HistoricalOptionQuote]] = {}
+        cadence = self.meta.snapshot_cadence
+        quotes_by_slot: dict[tuple[str, datetime], HistoricalOptionQuote] = {}
         for quote in self._quotes:
-            quotes_by_key.setdefault((quote.contract_id, quote.timestamp.date()), []).append(quote)
+            quotes_by_slot[(quote.contract_id, quote.timestamp)] = quote
         for day in open_days:
-            for contract in self._contracts.values():
-                if not (contract.first_seen_at.date() <= day <= contract.last_seen_at.date()):
+            session = self._sessions[day]
+            for stamp in cadence:
+                hour, minute = (int(part) for part in stamp.split(":"))
+                slot = datetime.combine(day, time(hour, minute), tzinfo=IST)
+                if slot < session.open_at or slot > session.close_at:
                     continue
-                expected_quotes += 1
-                rows = quotes_by_key.get((contract.contract_id, day), [])
-                if rows:
-                    observed_quotes += 1
-                else:
-                    missing_snaps.append(f"{contract.contract_id}:{day.isoformat()}")
-        denom = max(expected_quotes, 1) if expected_quotes else 1
+                for contract in self._contracts.values():
+                    if not (contract.first_seen_at <= slot <= contract.last_seen_at):
+                        continue
+                    expected_quotes += 1
+                    if (contract.contract_id, slot) in quotes_by_slot:
+                        observed_quotes += 1
+                    else:
+                        missing_snaps.append(f"{contract.contract_id}:{slot.isoformat()}")
+
         observed_rows = self._quotes
         n_obs = len(observed_rows)
 

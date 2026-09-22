@@ -7,6 +7,8 @@ from datetime import date, datetime
 
 from grow.clock import IST
 from grow.config import GrowConfig, load_config
+from grow.data.quality import combine_quality
+from grow.data.schedule import complete_starts
 from grow.data.schema import Bar, BarSeries, MarketSnapshot, SnapshotQuality, SourceMeta, Timeframe
 from grow.errors import GrowConfigError
 from grow.history.calendar import session_state_at
@@ -55,6 +57,12 @@ class HistoricalMarketSource:
         if as_of is None:
             raise GrowConfigError("HISTORICAL_REQUIRES_AS_OF")
         moment = as_of.astimezone(IST)
+        try:
+            state = session_state_at(self.store, moment)
+        except GrowConfigError as exc:
+            if "CALENDAR_MISSING" in str(exc):
+                raise GrowConfigError("DATA_UNAVAILABLE:CALENDAR_MISSING") from exc
+            raise
         symbol = Symbol(ticker=ticker, exchange=self.config.market.exchange)
         series: dict[Timeframe, BarSeries] = {}
         for name in self.config.data.timeframes:
@@ -71,19 +79,13 @@ class HistoricalMarketSource:
             last = series[Timeframe.D1].bars[-1].close
         if last <= 0:
             raise GrowConfigError(DATA_UNAVAILABLE)
-        quality = SnapshotQuality(
-            complete=True,
-            stale=False,
-            missing_count=0,
-            expected_count=len(series.get(Timeframe.M15).bars) if Timeframe.M15 in series else 0,
-            last_bar_end=series[Timeframe.M15].bars[-1].end if Timeframe.M15 in series and series[Timeframe.M15].bars else None,
-            notes=("historical", self.store.meta.fingerprint[:12]),
-        )
+        session = self.store.session_on(moment.date())
+        quality = self._bar_quality(series, moment, session)
         return MarketSnapshot(
             snapshot_id=_digest(f"{ticker}:{moment.isoformat()}:{self.store.meta.fingerprint}")[:16],
             symbol=symbol,
             as_of=moment,
-            session=session_state_at(self.store, moment),
+            session=state,
             last_price=last,
             currency="INR",
             series=series,
@@ -95,6 +97,67 @@ class HistoricalMarketSource:
         snap = self.snapshot(ticker, as_of=as_of)
         tf = timeframe if isinstance(timeframe, Timeframe) else Timeframe(str(timeframe).upper())
         return snap.series[tf]
+
+    def _bar_quality(self, series: dict[Timeframe, BarSeries], as_of: datetime, session) -> SnapshotQuality:
+        if session is None or session.status != "OPEN":
+            last = None
+            m15 = series.get(Timeframe.M15)
+            if m15 and m15.bars:
+                last = m15.bars[-1].end
+            return SnapshotQuality(
+                complete=True,
+                stale=False,
+                missing_count=0,
+                expected_count=0,
+                last_bar_end=last,
+                notes=("session not open", self.store.meta.fingerprint[:12]),
+            )
+        parts: list[SnapshotQuality] = []
+        open_t = session.open_at.time()
+        close_t = session.close_at.time()
+        for tf, item in series.items():
+            if tf is Timeframe.D1:
+                today = tuple(bar for bar in item.bars if bar.start.date() == as_of.date())
+                missing = 0 if today else 1
+                parts.append(
+                    SnapshotQuality(
+                        complete=missing == 0,
+                        stale=False,
+                        missing_count=missing,
+                        expected_count=1,
+                        last_bar_end=today[-1].end if today else None,
+                        notes=("D1",),
+                    )
+                )
+                continue
+            expected = complete_starts(
+                as_of.date(),
+                tf,
+                as_of,
+                session_open=open_t,
+                session_close=close_t,
+            )
+            have = {bar.start for bar in item.bars}
+            miss = tuple(start for start in expected if start not in have)
+            parts.append(
+                SnapshotQuality(
+                    complete=len(miss) == 0 and bool(expected),
+                    stale=False,
+                    missing_count=len(miss),
+                    expected_count=len(expected),
+                    last_bar_end=item.bars[-1].end if item.bars else None,
+                    notes=(f"{tf.value}:missing={len(miss)}",),
+                )
+            )
+        quality = combine_quality(tuple(parts))
+        return SnapshotQuality(
+            complete=quality.complete,
+            stale=quality.stale,
+            missing_count=quality.missing_count,
+            expected_count=quality.expected_count,
+            last_bar_end=quality.last_bar_end,
+            notes=quality.notes + (self.store.meta.fingerprint[:12],),
+        )
 
     def _forming_d1(self, symbol: Symbol, as_of: datetime, complete: list[Bar]) -> list[Bar]:
         session_open = as_of.replace(hour=9, minute=15, second=0, microsecond=0)

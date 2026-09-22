@@ -1,13 +1,22 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
 from datetime import date, datetime, time, timedelta
 
 from grow.backtest.calendar import WeekdayFixtureCalendar
 from grow.backtest.runner import BacktestRunner
 from grow.clock import IST
 from grow.config import load_config
-from grow.director.catalog import default_catalog, require_historical_research
+from grow.data.schedule import complete_starts
+from grow.data.schema import Timeframe
+from grow.director.catalog import (
+    ACCEPT_DATASET_WARNINGS,
+    APPROVED_WITH_WARNINGS,
+    ApprovedDataSource,
+    default_catalog,
+    require_historical_research,
+)
 from grow.errors import GrowConfigError
 from grow.history.adapter import _dt, load_payload
 from grow.history.bridge import HistoricalMarketSource, HistoricalOptionSource
@@ -59,6 +68,7 @@ def _meta(**kwargs) -> DatasetVersion:
         timezone="Asia/Kolkata",
         usage_scope="HISTORICAL_RESEARCH",
         is_fixture=False,
+        snapshot_cadence=("11:00", "15:15"),
     )
     base.update(kwargs)
     return DatasetVersion(**base)
@@ -613,4 +623,138 @@ class HistoryHardeningTests(unittest.TestCase):
         published = store.publish()
         self.assertIn(published.quality_status, {APPROVED_WITH_WARNINGS, REJECTED})
         self.assertNotEqual(published.quality_status, "APPROVED")
+
+    def test_warnings_require_explicit_ack(self) -> None:
+        src = ApprovedDataSource(
+            dataset_id="hist.warn",
+            provider="file",
+            instrument_scope=("NIFTY",),
+            date_coverage=(date(2026, 1, 1), date(2026, 12, 31)),
+            timestamp_granularity=("M15",),
+            timezone="Asia/Kolkata",
+            option_chain_depth="atm_pm2",
+            bid_ask_available=True,
+            oi_available=True,
+            volume_available=True,
+            iv_available=False,
+            greeks_available=False,
+            historical_contract_metadata=True,
+            session_calendar_version="cal.v1",
+            quality_status=APPROVED_WITH_WARNINGS,
+            licensing_status="APPROVED",
+            dataset_version="v1",
+            provenance="test",
+            usage_scope="HISTORICAL_RESEARCH",
+            is_fixture=False,
+        )
+        clean = replace(src, quality_status="APPROVED", dataset_id="hist.ok")
+        cat = {src.dataset_id: src, clean.dataset_id: clean}
+        require_historical_research(cat, clean.dataset_id)
+        with self.assertRaises(GrowConfigError) as ctx:
+            require_historical_research(cat, src.dataset_id)
+        self.assertIn("WARNINGS_NOT_ACKNOWLEDGED", str(ctx.exception))
+        require_historical_research(cat, src.dataset_id, accept_warnings=True)
+
+    def test_missing_m15_quality_not_complete(self) -> None:
+        store = CanonicalStore(_meta())
+        store.add_session(_session())
+        day = date(2026, 9, 21)
+        as_of = datetime(2026, 9, 21, 11, 0, tzinfo=IST)
+        skip = datetime(2026, 9, 21, 10, 0, tzinfo=IST)
+        for tf in (Timeframe.M5, Timeframe.M15):
+            for start in complete_starts(
+                day, tf, as_of, session_open=time(9, 15), session_close=time(15, 30)
+            ):
+                if tf is Timeframe.M15 and start == skip:
+                    continue
+                end = start + timedelta(minutes=5 if tf is Timeframe.M5 else 15)
+                px = 25000.0
+                store.add_bar(
+                    HistoricalBar(
+                        symbol="NIFTY",
+                        timeframe=tf.value,
+                        timestamp=start,
+                        end=end,
+                        open=px,
+                        high=px + 1,
+                        low=px - 1,
+                        close=px,
+                        volume=1,
+                        source_id="t",
+                        dataset_version="v1",
+                        as_of_available_at=end,
+                        corporate_action_adjustment_version="u",
+                        quality_flags=(),
+                    )
+                )
+        snap = HistoricalMarketSource(store).snapshot("NIFTY", as_of=as_of)
+        expected_m15 = complete_starts(day, Timeframe.M15, as_of, session_open=time(9, 15), session_close=time(15, 30))
+        self.assertGreater(snap.quality.expected_count, len(expected_m15) - 1)
+        self.assertFalse(snap.quality.complete)
+        self.assertGreaterEqual(snap.quality.missing_count, 1)
+        self.assertNotEqual(snap.quality.expected_count, len(snap.series[Timeframe.M15].bars))
+
+    def test_one_quote_per_day_is_not_full_intraday_coverage(self) -> None:
+        store = CanonicalStore(_meta())
+        store.add_session(_session())
+        store.add_contract(
+            HistoricalOptionContract(
+                underlying="NIFTY",
+                expiry=date(2026, 9, 22),
+                strike=25000,
+                option_type="CE",
+                contract_id="c1",
+                provider_contract_id="c1",
+                lot_size=75,
+                expiry_class="WEEKLY",
+                first_seen_at=datetime(2026, 9, 21, 9, 15, tzinfo=IST),
+                last_seen_at=datetime(2026, 9, 22, 15, 30, tzinfo=IST),
+                listing_status="ACTIVE",
+                source_id="t",
+                dataset_version="v1",
+            )
+        )
+        ts = datetime(2026, 9, 21, 11, 0, tzinfo=IST)
+        store.add_quote(
+            HistoricalOptionQuote(
+                contract_id="c1",
+                timestamp=ts,
+                bid=10,
+                ask=11,
+                ltp=10.5,
+                volume=1,
+                open_interest=1,
+                previous_open_interest=None,
+                implied_volatility=None,
+                delta=None,
+                gamma=None,
+                theta=None,
+                vega=None,
+                greek_source=None,
+                iv_source=None,
+                source_id="t",
+                dataset_version="v1",
+                as_of_available_at=ts,
+                quality_flags=(),
+            )
+        )
+        report = store.coverage()
+        self.assertEqual(report.expected_quotes, 2)
+        self.assertEqual(report.observed_quotes, 1)
+        self.assertLess(report.quote_completeness, 1.0)
+        published = store.publish()
+        self.assertNotEqual(published.quality_status, "APPROVED")
+
+    def test_missing_weekday_is_not_a_holiday(self) -> None:
+        store = default_registry().get(SAMPLE_ID, SAMPLE_VERSION)
+        saturday = datetime(2026, 9, 19, 11, 0, tzinfo=IST)
+        self.assertEqual(session_state_at(store, saturday), SessionState.WEEKEND)
+        missing = datetime(2026, 9, 24, 11, 0, tzinfo=IST)
+        self.assertEqual(missing.weekday(), 3)
+        with self.assertRaises(GrowConfigError) as ctx:
+            session_state_at(store, missing)
+        self.assertIn("CALENDAR_MISSING", str(ctx.exception))
+        with self.assertRaises(GrowConfigError) as ctx:
+            HistoricalMarketSource(store).snapshot("NIFTY", as_of=missing)
+        self.assertIn("DATA_UNAVAILABLE", str(ctx.exception))
 

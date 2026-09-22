@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta
 
 from grow.backtest.calendar import ExplicitSessionCalendar
 from grow.clock import IST
+from grow.errors import GrowConfigError
 from grow.history.store import CanonicalStore
 from grow.types import SessionState
 
@@ -20,7 +21,9 @@ def session_state_at(store: CanonicalStore, as_of: datetime) -> SessionState:
     day = moment.date()
     session = store.session_on(day)
     if session is None:
-        return SessionState.WEEKEND if day.weekday() >= 5 else SessionState.HOLIDAY
+        if day.weekday() >= 5:
+            return SessionState.WEEKEND
+        raise GrowConfigError("CALENDAR_MISSING")
     if session.status == "CLOSED":
         reason = (session.special_reason or "").lower()
         return SessionState.HOLIDAY if reason == "holiday" else SessionState.CLOSED
