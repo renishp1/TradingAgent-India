@@ -206,7 +206,10 @@ class ChainFilterUnitTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.reason_codes, (UNKNOWN_EXPIRY_CLASS,))
         self.assertEqual(UNKNOWN_EXPIRY_CLASS, "UNKNOWN_EXPIRY_CLASS")
+        self.assertEqual(result.eligible_instruments, ())
+        self.assertEqual(result.eligible_quotes, ())
         self.assertIsNone(result.selected_expiry)
+        self.assertEqual(result.diagnostics.get("expiry_class_policy"), "fail_closed")
         self.assertIsNone(_expiry_class(None))
 
     def test_expiry_class_unknown_rejected(self) -> None:
@@ -214,16 +217,32 @@ class ChainFilterUnitTests(unittest.TestCase):
         result = filter_campaign_chain(snap, underlying="RELIANCE", direction="BULLISH")
         self.assertFalse(result.ok)
         self.assertEqual(result.reason_codes, (UNKNOWN_EXPIRY_CLASS,))
+        self.assertEqual(result.eligible_instruments, ())
+        self.assertEqual(result.eligible_quotes, ())
         self.assertIsNone(result.selected_expiry)
+        self.assertEqual(result.diagnostics.get("expiry_class_policy"), "fail_closed")
         self.assertIsNone(_expiry_class("UNKNOWN"))
+
+    def test_expiry_class_unknown_expiry_class_token_rejected(self) -> None:
+        snap = _snapshot(quotes=(_quote(expiry_class="UNKNOWN_EXPIRY_CLASS"),))
+        result = filter_campaign_chain(snap, underlying="RELIANCE", direction="BULLISH")
+        self.assertEqual(result.reason_codes, (UNKNOWN_EXPIRY_CLASS,))
+        self.assertEqual(result.eligible_instruments, ())
+        self.assertEqual(result.eligible_quotes, ())
+        self.assertIsNone(result.selected_expiry)
+        self.assertEqual(result.diagnostics.get("expiry_class_policy"), "fail_closed")
 
     def test_expiry_class_invalid_rejected(self) -> None:
         snap = _snapshot(quotes=(_quote(expiry_class="INVALID"),))
         result = filter_campaign_chain(snap, underlying="RELIANCE", direction="BULLISH")
         self.assertFalse(result.ok)
         self.assertEqual(result.reason_codes, (UNKNOWN_EXPIRY_CLASS,))
+        self.assertEqual(result.eligible_instruments, ())
+        self.assertEqual(result.eligible_quotes, ())
         self.assertIsNone(result.selected_expiry)
+        self.assertEqual(result.diagnostics.get("expiry_class_policy"), "fail_closed")
         self.assertIsNone(_expiry_class("INVALID"))
+        self.assertFalse(any(str(code).startswith("NO_ELIGIBLE_EXPIRY") for code in result.reason_codes))
 
     def test_expiry_class_weekly_accepted(self) -> None:
         snap = _snapshot(quotes=(_quote(expiry_class="WEEKLY"),))
@@ -276,7 +295,7 @@ class ChainFilterUnitTests(unittest.TestCase):
 
     def test_unclassified_expiry_cannot_produce_eligible_candidate(self) -> None:
         """Option chain with None/invalid expiry_class must not yield an eligible instrument."""
-        for bad in (None, "UNKNOWN", "INVALID"):
+        for bad in (None, "UNKNOWN", "UNKNOWN_EXPIRY_CLASS", "INVALID"):
             with self.subTest(expiry_class=bad):
                 snap = _snapshot(quotes=(_quote(expiry_class=bad),))
                 filtered = filter_campaign_chain(snap, underlying="RELIANCE", direction="BULLISH")
@@ -284,6 +303,10 @@ class ChainFilterUnitTests(unittest.TestCase):
                 self.assertEqual(filtered.eligible_instruments, ())
                 self.assertEqual(filtered.eligible_quotes, ())
                 self.assertIsNone(filtered.selected_expiry)
+                self.assertEqual(filtered.diagnostics.get("expiry_class_policy"), "fail_closed")
+                self.assertFalse(
+                    any(str(code).startswith("NO_ELIGIBLE_EXPIRY") for code in filtered.reason_codes)
+                )
                 code, again = allow_campaign_candidate(snap, _candidate())
                 self.assertEqual(code, UNKNOWN_EXPIRY_CLASS)
                 self.assertFalse(again.ok)

@@ -112,8 +112,24 @@ def filter_campaign_chain(
                 "underlying": under,
                 "expiry_class_policy": "fail_closed",
             },
+            selected_expiry=None,
         )
     expiries = expiries_or_reason
+    # Belt-and-suspenders: never hand OptionExpiry with missing/invalid klass to choose_expiry.
+    guarded = _require_tradable_expiries(expiries)
+    if isinstance(guarded, str):
+        return ChainFilterResult(
+            eligible_instruments=(),
+            eligible_quotes=(),
+            reason_codes=(guarded,),
+            diagnostics={
+                "filter_version": CHAIN_FILTER_VERSION,
+                "underlying": under,
+                "expiry_class_policy": "fail_closed",
+            },
+            selected_expiry=None,
+        )
+    expiries = guarded
     # Minimal chain shape for choose_expiry (no fabricate).
     from grow.options.models import OptionChainSnapshot
 
@@ -135,6 +151,7 @@ def filter_campaign_chain(
             eligible_quotes=(),
             reason_codes=(expiry_why,),
             diagnostics={"filter_version": CHAIN_FILTER_VERSION, "underlying": under},
+            selected_expiry=None,
         )
 
     typed = tuple(
@@ -330,11 +347,17 @@ def _spot(snapshot: AgentMarketSnapshot, underlying: str) -> float | None:
 
 
 def _expiries(quotes: tuple[OptionQuoteView, ...]) -> tuple[OptionExpiry, ...] | str:
-    """Build expiry markers. Fail closed on missing/unknown/invalid class — never invent WEEKLY."""
+    """Build expiry markers. Fail closed on missing/unknown/invalid class — never invent WEEKLY.
+
+    Never constructs ``OptionExpiry(day, None)``. Bad classification returns
+    ``UNKNOWN_EXPIRY_CLASS`` so ``filter_campaign_chain`` never calls ``choose_expiry``.
+    """
     seen: dict[date, ExpiryClass] = {}
     for row in quotes:
         klass = _expiry_class(row.expiry_class)
         if klass is None:
+            return UNKNOWN_EXPIRY_CLASS
+        if klass not in (ExpiryClass.WEEKLY, ExpiryClass.MONTHLY):
             return UNKNOWN_EXPIRY_CLASS
         prior = seen.get(row.expiry)
         if prior is not None and prior is not klass:
@@ -342,7 +365,23 @@ def _expiries(quotes: tuple[OptionQuoteView, ...]) -> tuple[OptionExpiry, ...] |
         seen[row.expiry] = klass
     if not seen:
         return UNKNOWN_EXPIRY_CLASS
-    return tuple(OptionExpiry(day, klass) for day, klass in sorted(seen.items(), key=lambda item: item[0]))
+    built: list[OptionExpiry] = []
+    for day, klass in sorted(seen.items(), key=lambda item: item[0]):
+        # klass is ExpiryClass.WEEKLY|MONTHLY only — never None.
+        built.append(OptionExpiry(day, klass))
+    return tuple(built)
+
+
+def _require_tradable_expiries(expiries: tuple[OptionExpiry, ...]) -> tuple[OptionExpiry, ...] | str:
+    """Reject any expiry marker that is missing or not WEEKLY/MONTHLY before choose_expiry."""
+    if not expiries:
+        return UNKNOWN_EXPIRY_CLASS
+    for item in expiries:
+        if item.klass is None:
+            return UNKNOWN_EXPIRY_CLASS
+        if item.klass not in (ExpiryClass.WEEKLY, ExpiryClass.MONTHLY):
+            return UNKNOWN_EXPIRY_CLASS
+    return expiries
 
 
 # Strict allowlist only. Missing keys (None/UNKNOWN/invalid) → None. Never default to WEEKLY.
