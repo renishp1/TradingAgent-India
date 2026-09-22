@@ -167,6 +167,46 @@ class PaperConfig:
     entry_price_source: str = "LTP"
     exit_price_source: str = "BID"
     slippage_bps: float | None = None
+    # Named execution-price modes. When set, they override entry/exit sources.
+    # ltp is research/test only and must not be treated as realistic.
+    price_mode: str | None = None
+    # Optional named capital profile label (e.g. INDIA_INDEX_OPTIONS_PAPER_10K).
+    capital_profile: str | None = None
+
+
+# Named paper capital profiles. Applying a profile does not mutate global YAML defaults.
+PAPER_CAPITAL_PROFILES: dict[str, dict[str, float | int]] = {
+    "INDIA_INDEX_OPTIONS_PAPER_10K": {
+        "starting_cash": 10_000,
+        "max_daily_loss": 2_000,
+        "max_per_trade_risk": 1_000,
+        "max_open_positions": 2,
+    },
+}
+
+
+def apply_paper_capital_profile(config: "GrowConfig", profile_name: str) -> "GrowConfig":
+    """Return a config with the named paper capital / risk profile applied."""
+    from dataclasses import replace
+
+    key = str(profile_name).strip().upper()
+    if key not in PAPER_CAPITAL_PROFILES:
+        raise GrowConfigError(f"Unknown paper capital profile {profile_name!r}")
+    body = PAPER_CAPITAL_PROFILES[key]
+    return replace(
+        config,
+        paper=replace(
+            config.paper,
+            starting_cash=float(body["starting_cash"]),
+            capital_profile=key,
+        ),
+        risk=replace(
+            config.risk,
+            max_daily_loss=float(body["max_daily_loss"]),
+            max_per_trade_risk=float(body["max_per_trade_risk"]),
+            max_open_positions=int(body["max_open_positions"]),
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -353,6 +393,14 @@ class GrowConfig:
             raise GrowConfigError("paper.exit_price_source must be LTP, BID, ASK, or MIDPOINT.")
         if self.paper.slippage_bps is not None and self.paper.slippage_bps < 0:
             raise GrowConfigError("paper.slippage_bps must be >= 0 when set.")
+        if self.paper.price_mode is not None:
+            mode = str(self.paper.price_mode).strip().lower()
+            if mode not in {"conservative", "midpoint", "ltp"}:
+                raise GrowConfigError("paper.price_mode must be conservative, midpoint, or ltp when set.")
+        if self.paper.capital_profile is not None:
+            profile = str(self.paper.capital_profile).strip().upper()
+            if profile not in PAPER_CAPITAL_PROFILES:
+                raise GrowConfigError(f"Unknown paper.capital_profile {self.paper.capital_profile!r}")
         if self.market.product != "CASH":
             raise GrowConfigError("Milestone 1 product must be CASH.")
         if self.risk.allow_short:
@@ -809,6 +857,16 @@ def _build(raw: dict[str, Any], source_path: str) -> GrowConfig:
                 None
                 if paper.get("slippage_bps", None) is None
                 else _as_float(paper.get("slippage_bps"), "paper.slippage_bps")
+            ),
+            price_mode=(
+                None
+                if paper.get("price_mode", None) in (None, "")
+                else str(paper.get("price_mode")).strip().lower()
+            ),
+            capital_profile=(
+                None
+                if paper.get("capital_profile", None) in (None, "")
+                else str(paper.get("capital_profile")).strip().upper()
             ),
         ),
         model=ModelConfig(
