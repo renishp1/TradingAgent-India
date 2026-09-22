@@ -7,11 +7,13 @@ Canonical campaign path (no third executor):
     → PaperExecutionEngine (existing 3B paper fills)
 
 Preserves ``LivePaperLoop`` as the legacy 3A path. Does not place broker orders.
+Phase 9 adds optional durable paper checkpoints for cross-process restart.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from grow.agents.base import SpecialistAgent
@@ -24,6 +26,7 @@ from grow.execution.lock import assert_paper_runtime
 from grow.market_data.normalized.models import AgentMarketSnapshot
 from grow.orchestration.cycle import AnalysisOrchestrator
 from grow.orchestration.models import AggregateAnalysisPackage
+from grow.paper.checkpoint import restore_paper_engine
 from grow.paper.engine import PaperExecutionEngine, PaperExecutionResult
 from grow.paper.fills import policy_from_config
 from grow.risk.guard import RiskGuard
@@ -73,6 +76,8 @@ class CampaignRunner:
         specialists: tuple[SpecialistAgent, ...] | None = None,
         configured_strategies: tuple[str, ...] = ("trend",),
         apply_campaign_defaults: bool = True,
+        checkpoint_path: Path | str | None = None,
+        paper: PaperExecutionEngine | None = None,
     ) -> None:
         raw = config
         if apply_campaign_defaults:
@@ -94,11 +99,56 @@ class CampaignRunner:
             risk_guard=self.guard,
             risk_secret=risk_secret,
         )
-        self.paper = PaperExecutionEngine(
-            self.config,
-            clock=self.clock,
-            risk_guard=self.guard,
+        self.checkpoint_path = None if checkpoint_path is None else Path(checkpoint_path)
+        if paper is not None:
+            self.paper = paper
+            if self.checkpoint_path is not None:
+                self.paper.checkpoint_path = self.checkpoint_path
+        else:
+            self.paper = PaperExecutionEngine(
+                self.config,
+                clock=self.clock,
+                risk_guard=self.guard,
+                risk_secret=risk_secret,
+                checkpoint_path=self.checkpoint_path,
+            )
+        self._risk_secret = risk_secret
+
+    @classmethod
+    def from_checkpoint(
+        cls,
+        path: Path | str,
+        config: GrowConfig | None = None,
+        *,
+        clock: Clock | None = None,
+        risk_secret: str | None = None,
+        specialists: tuple[SpecialistAgent, ...] | None = None,
+        configured_strategies: tuple[str, ...] = ("trend",),
+        apply_campaign_defaults: bool = True,
+    ) -> CampaignRunner:
+        """Cross-process campaign restart from a durable paper checkpoint."""
+        raw = config
+        if apply_campaign_defaults:
+            raw = campaign_paper_config(config)
+        assert raw is not None
+        resolved_clock = clock if clock is not None else SystemClock()
+        paper = restore_paper_engine(
+            raw,
+            path,
+            clock=resolved_clock,
             risk_secret=risk_secret,
+        )
+        paper.checkpoint_path = Path(path)
+        return cls(
+            raw,
+            clock=resolved_clock,
+            risk_guard=paper.guard,
+            risk_secret=risk_secret,
+            specialists=specialists,
+            configured_strategies=configured_strategies,
+            apply_campaign_defaults=False,
+            checkpoint_path=path,
+            paper=paper,
         )
 
     @property
@@ -137,3 +187,9 @@ class CampaignRunner:
             decision=decision,
             execution=execution,
         )
+
+    def on_snapshot(self, snapshot: AgentMarketSnapshot) -> tuple[str, ...]:
+        """Mark / timeout / recovery on the shared paper engine."""
+        if snapshot.live_trading or not snapshot.paper_mode:
+            raise ValueError("campaign runner requires a paper-only snapshot")
+        return self.paper.on_snapshot(snapshot)
