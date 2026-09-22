@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import unittest
+from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -15,6 +16,7 @@ from grow.decision.contracts.agent_result import AgentResult, AgentStatus, Candi
 from grow.decision.integration.contract import DecisionAction, DecisionBookState, IntegratedDecisionStatus
 from grow.decision.integration.engine import DecisionEngine
 from grow.decision.signal import SIGNAL_ENGINE_VERSION, SIGNAL_SCHEMA, CampaignSignal, SignalEngine
+from grow.decision.signal.engine import _candidate_from_agent
 from grow.market_data.normalized.models import DataQualityStatus, OptionQuoteView
 from grow.market_data.snapshots.builder import build_fixture_snapshot
 from grow.orchestration.models import AggregateAnalysisPackage
@@ -187,6 +189,235 @@ class SignalEngineUnitTests(unittest.TestCase):
         self.assertEqual(signal.action, DecisionAction.NO_TRADE)
         self.assertTrue(any(item.code == "CHAIN_FILTER" for item in signal.counter_evidence))
         self.assertIn("UNKNOWN_EXPIRY_CLASS", signal.reason_codes)
+
+
+class CandidateFromAgentFailClosedTests(unittest.TestCase):
+    """Malformed agent metrics must fail closed — never raise into decide()."""
+
+    def _assert_incomplete_no_trade(self, **metric_overrides) -> CampaignSignal:
+        snap = _snapshot()
+        signal = SignalEngine().evaluate(
+            snapshot=snap,
+            package=_package(snap, _result(snap, **metric_overrides)),
+        )
+        self.assertEqual(signal.action, DecisionAction.NO_TRADE)
+        self.assertIn("INCOMPLETE_SIGNAL_CANDIDATE", signal.reason_codes)
+        self.assertTrue(
+            any(item.code == "INCOMPLETE_SIGNAL_CANDIDATE" for item in signal.counter_evidence)
+        )
+        return signal
+
+    def test_invalid_quantity_string_is_no_trade(self) -> None:
+        self._assert_incomplete_no_trade(quantity="abc")
+
+    def test_invalid_quantity_none_is_no_trade(self) -> None:
+        self._assert_incomplete_no_trade(quantity=None)
+
+    def test_invalid_strike_string_is_no_trade(self) -> None:
+        self._assert_incomplete_no_trade(strike="abc")
+
+    def test_invalid_target_string_is_no_trade(self) -> None:
+        self._assert_incomplete_no_trade(target="abc")
+
+    def test_invalid_lot_size_string_is_no_trade(self) -> None:
+        self._assert_incomplete_no_trade(lot_size="abc")
+
+    def test_invalid_limit_price_string_is_no_trade(self) -> None:
+        self._assert_incomplete_no_trade(limit_price="abc")
+
+    def test_invalid_stop_loss_string_is_no_trade(self) -> None:
+        self._assert_incomplete_no_trade(stop_loss="abc")
+
+    def test_malformed_numeric_combinations_is_no_trade(self) -> None:
+        self._assert_incomplete_no_trade(
+            quantity="abc",
+            strike="abc",
+            target="abc",
+            lot_size="abc",
+            limit_price="abc",
+            stop_loss="abc",
+        )
+
+    def test_invalid_lots_when_quantity_absent_is_no_trade(self) -> None:
+        snap = _snapshot()
+        base = _result(snap)
+        metrics = {key: value for key, value in base.calculated_metrics.items() if key != "quantity"}
+        metrics["lots"] = "abc"
+        result = replace(base, calculated_metrics=metrics)
+        signal = SignalEngine().evaluate(snapshot=snap, package=_package(snap, result))
+        self.assertEqual(signal.action, DecisionAction.NO_TRADE)
+        self.assertIn("INCOMPLETE_SIGNAL_CANDIDATE", signal.reason_codes)
+
+    def test_decide_malformed_metrics_returns_no_trade_not_raise(self) -> None:
+        """DecisionEngine.decide() stays deterministic NO_TRADE; never raises."""
+        snap = _snapshot()
+        # Required / quantity-path malformations: integrator also fails closed → NO_TRADE.
+        required_cases = (
+            {"quantity": "abc"},
+            {"quantity": None},
+            {"lot_size": "abc"},
+            {"limit_price": "abc"},
+            {"stop_loss": "abc"},
+            {
+                "quantity": "abc",
+                "strike": "abc",
+                "target": "abc",
+                "lot_size": "abc",
+                "limit_price": "abc",
+                "stop_loss": "abc",
+            },
+        )
+        for overrides in required_cases:
+            with self.subTest(overrides=overrides):
+                engine = _engine()
+                decision = engine.decide(
+                    snapshot=snap,
+                    package=_package(snap, _result(snap, **overrides)),
+                )
+                self.assertEqual(decision.action, DecisionAction.NO_TRADE)
+                self.assertEqual(decision.campaign_signal["action"], "NO_TRADE")
+                self.assertIn(
+                    "INCOMPLETE_SIGNAL_CANDIDATE",
+                    decision.campaign_signal["reason_codes"],
+                )
+                again = _engine().decide(
+                    snapshot=snap,
+                    package=_package(snap, _result(snap, **overrides)),
+                )
+                self.assertEqual(decision.action, again.action)
+                self.assertEqual(
+                    decision.campaign_signal["reason_codes"],
+                    again.campaign_signal["reason_codes"],
+                )
+                self.assertEqual(
+                    decision.campaign_signal["signal_id"],
+                    again.campaign_signal["signal_id"],
+                )
+
+        # Optional numeric malformations: SignalEngine fails closed; decide must not raise.
+        for overrides in ({"strike": "abc"}, {"target": "abc"}):
+            with self.subTest(optional=overrides):
+                engine = _engine()
+                decision = engine.decide(
+                    snapshot=snap,
+                    package=_package(snap, _result(snap, **overrides)),
+                )
+                self.assertEqual(decision.campaign_signal["action"], "NO_TRADE")
+                self.assertIn(
+                    "INCOMPLETE_SIGNAL_CANDIDATE",
+                    decision.campaign_signal["reason_codes"],
+                )
+
+
+class CandidateFromAgentNormalizationTests(unittest.TestCase):
+    """String metrics must normalize to typed numeric StrategyCandidate fields."""
+
+    def _candidate(self, *, confidence=0.5, drop_quantity: bool = False, **metric_overrides):
+        snap = _snapshot()
+        base = _result(snap, **metric_overrides)
+        metrics = dict(base.calculated_metrics)
+        if drop_quantity:
+            metrics.pop("quantity", None)
+        result = replace(base, calculated_metrics=metrics, confidence=confidence)
+        return _candidate_from_agent(result)
+
+    def test_quantity_string_normalizes_to_int(self) -> None:
+        candidate = self._candidate(quantity="10")
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate.quantity, 10)
+        self.assertIsInstance(candidate.quantity, int)
+
+    def test_lots_string_normalizes_to_quantity_int(self) -> None:
+        candidate = self._candidate(lots="2", drop_quantity=True)
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate.quantity, 2)
+        self.assertIsInstance(candidate.quantity, int)
+
+    def test_strike_string_normalizes_to_float(self) -> None:
+        candidate = self._candidate(strike="25000")
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate.strike, 25000.0)
+        self.assertIsInstance(candidate.strike, float)
+
+    def test_target_string_normalizes_to_float(self) -> None:
+        candidate = self._candidate(target="180")
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate.target, 180.0)
+        self.assertIsInstance(candidate.target, float)
+
+    def test_lot_size_string_normalizes_to_int(self) -> None:
+        candidate = self._candidate(lot_size="75")
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate.lot_size, 75)
+        self.assertIsInstance(candidate.lot_size, int)
+
+    def test_limit_price_string_normalizes_to_float(self) -> None:
+        candidate = self._candidate(limit_price="100.5")
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate.limit_price, 100.5)
+        self.assertIsInstance(candidate.limit_price, float)
+
+    def test_stop_loss_string_normalizes_to_float(self) -> None:
+        candidate = self._candidate(stop_loss="90.5")
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate.stop_loss, 90.5)
+        self.assertIsInstance(candidate.stop_loss, float)
+
+    def test_confidence_string_normalizes_to_float(self) -> None:
+        # AgentResult rejects non-float confidence; exercise the parser path directly.
+        snap = _snapshot()
+        base = _result(snap)
+        row = replace(base, confidence=None)
+        object.__setattr__(row, "confidence", "0.85")
+        candidate = _candidate_from_agent(row)
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate.confidence, 0.85)
+        self.assertIsInstance(candidate.confidence, float)
+
+    def test_normalized_candidate_numeric_field_types(self) -> None:
+        candidate = self._candidate(
+            quantity="10",
+            strike="25000",
+            target="180",
+            lot_size="75",
+            limit_price="100.5",
+            stop_loss="90.5",
+            confidence=0.85,
+        )
+        self.assertIsNotNone(candidate)
+        self.assertIsInstance(candidate.quantity, int)
+        self.assertIsInstance(candidate.strike, float)
+        self.assertIsInstance(candidate.target, float)
+        self.assertIsInstance(candidate.lot_size, int)
+        self.assertIsInstance(candidate.limit_price, float)
+        self.assertIsInstance(candidate.stop_loss, float)
+        self.assertIsInstance(candidate.confidence, float)
+        self.assertEqual(candidate.quantity, 10)
+        self.assertEqual(candidate.strike, 25000.0)
+        self.assertEqual(candidate.target, 180.0)
+        self.assertEqual(candidate.lot_size, 75)
+        self.assertEqual(candidate.limit_price, 100.5)
+        self.assertEqual(candidate.stop_loss, 90.5)
+        self.assertEqual(candidate.confidence, 0.85)
+
+    def test_malformed_still_fail_closed_after_normalization(self) -> None:
+        self.assertIsNone(self._candidate(quantity="abc"))
+        self.assertIsNone(self._candidate(quantity=None))
+        self.assertIsNone(self._candidate(strike="abc"))
+        self.assertIsNone(self._candidate(target="abc"))
+        self.assertIsNone(self._candidate(lot_size="abc"))
+        self.assertIsNone(self._candidate(limit_price="abc"))
+        self.assertIsNone(self._candidate(stop_loss="abc"))
+        self.assertIsNone(
+            self._candidate(
+                quantity="abc",
+                strike="abc",
+                target="abc",
+                lot_size="abc",
+                limit_price="abc",
+                stop_loss="abc",
+            )
+        )
 
 
 class DecisionEngineSignalAttachmentTests(unittest.TestCase):
