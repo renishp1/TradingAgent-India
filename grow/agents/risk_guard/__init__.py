@@ -1,7 +1,8 @@
 """Risk Guard adapter for the multi-agent cycle.
 
 Wraps the independent grow.risk.RiskGuard. Agents cannot modify risk limits.
-Consensus cannot override a rejection.
+Consensus cannot override a rejection. 4B consumes this interface only —
+final decision integration remains Requirement 4C.
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ class AgentRiskGuard:
     """Independent safety authority for agent-cycle proposals."""
 
     agent_name = "risk_guard"
-    agent_version = "risk_guard.adapter.v1"
+    agent_version = "risk_guard.adapter.v2"
 
     def __init__(
         self,
@@ -71,13 +72,12 @@ class AgentRiskGuard:
             )
         errors = tuple(row.agent_name for row in specialist_results if row.status is AgentStatus.ERROR)
         if errors:
-            # Critical specialist failure → NO_TRADE (fail closed, no fabricated substitute).
             return RiskGateDecision(False, "NO_TRADE", "SPECIALIST_ERROR", errors)
         if proposed_action in {CandidateAction.NONE, CandidateAction.ABSTAIN, CandidateAction.HOLD}:
             return RiskGateDecision(False, "NO_TRADE", "NO_CANDIDATE_ACTION")
         if proposed_action is CandidateAction.PAPER_OPEN and not proposed_instrument:
             return RiskGateDecision(False, "REJECT", "MISSING_INSTRUMENT")
-        # Foundation phase never auto-approves paper opens from research agents.
+        # 4B never auto-approves paper opens from research agents.
         if proposed_action is CandidateAction.PAPER_OPEN:
             reason = "FOUNDATION_NO_AUTO_OPEN"
             if consensus:
@@ -85,7 +85,7 @@ class AgentRiskGuard:
             return RiskGateDecision(False, "REJECT", reason)
         return RiskGateDecision(False, "NO_TRADE", f"UNSUPPORTED_ACTION:{proposed_action.value}")
 
-    def analyze(self, snapshot: AgentMarketSnapshot) -> AgentResult:
+    def analyze(self, snapshot: AgentMarketSnapshot, *, cycle_id: str = "") -> AgentResult:
         """Expose Risk Guard as a structured agent result without execution rights."""
         gate = self.evaluate(
             snapshot,
@@ -94,13 +94,21 @@ class AgentRiskGuard:
             specialist_results=(),
             consensus=False,
         )
+        status = AgentStatus.PASS if gate.decision != "REJECT" else AgentStatus.ERROR
         return AgentResult(
             agent_name=self.agent_name,
             agent_version=self.agent_version,
             snapshot_id=snapshot.snapshot_id,
+            snapshot_version=snapshot.version,
             decision_timestamp=snapshot.decision_timestamp,
-            status=AgentStatus.PASS if gate.decision != "REJECT" else AgentStatus.REJECT,
+            status=status,
             observations=(gate.reason, *gate.details),
+            calculated_metrics={"paper_mode": True},
+            interpretation=("Risk Guard adapter validation only; not a trade order.",),
+            findings=(gate.decision,),
+            data_quality_concerns=(),
+            assumptions=(),
+            evidence=(f"snapshot_id={snapshot.snapshot_id}",),
             metrics_used=("paper_mode", "data_quality"),
             candidate_action=CandidateAction.NONE,
             candidate_instrument=None,
@@ -109,4 +117,5 @@ class AgentRiskGuard:
             risk_flags=(gate.decision,),
             missing_data=(),
             confidence=None,
+            cycle_id=cycle_id,
         )

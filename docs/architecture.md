@@ -11,6 +11,7 @@ Milestone 2I (dynamic index/expiry discovery) lives in [`docs/dynamic.md`](dynam
 Milestone 3A (live stream → paper) lives in [`docs/live_data.md`](live_data.md).
 Milestone 3B (paper MTM + exits) lives in [`docs/positions.md`](positions.md).
 Milestone 3C (TrueData live adapter) lives in [`docs/truedata.md`](truedata.md).
+Milestone 4B (specialist agents & orchestration) lives in [`docs/milestone-4b.md`](milestone-4b.md).
 
 ## Product split
 

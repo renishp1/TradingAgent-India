@@ -9,7 +9,7 @@ from grow.market_data.normalized.models import AgentMarketSnapshot
 
 class AuditorAgent:
     agent_name = "auditor"
-    agent_version = "auditor.v1"
+    agent_version = "auditor.v2"
 
     def __init__(self, store: JournalStore | None = None) -> None:
         self.store = store or JournalStore()
@@ -18,14 +18,21 @@ class AuditorAgent:
         self.store.append(cycle)
         return cycle
 
-    def analyze(self, snapshot: AgentMarketSnapshot) -> AgentResult:
+    def analyze(self, snapshot: AgentMarketSnapshot, *, cycle_id: str = "") -> AgentResult:
         return AgentResult(
             agent_name=self.agent_name,
             agent_version=self.agent_version,
             snapshot_id=snapshot.snapshot_id,
+            snapshot_version=snapshot.version,
             decision_timestamp=snapshot.decision_timestamp,
             status=AgentStatus.PASS,
             observations=(f"journal_size={len(self.store.records)}",),
+            calculated_metrics={"journal_size": len(self.store.records)},
+            interpretation=("Audit store ready; no trading authority.",),
+            findings=("AUDIT_READY",),
+            data_quality_concerns=(),
+            assumptions=(),
+            evidence=(f"snapshot_id={snapshot.snapshot_id}",),
             metrics_used=("journal_size",),
             candidate_action=CandidateAction.ABSTAIN,
             candidate_instrument=None,
@@ -34,4 +41,5 @@ class AuditorAgent:
             risk_flags=(),
             missing_data=(),
             confidence=None,
+            cycle_id=cycle_id,
         )

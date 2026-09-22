@@ -19,14 +19,21 @@ class _OpenAgent:
     agent_name = "force_open"
     agent_version = "force_open.v1"
 
-    def analyze(self, snapshot):
+    def analyze(self, snapshot, *, cycle_id: str = ""):
         return AgentResult(
             agent_name=self.agent_name,
             agent_version=self.agent_version,
             snapshot_id=snapshot.snapshot_id,
+            snapshot_version=snapshot.version,
             decision_timestamp=snapshot.decision_timestamp,
             status=AgentStatus.PASS,
             observations=("force open",),
+            calculated_metrics={},
+            interpretation=("test force open",),
+            findings=("FORCE_OPEN",),
+            data_quality_concerns=(),
+            assumptions=(),
+            evidence=("test",),
             metrics_used=(),
             candidate_action=CandidateAction.PAPER_OPEN,
             candidate_instrument="NIFTY-25000-CE",
@@ -34,6 +41,7 @@ class _OpenAgent:
             invalidation_reason=None,
             risk_flags=(),
             missing_data=(),
+            cycle_id=cycle_id,
         )
 
 
@@ -41,8 +49,38 @@ class _BoomAgent:
     agent_name = "boom"
     agent_version = "boom.v1"
 
-    def analyze(self, snapshot):
+    def analyze(self, snapshot, *, cycle_id: str = ""):
         raise RuntimeError("boom")
+
+
+class _MismatchAgent:
+    agent_name = "mismatch"
+    agent_version = "mismatch.v1"
+
+    def analyze(self, snapshot, *, cycle_id: str = ""):
+        return AgentResult(
+            agent_name=self.agent_name,
+            agent_version=self.agent_version,
+            snapshot_id="wrong-id",
+            snapshot_version=snapshot.version,
+            decision_timestamp=snapshot.decision_timestamp,
+            status=AgentStatus.PASS,
+            observations=("bad",),
+            calculated_metrics={},
+            interpretation=(),
+            findings=(),
+            data_quality_concerns=(),
+            assumptions=(),
+            evidence=(),
+            metrics_used=(),
+            candidate_action=CandidateAction.NONE,
+            candidate_instrument=None,
+            entry_reason=None,
+            invalidation_reason=None,
+            risk_flags=(),
+            missing_data=(),
+            cycle_id=cycle_id,
+        )
 
 
 def _snapshot(quality: DataQualityStatus = DataQualityStatus.OK):
@@ -69,6 +107,7 @@ def _snapshot(quality: DataQualityStatus = DataQualityStatus.OK):
         option_contracts=(option,),
         quality=quality,
         notes=("stale",) if quality is DataQualityStatus.STALE else (),
+        diagnostics={"history_closes": [100.0 + i for i in range(20)]},
     )
 
 
@@ -76,16 +115,18 @@ class AgentOrchestratorSafetyTests(unittest.TestCase):
     def test_default_cycle_is_no_trade_and_journaled(self) -> None:
         orch = AgentCycleOrchestrator(configured_strategies=("trend",))
         decision = orch.run(_snapshot())
-        self.assertIn(decision.decision, {"NO_TRADE", "REJECTED_BY_RISK"})
+        self.assertIn(decision.decision, {"NO_TRADE", "REJECTED_BY_RISK", "ANALYSIS_COMPLETE"})
         self.assertEqual(len(orch.journal.records), 1)
         self.assertEqual(decision.record.snapshot_id, decision.snapshot_id)
         self.assertFalse(decision.to_dict()["live_trading"])
+        self.assertFalse(decision.to_dict()["broker_order_path"])
+        self.assertEqual(decision.analysis_package.snapshot_id, decision.snapshot_id)
 
     def test_quality_gate_short_circuits(self) -> None:
         orch = AgentCycleOrchestrator()
         decision = orch.run(_snapshot(DataQualityStatus.STALE))
         self.assertEqual(decision.decision, "NO_TRADE")
-        self.assertTrue(decision.reason.startswith("DATA_QUALITY_GATE"))
+        self.assertTrue(decision.reason.startswith("STOPPED_BEFORE_DISPATCH"))
         self.assertEqual(decision.agent_results, ())
 
     def test_risk_guard_rejects_despite_consensus(self) -> None:
@@ -102,6 +143,16 @@ class AgentOrchestratorSafetyTests(unittest.TestCase):
         self.assertEqual(decision.agent_results[0].status, AgentStatus.ERROR)
         self.assertEqual(decision.decision, "NO_TRADE")
         self.assertIn("SPECIALIST_ERROR", decision.reason)
+
+    def test_snapshot_mismatch_is_rejected(self) -> None:
+        orch = AgentCycleOrchestrator(specialists=(_MismatchAgent(),))
+        decision = orch.run(_snapshot())
+        self.assertEqual(decision.agent_results, ())
+        self.assertTrue(decision.analysis_package.rejected_outputs)
+        self.assertEqual(
+            decision.analysis_package.rejected_outputs[0]["reason"],
+            "SNAPSHOT_ID_MISMATCH",
+        )
 
     def test_risk_guard_refuses_live_construction(self) -> None:
         with self.assertRaises(ValueError):

@@ -1,4 +1,7 @@
-"""Fixture-driven multi-agent paper cycle. No broker. No live trading."""
+"""Fixture-driven multi-agent paper analysis cycle (Requirement 4B).
+
+No broker. No live trading. Emits an auditable AggregateAnalysisPackage.
+"""
 
 from __future__ import annotations
 
@@ -43,10 +46,11 @@ def main(argv: list[str] | None = None) -> int:
         spot=25000.0,
         option_contracts=(option,),
         notes=("fixture agent cycle",),
+        diagnostics={"history_closes": [24900.0 + i * 5 for i in range(20)]},
     )
     decision = AgentCycleOrchestrator(configured_strategies=("trend", "momentum")).run(snapshot)
     print(json.dumps(decision.to_dict(), indent=2, sort_keys=True))
-    return 0 if decision.decision in {"NO_TRADE", "REJECTED_BY_RISK", "PAPER_READY"} else 1
+    return 0 if decision.decision in {"NO_TRADE", "REJECTED_BY_RISK", "ANALYSIS_COMPLETE"} else 1
 
 
 if __name__ == "__main__":
