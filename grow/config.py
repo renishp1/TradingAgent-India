@@ -395,17 +395,17 @@ class GrowConfig:
             raise GrowLiveTradingDisabled("live_data.live_trading must be false. Milestone 3A is paper only.")
         if not self.live_data.paper_mode:
             raise GrowConfigError("live_data.paper_mode must be true.")
-        if self.live_data.provider not in {"mock", "truedata"}:
-            raise GrowConfigError("live_data.provider must be 'mock' or 'truedata'.")
+        if self.live_data.provider not in {"mock", "truedata", "kite_market"}:
+            raise GrowConfigError("live_data.provider must be 'mock', 'truedata', or 'kite_market'.")
         if self.live_data.mode not in {"replay", "real"}:
             raise GrowConfigError("live_data.mode must be replay or real.")
         if self.live_data.provider == "mock" and self.live_data.reconnect_policy != "fail_closed":
             raise GrowConfigError("3A live_data.reconnect_policy must be fail_closed.")
-        if self.live_data.provider == "truedata" and self.live_data.reconnect_policy not in {
+        if self.live_data.provider in {"truedata", "kite_market"} and self.live_data.reconnect_policy not in {
             "fail_closed",
             "bounded_backoff",
         }:
-            raise GrowConfigError("3C truedata reconnect_policy must be fail_closed or bounded_backoff.")
+            raise GrowConfigError("3C reconnect_policy must be fail_closed or bounded_backoff.")
         if self.live_data.subscription_strike_window < 2:
             raise GrowConfigError("live_data.subscription_strike_window must be >= 2 (2C uses ATM ±2).")
         if self.live_data.max_symbols < 1:

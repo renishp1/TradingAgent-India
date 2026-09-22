@@ -23,6 +23,7 @@ from grow.live_data.models import (
     MOCK_PROVIDER_ID,
     SCHEMA,
     TRUEDATA_PROVIDER_ID,
+    KITE_MARKET_PROVIDER_ID,
     LiveSnapshot,
 )
 from grow.market.session import SessionCalendar
@@ -41,6 +42,14 @@ STREAM_META = {
     TRUEDATA_PROVIDER_ID: SourceMeta(
         name=TRUEDATA_PROVIDER_ID,
         vendor="truedata",
+        license="operator-subscription-not-in-repo",
+        is_live=True,
+        is_fixture=False,
+        schema=SCHEMA,
+    ),
+    KITE_MARKET_PROVIDER_ID: SourceMeta(
+        name=KITE_MARKET_PROVIDER_ID,
+        vendor="kite-market",
         license="operator-subscription-not-in-repo",
         is_live=True,
         is_fixture=False,
