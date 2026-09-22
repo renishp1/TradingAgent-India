@@ -574,9 +574,14 @@ class BacktestTests(unittest.TestCase):
                 self.last_packet = packet
                 return super().run(packet)
 
+        base_config = load_config()
         config = replace(
-            load_config(),
-            options=replace(load_config().options, provider="historical", allow_live_chain=False),
+            base_config,
+            options=replace(
+                base_config.options,
+                provider="historical",
+                allow_live_chain=False,
+            ),
         )
         ledger = BacktestLedger()
         orch = CaptureOrch(config)
