@@ -76,9 +76,9 @@ class PerOptionFreshnessTests(unittest.TestCase):
         self.assertEqual(snap.option_contracts[0].quality, DataQualityStatus.STALE)
         self.assertEqual(snap.option_contracts[1].quality, DataQualityStatus.OK)
         result = OptionsChainAgent().analyze(snap)
-        self.assertEqual(result.status, AgentStatus.NO_TRADE)
+        self.assertEqual(result.status, AgentStatus.DEGRADED)
         self.assertEqual(result.candidate_action, CandidateAction.NONE)
-        self.assertTrue(any("unusable:stale-1" in row for row in result.observations))
+        self.assertTrue(any("unusable:stale-1" in row or "stale:stale-1" in row for row in (*result.observations, *result.data_quality_concerns)))
         self.assertTrue(any(row.startswith("usable=2") for row in result.observations))
         self.assertIn("STALE_OPTIONS_EXCLUDED", result.risk_flags)
 
@@ -96,7 +96,7 @@ class PerOptionFreshnessTests(unittest.TestCase):
         )
         self.assertEqual(gate_snapshot_quality(snap), DataQualityStatus.OK)
         result = OptionsChainAgent().analyze(snap)
-        self.assertEqual(result.status, AgentStatus.DATA_INSUFFICIENT)
+        self.assertEqual(result.status, AgentStatus.NO_DATA)
         self.assertIn("usable_option_contracts", result.missing_data)
         self.assertEqual(result.candidate_action, CandidateAction.NONE)
 
@@ -126,7 +126,7 @@ class PerOptionFreshnessTests(unittest.TestCase):
         )
         self.assertEqual(gate_snapshot_quality(snap), DataQualityStatus.STALE)
         result = OptionsChainAgent().analyze(snap)
-        self.assertEqual(result.status, AgentStatus.DATA_INSUFFICIENT)
+        self.assertEqual(result.status, AgentStatus.NO_DATA)
 
     def test_missing_underlying(self) -> None:
         snap = build_fixture_snapshot(

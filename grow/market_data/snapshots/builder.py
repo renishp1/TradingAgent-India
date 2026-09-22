@@ -160,6 +160,7 @@ def build_fixture_snapshot(
     market: MarketSnapshot | None = None,
     chain: OptionChainSnapshot | None = None,
     include_underlying: bool = True,
+    diagnostics: dict | None = None,
 ) -> AgentMarketSnapshot:
     """Deterministic fixture snapshot for unit tests and offline cycles."""
     decision_ts = as_of.astimezone(IST)
@@ -229,6 +230,7 @@ def build_fixture_snapshot(
             "fresh_option_count": sum(
                 1 for row in option_contracts if row.quality is DataQualityStatus.OK
             ),
+            **(diagnostics or {}),
         },
     )
 

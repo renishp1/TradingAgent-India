@@ -82,11 +82,9 @@ def summarize_debate(results: tuple[AgentResult, ...]) -> DebateSummary:
         row.agent_name
         for row in results
         if row.agent_name not in agreeing
-        and row.status not in {AgentStatus.DATA_INSUFFICIENT, AgentStatus.ERROR}
+        and row.status not in {AgentStatus.NO_DATA, AgentStatus.ERROR}
     )
-    insufficient = tuple(
-        row.agent_name for row in results if row.status is AgentStatus.DATA_INSUFFICIENT
-    )
+    insufficient = tuple(row.agent_name for row in results if row.status is AgentStatus.NO_DATA)
     errors = tuple(row.agent_name for row in results if row.status is AgentStatus.ERROR)
 
     agreement = bool(majority_action) and not conflicts and not insufficient and not errors
