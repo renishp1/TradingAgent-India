@@ -27,6 +27,7 @@ from grow.live_data.smoke import (
     classify_smoke_result,
     contains_secret,
     drain_smoke_loop,
+    format_option_tick_evidence,
     load_smoke_secrets,
     redact_tree,
     scan_broker_source,
@@ -591,8 +592,21 @@ class OptionQuoteFreshnessTests(unittest.TestCase):
         report = self._report_for(self.fresh)
         self.assertTrue(report["option_tick_ok"])
         self.assertIsNotNone(report["first_option_tick"])
-        self.assertTrue(report["first_option_tick"]["quote_freshness"])
-        self.assertEqual(report["first_option_tick"]["option_type"], "CE")
+        tick = report["first_option_tick"]
+        self.assertTrue(tick["quote_freshness"])
+        self.assertEqual(tick["option_type"], "CE")
+        self.assertEqual(tick["quote_timestamp"], AS_OF.isoformat())
+        self.assertEqual(tick["quote_age_seconds"], 0)
+        self.assertEqual(tick["quote_age_ms"], 0)
+        self.assertTrue(tick["provider_symbol_id"])
+        self.assertTrue(tick["canonical_id"])
+        evidence = format_option_tick_evidence(report)
+        self.assertIn("OPTION TICK: PASS", evidence)
+        self.assertIn(f"Quote timestamp: {AS_OF.isoformat()}", evidence)
+        self.assertIn("Quote age: 0 ms", evidence)
+        self.assertIn("Quote freshness: PASS", evidence)
+        self.assertIn("Fixture detection: PASS", evidence)
+        self.assertIn("Option tick: PASS", evidence)
 
     def test_b_stale_ce_quote_does_not_count(self) -> None:
         quote_time = AS_OF - timedelta(seconds=self.limit + 60)
@@ -605,6 +619,11 @@ class OptionQuoteFreshnessTests(unittest.TestCase):
         self.assertFalse(report["option_tick_ok"])
         self.assertIsNone(report["first_option_tick"])
         self.assertEqual(report["result"], FAIL)
+        evidence = format_option_tick_evidence(report)
+        self.assertIn("OPTION TICK: FAIL", evidence)
+        self.assertIn("Quote timestamp: absent", evidence)
+        self.assertIn("Quote age: absent", evidence)
+        self.assertNotIn("quote_freshness: True", evidence)
         priced = next(
             contract
             for contract in stale.chains["NIFTY"].contracts
@@ -628,7 +647,12 @@ class OptionQuoteFreshnessTests(unittest.TestCase):
         self.assertTrue(check.quotes[0]["quote_freshness"])
         report = self._report_for(boundary)
         self.assertTrue(report["option_tick_ok"])
-        self.assertTrue(report["first_option_tick"]["quote_freshness"])
+        tick = report["first_option_tick"]
+        self.assertTrue(tick["quote_freshness"])
+        expected = AS_OF - timedelta(seconds=self.limit)
+        self.assertEqual(tick["quote_timestamp"], expected.isoformat())
+        self.assertEqual(tick["quote_age_seconds"], float(self.limit))
+        self.assertEqual(tick["quote_age_ms"], self.limit * 1000)
 
     def test_e_ce_quote_beyond_staleness_boundary_does_not_count(self) -> None:
         beyond = _retimed_ce(self.fresh, AS_OF - timedelta(seconds=self.limit + 1))

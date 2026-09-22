@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Credential-gated TrueData 3C.2 smoke. Paper only. Disabled unless TRUEDATA_SMOKE=1.
+"""Credential-gated TrueData 3C.3 smoke. Paper only. Disabled unless TRUEDATA_SMOKE=1.
 
 Usage (never commit secrets):
 
@@ -39,6 +39,7 @@ from grow.live_data.smoke import (  # noqa: E402
     PASS_WITH_NO_TRADE,
     build_smoke_report,
     drain_smoke_loop,
+    format_option_tick_evidence,
     load_smoke_secrets,
     smoke_config,
     smoke_risk_secret,
@@ -52,6 +53,7 @@ def _report_path(session_id: str) -> Path:
 
 def _print_report(report: dict, path: Path) -> int:
     print(json.dumps(report, indent=2, default=str))
+    print(format_option_tick_evidence(report), file=sys.stderr)
     print(f"smoke_report={path}", file=sys.stderr)
     if report["result"] in {PASS, PASS_WITH_NO_TRADE}:
         return 0
