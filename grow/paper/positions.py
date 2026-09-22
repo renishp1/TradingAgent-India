@@ -93,8 +93,54 @@ class PaperPosition:
             "exit_reason": self.exit_reason,
             "closed_at": None if self.closed_at is None else self.closed_at.isoformat(),
             "market_value": self.market_value(),
+            "fill_id": self.fill_id,
+            "snapshot_id": self.snapshot_id,
+            "close_fill_id": self.close_fill_id,
+            "close_snapshot_id": self.close_snapshot_id,
+            "diagnostics": list(self.diagnostics),
             "live_trading": False,
         }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> PaperPosition:
+        """Rebuild a recorded position. Used by paper restart, not by 3B marks."""
+
+        def _dt(value: str | None) -> datetime | None:
+            return None if value is None else datetime.fromisoformat(value)
+
+        return cls(
+            position_id=payload["position_id"],
+            session_id=payload["session_id"],
+            candidate_id=payload.get("candidate_id"),
+            contract_id=payload["contract_id"],
+            underlying=payload["underlying"],
+            expiry=date.fromisoformat(payload["expiry"]),
+            strike=float(payload["strike"]),
+            option_type=payload["option_type"],
+            provider_id=payload["provider_id"],
+            lot_size=int(payload["lot_size"]),
+            lots=int(payload["lots"]),
+            quantity=int(payload["quantity"]),
+            entry_price=float(payload["entry_price"]),
+            opened_at=datetime.fromisoformat(payload["opened_at"]),
+            stop_loss_price=float(payload["stop_loss_price"]),
+            take_profit_price=float(payload["take_profit_price"]),
+            fill_id=payload.get("fill_id"),
+            snapshot_id=payload.get("snapshot_id"),
+            state=PositionState(payload["state"]),
+            current_price=None if payload.get("current_price") is None else float(payload["current_price"]),
+            last_valued_at=_dt(payload.get("last_valued_at")),
+            price_source=payload.get("price_source"),
+            unrealized_pnl=float(payload.get("unrealized_pnl") or 0.0),
+            realized_pnl=float(payload.get("realized_pnl") or 0.0),
+            realized_gross=float(payload.get("realized_gross") or 0.0),
+            total_costs=float(payload.get("total_costs") or 0.0),
+            exit_reason=payload.get("exit_reason"),
+            closed_at=_dt(payload.get("closed_at")),
+            close_fill_id=payload.get("close_fill_id"),
+            close_snapshot_id=payload.get("close_snapshot_id"),
+            diagnostics=list(payload.get("diagnostics") or []),
+        )
 
 
 @dataclass(frozen=True)
@@ -501,3 +547,14 @@ class PositionRegistry:
 
     def note_no_trade(self) -> None:
         self.no_trade_count += 1
+
+    def adopt(self, position: PaperPosition) -> PaperPosition:
+        """Restore a previously recorded position without minting a new id."""
+        if position.position_id in self._positions:
+            raise ValueError("DUPLICATE_POSITION")
+        if position.state is PositionState.OPEN and self.has_open(position.contract_id):
+            raise ValueError("DUPLICATE_OPEN_POSITION")
+        self._positions[position.position_id] = position
+        if position.state is PositionState.OPEN:
+            self._by_contract[position.contract_id] = position.position_id
+        return position

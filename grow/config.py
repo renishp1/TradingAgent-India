@@ -161,6 +161,12 @@ class RiskConfig:
 class PaperConfig:
     starting_cash: float
     venue_id: str
+    # Paper execution fill model. Deterministic LTP fills are the test default.
+    # Configurable selects an explicit price source plus slippage for experiments.
+    fill_model: str = "deterministic"
+    entry_price_source: str = "LTP"
+    exit_price_source: str = "BID"
+    slippage_bps: float | None = None
 
 
 @dataclass(frozen=True)
@@ -338,6 +344,15 @@ class GrowConfig:
             raise GrowLiveTradingDisabled("config.execution.live_trading_enabled must be false")
         if self.paper.venue_id.upper() not in {"GROW_PAPER", "PAPER"}:
             raise GrowLiveTradingDisabled(f"Unknown paper venue {self.paper.venue_id!r}")
+        if self.paper.fill_model not in {"deterministic", "configurable"}:
+            raise GrowConfigError("paper.fill_model must be deterministic or configurable.")
+        _price_sources = {"LTP", "BID", "ASK", "MIDPOINT"}
+        if self.paper.entry_price_source not in _price_sources:
+            raise GrowConfigError("paper.entry_price_source must be LTP, BID, ASK, or MIDPOINT.")
+        if self.paper.exit_price_source not in _price_sources:
+            raise GrowConfigError("paper.exit_price_source must be LTP, BID, ASK, or MIDPOINT.")
+        if self.paper.slippage_bps is not None and self.paper.slippage_bps < 0:
+            raise GrowConfigError("paper.slippage_bps must be >= 0 when set.")
         if self.market.product != "CASH":
             raise GrowConfigError("Milestone 1 product must be CASH.")
         if self.risk.allow_short:
@@ -787,6 +802,14 @@ def _build(raw: dict[str, Any], source_path: str) -> GrowConfig:
         paper=PaperConfig(
             starting_cash=_as_float(paper.get("starting_cash", 1_000_000), "starting_cash"),
             venue_id=str(paper.get("venue_id", "GROW_PAPER")),
+            fill_model=str(paper.get("fill_model", "deterministic")).strip().lower(),
+            entry_price_source=str(paper.get("entry_price_source", "LTP")).strip().upper(),
+            exit_price_source=str(paper.get("exit_price_source", "BID")).strip().upper(),
+            slippage_bps=(
+                None
+                if paper.get("slippage_bps", None) is None
+                else _as_float(paper.get("slippage_bps"), "paper.slippage_bps")
+            ),
         ),
         model=ModelConfig(
             provider=str(model.get("provider", "mock")).lower(),
