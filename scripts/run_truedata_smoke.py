@@ -8,10 +8,15 @@ Usage (never commit secrets):
     export GROW_LIVE_DATA_MODE=real
     export TRUEDATA_USERNAME=...
     export TRUEDATA_PASSWORD=...
+    export TRUEDATA_SMOKE=1
     python scripts/run_truedata_smoke.py
 
-Do not set broker or live-trading flags. Expected result: feed connects,
-paper diagnostics are printed, no real order exists.
+Flow:
+    credentials → WebSocket auth → vendor catalog discovery (2I overlay)
+    → ATM subscription → first live snapshot → 3A/3B paper loop diagnostics
+
+The catalog is fetched from TrueData symbol lists. Do not inject a fixture
+catalog. Do not set any broker token or live_trading flag.
 """
 
 from __future__ import annotations
@@ -57,15 +62,34 @@ def main() -> int:
             return 1
         loop = open_loop(config, clock=SystemClock())
         loop.start()
-        reports = loop.run_once()
+        provider = loop.provider
+        catalog = list(getattr(provider, "instrument_catalog", lambda: ())())
+        discovered = list(getattr(provider, "discover_underlyings", lambda: ())())
+        subscribed = list(provider.health().subscribed)
+        reports = []
+        for _ in range(64):
+            batch = loop.run_once()
+            reports.extend(batch)
+            if loop.last_snapshot is not None:
+                break
+            reason = batch[-1].reason if batch else ""
+            if reason.startswith("FEED_"):
+                continue
+            break
+        snapshot = None if loop.last_snapshot is None else loop.last_snapshot.to_dict()
         print(
             json.dumps(
                 {
                     "health": loop.health.to_dict(),
+                    "catalog_size": len(catalog),
+                    "discovered_underlyings": discovered,
+                    "subscribed": subscribed or list(provider.health().subscribed),
+                    "snapshot": snapshot,
                     "reports": [row.to_dict() for row in reports],
                     "paper_only": True,
                     "live_trading": False,
                     "broker": False,
+                    "catalog_injected": False,
                 },
                 indent=2,
                 default=str,

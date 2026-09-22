@@ -19,8 +19,22 @@ from grow.live_data.models import (
     SessionHealth,
 )
 from grow.live_data.provider import _FORBIDDEN_FALLBACK
-from grow.live_data.subscribe import plan_subscriptions
 from grow.live_data.symbols import ParsedInstrument, parse_provider_symbol, parse_tick_fields
+from grow.live_data.subscribe import plan_subscriptions, resubscribe_set
+from grow.live_data.catalog import DEFAULT_CATALOG_URLS, merge_catalog, parse_catalog_text
+from grow.live_data.protocol import (
+    AUTH,
+    CATALOG,
+    CONTROL_KINDS,
+    DISCONNECT,
+    ERROR,
+    HEARTBEAT,
+    SNAPSHOT,
+    SUBSCRIBE,
+    TICK,
+    ProtocolMessage,
+    decode_truedata_message,
+)
 
 TRUEDATA_ADAPTER_VERSION = "live_data.truedata.v1"
 
@@ -94,6 +108,15 @@ class ReplayTransport:
         self._index += 1
         return payload
 
+    def fetch_catalog(self) -> list[dict[str, Any]]:
+        if self.catalog_rows:
+            return merge_catalog(self.catalog_rows)
+        rows: list[dict[str, Any]] = []
+        for event in self.events:
+            if event.get("kind") == "catalog":
+                rows.extend(event.get("instruments") or [])
+        return merge_catalog(rows) if rows else []
+
     def resubscribe(self, symbols: Sequence[str]) -> None:
         self.reconnects += 1
         self.connected = True
@@ -102,7 +125,7 @@ class ReplayTransport:
 
 
 class RealTrueDataTransport:
-    """Optional websocket-client transport. Missing library or credentials fail closed."""
+    """WebSocket transport + catalog bootstrap. Optional websocket-client. No broker."""
 
     def __init__(
         self,
@@ -112,6 +135,9 @@ class RealTrueDataTransport:
         endpoint: str,
         port: int,
         bid_ask: bool = True,
+        socket_factory: Any | None = None,
+        catalog_loader: Any | None = None,
+        catalog_urls: Sequence[str] | None = None,
     ) -> None:
         if not username or not password:
             raise GrowConfigError("AUTH_MISSING")
@@ -123,26 +149,37 @@ class RealTrueDataTransport:
         self.connected = False
         self.subscribed: list[str] = []
         self._ws = None
+        self._socket_factory = socket_factory
+        self._catalog_loader = catalog_loader
+        self._catalog_urls = tuple(catalog_urls or DEFAULT_CATALOG_URLS)
+        self.sent: list[str] = []
+        self.spot_bars: list[dict[str, Any]] = []
 
     def connect(self) -> None:
         try:
-            import importlib
+            if self._socket_factory is not None:
+                self._ws = self._socket_factory()
+            else:
+                import importlib
 
-            websocket = importlib.import_module("websocket")
-        except ImportError as exc:
-            raise GrowConfigError("TRANSPORT_UNAVAILABLE:websocket-client") from exc
-        url = self.endpoint
-        if "://" not in url:
-            url = f"wss://{url}:{self.port}"
-        try:
-            self._ws = websocket.create_connection(url, timeout=10)
+                ws_mod = importlib.import_module("websocket")
+                url = self.endpoint
+                if "://" not in url:
+                    url = f"wss://{url}:{self.port}"
+                self._ws = ws_mod.create_connection(url, timeout=10)
             self._ws.send(f"{self.username}:{self.password}")
-            reply = str(self._ws.recv() or "")
+            self.sent.append("auth")
+            reply = self._ws.recv()
         except GrowConfigError:
             raise
         except Exception as exc:
             raise GrowConfigError("AUTH_FAILED") from exc
-        if "fail" in reply.lower() or "invalid" in reply.lower() or "unauthorized" in reply.lower():
+        try:
+            message = decode_truedata_message(reply)
+        except GrowConfigError as exc:
+            self.disconnect()
+            raise GrowConfigError("AUTH_FAILED") from exc
+        if message.kind != AUTH or message.ok is False:
             self.disconnect()
             raise GrowConfigError("AUTH_FAILED")
         self.connected = True
@@ -162,11 +199,14 @@ class RealTrueDataTransport:
             raise GrowConfigError("FEED_DISCONNECTED")
         payload = "addsymbol:" + "+".join(symbols)
         self._ws.send(payload)
+        self.sent.append(payload)
         self.subscribed = list(dict.fromkeys([*self.subscribed, *symbols]))
 
     def unsubscribe(self, symbols: Sequence[str]) -> None:
         if self._ws is not None and self.connected:
-            self._ws.send("unsymbol:" + "+".join(symbols))
+            payload = "unsymbol:" + "+".join(symbols)
+            self._ws.send(payload)
+            self.sent.append(payload)
         drop = set(symbols)
         self.subscribed = [s for s in self.subscribed if s not in drop]
 
@@ -179,11 +219,44 @@ class RealTrueDataTransport:
             raise GrowConfigError("FEED_DISCONNECTED") from exc
         if raw is None or raw == "":
             return None
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8")
-        return {"kind": "tick_csv", "line": str(raw)}
+        message = decode_truedata_message(raw)
+        if message.kind == DISCONNECT:
+            self.connected = False
+            raise GrowConfigError("FEED_DISCONNECTED")
+        return message.to_dict()
+
+    def fetch_catalog(self) -> list[dict[str, Any]]:
+        if self._catalog_loader is not None:
+            loaded = self._catalog_loader()
+            if isinstance(loaded, str):
+                return parse_catalog_text(loaded)
+            if isinstance(loaded, Mapping) and loaded.get("instruments") is not None:
+                self.spot_bars = list(loaded.get("spot_bars") or [])
+                return merge_catalog(loaded.get("instruments") or [])
+            return merge_catalog(loaded or [])
+        rows: list[dict[str, Any]] = []
+        try:
+            import importlib
+
+            request_mod = importlib.import_module("urllib.request")
+            error_mod = importlib.import_module("urllib.error")
+        except ImportError as exc:
+            raise GrowConfigError("METADATA_UNAVAILABLE") from exc
+        last_error: Exception | None = None
+        for url in self._catalog_urls:
+            try:
+                with request_mod.urlopen(url, timeout=10) as response:
+                    text = response.read().decode("utf-8")
+                rows.extend(parse_catalog_text(text, source=url))
+            except Exception as exc:  # noqa: BLE001 — fail closed after all URLs
+                last_error = exc
+                continue
+        if not rows:
+            raise GrowConfigError("METADATA_UNAVAILABLE") from last_error
+        return merge_catalog(rows)
 
     def resubscribe(self, symbols: Sequence[str]) -> None:
+        self.disconnect()
         self.connect()
         self.subscribed = []
         self.subscribe(symbols)
@@ -202,6 +275,7 @@ class TrueDataSettings:
     max_attempts: int = 5
     max_backoff_seconds: int = 30
     mode: str = "real"
+    max_staleness_seconds: int = 30
 
 
 class TrueDataAdapter:
@@ -221,6 +295,8 @@ class TrueDataAdapter:
         registry: IndexUniverseRegistry | None = None,
         environ: Mapping[str, str] | None = None,
         as_of: datetime | None = None,
+        socket_factory: Any | None = None,
+        catalog_loader: Any | None = None,
     ) -> None:
         self.settings = settings or TrueDataSettings()
         self.clock = clock or FrozenClock(datetime.now(tz=IST))
@@ -236,8 +312,12 @@ class TrueDataAdapter:
         self.subscription_events: list[dict[str, Any]] = []
         self._quotes: dict[str, dict[str, Any]] = {}
         self._spots: dict[str, float] = {}
+        self._plan_spots: dict[str, float] = {}
         self._bars: list[dict[str, Any]] = []
         self._symbol_seq: dict[str, int] = {}
+        self._symbol_ids: dict[str, str] = {}
+        self._last_heartbeat_at: datetime | None = None
+        self._last_activity_at: datetime | None = None
         self._desired: tuple[str, ...] = ()
         self._retry_at: datetime | None = None
         self._attempts = 0
@@ -259,6 +339,8 @@ class TrueDataAdapter:
                 endpoint=self.settings.endpoint,
                 port=self.settings.port,
                 bid_ask=self.settings.bid_ask,
+                socket_factory=socket_factory,
+                catalog_loader=catalog_loader,
             )
         self._instruments: list[dict[str, Any]] = [dict(row) for row in (catalog or ())]
         if not self._instruments and isinstance(self.transport, ReplayTransport):
@@ -311,6 +393,37 @@ class TrueDataAdapter:
             self._note("STOPPED", str(exc))
             raise
         self._error = None
+        self._last_activity_at = self.clock.now()
+        try:
+            catalog = self.transport.fetch_catalog()
+        except GrowConfigError as exc:
+            if isinstance(self.transport, RealTrueDataTransport) or "METADATA" in str(exc):
+                self._state = SessionHealth.DEGRADED
+                self._error = "METADATA_UNAVAILABLE"
+                self._note("DEGRADED", "METADATA_UNAVAILABLE")
+                raise GrowConfigError("METADATA_UNAVAILABLE") from exc
+            catalog = []
+        if catalog:
+            existing = {row["provider_symbol"]: row for row in self._instruments}
+            for row in catalog:
+                existing[row["provider_symbol"]] = row
+                ident = row.get("provider_symbol_id")
+                if ident:
+                    self._symbol_ids[str(ident)] = row["provider_symbol"]
+            self._instruments = list(existing.values())
+        bars = getattr(self.transport, "spot_bars", None)
+        if bars:
+            self._bars = list(bars)
+            for row in self._bars:
+                symbol = str(row.get("underlying") or "")
+                close = row.get("close")
+                if symbol and close not in (None, ""):
+                    self._plan_spots[symbol] = float(close)
+        if not self._instruments and isinstance(self.transport, RealTrueDataTransport):
+            self._state = SessionHealth.DEGRADED
+            self._error = "METADATA_UNAVAILABLE"
+            self._note("DEGRADED", "METADATA_UNAVAILABLE")
+            raise GrowConfigError("METADATA_UNAVAILABLE")
         self._state = SessionHealth.READY
         self._note("READY", "authenticated")
         if self._instruments:
@@ -331,6 +444,7 @@ class TrueDataAdapter:
             error=self._error,
             reconnect_count=self.reconnect_count,
             subscribed=self._desired,
+            last_heartbeat_at=self._last_heartbeat_at,
         )
 
     def instrument_catalog(self) -> tuple[dict[str, Any], ...]:
@@ -397,6 +511,10 @@ class TrueDataAdapter:
     def poll(self) -> dict[str, Any] | None:
         if self._state in {SessionHealth.DISCONNECTED, SessionHealth.STOPPED, SessionHealth.CONNECTING}:
             return None
+        if self._activity_stale():
+            self._state = SessionHealth.DEGRADED
+            self._error = "STALE_REQUIRED_QUOTE"
+            raise GrowConfigError("STALE_REQUIRED_QUOTE")
         if self._state is SessionHealth.DEGRADED and self.settings.reconnect_policy == "bounded_backoff":
             return self._reconnect_poll()
         try:
@@ -412,20 +530,44 @@ class TrueDataAdapter:
             self._state = SessionHealth.DEGRADED
             self._error = "FIXTURE_FALLBACK_FORBIDDEN"
             raise GrowConfigError("FIXTURE_FALLBACK_FORBIDDEN")
-        if raw.get("kind") == "auth" and raw.get("ok") is False:
-            self._state = SessionHealth.STOPPED
-            self._error = "AUTH_FAILED"
-            raise GrowConfigError("AUTH_FAILED")
-        if raw.get("kind") == "catalog":
-            self._instruments.extend(dict(row) for row in (raw.get("instruments") or ()))
+        try:
+            message = decode_truedata_message(raw)
+        except GrowConfigError:
+            if raw.get("schema") == "grow.stream.snapshot.v1" or raw.get("contract_master") is not None:
+                message = ProtocolMessage(SNAPSHOT, True, dict(raw), "")
+            else:
+                raise
+        self._last_activity_at = self.clock.now()
+        if message.kind == HEARTBEAT:
+            self._last_heartbeat_at = self.clock.now()
+            if self._state is SessionHealth.READY:
+                self._state = SessionHealth.RUNNING
+            return {"kind": HEARTBEAT, "provider": self.identity, "ok": True}
+        if message.kind == AUTH:
+            if message.ok is False:
+                self._state = SessionHealth.STOPPED
+                self._error = "AUTH_FAILED"
+                raise GrowConfigError("AUTH_FAILED")
+            return {"kind": AUTH, "provider": self.identity, "ok": True}
+        if message.kind == SUBSCRIBE:
+            self._ingest_symbol_map(message.payload.get("mapping") or {})
+            return {"kind": SUBSCRIBE, "provider": self.identity, "mapping": dict(self._symbol_ids)}
+        if message.kind == ERROR:
+            self._state = SessionHealth.DEGRADED
+            self._error = "PROVIDER_ERROR"
+            raise GrowConfigError("PROVIDER_ERROR")
+        if message.kind == DISCONNECT:
+            return self._on_feed_error("FEED_DISCONNECTED")
+        if message.kind == CATALOG:
+            self._instruments.extend(dict(row) for row in (message.payload.get("instruments") or raw.get("instruments") or ()))
+            if raw.get("spot_bars"):
+                self._bars = list(raw.get("spot_bars") or [])
             self._refresh_plan()
-            return self.poll()
-        if raw.get("kind") in {"tick", "tick_csv"} or (
-            raw.get("symbol") and not raw.get("schema") and "contract_master" not in raw
-        ):
-            self._ingest_tick(raw)
+            return {"kind": CATALOG, "provider": self.identity}
+        if message.kind == TICK or raw.get("kind") in {"tick", "tick_csv"}:
+            self._ingest_tick(message.to_dict() if message.kind == TICK else raw)
             return self._assemble_snapshot()
-        if raw.get("schema") == "grow.stream.snapshot.v1" or raw.get("contract_master") is not None:
+        if message.kind == SNAPSHOT or raw.get("schema") == "grow.stream.snapshot.v1" or raw.get("contract_master") is not None:
             payload = dict(raw)
             payload["provider"] = self.identity
             payload["adapter_version"] = self.adapter_version
@@ -455,14 +597,45 @@ class TrueDataAdapter:
         self._ingest_tick(raw)
         return self._assemble_snapshot()
 
+    def _activity_stale(self) -> bool:
+        if self._last_activity_at is None:
+            return False
+        age = (self.clock.now() - self._last_activity_at).total_seconds()
+        return age > self.settings.max_staleness_seconds
+
+    def _ingest_symbol_map(self, mapping: Mapping[str, Any]) -> None:
+        for ident, symbol in mapping.items():
+            name = str(symbol).strip()
+            if not name:
+                continue
+            self._symbol_ids[str(ident)] = name
+
+    def _resolve_provider_symbol(self, fields: Mapping[str, Any]) -> str:
+        symbol = str(fields.get("provider_symbol") or "").strip()
+        symbol_id = fields.get("symbol_id")
+        if symbol_id not in (None, ""):
+            mapped = self._symbol_ids.get(str(symbol_id))
+            if not mapped:
+                raise GrowConfigError("UNKNOWN_SYMBOL_ID")
+            if symbol and symbol != mapped and not str(symbol).isdigit():
+                if symbol != mapped:
+                    raise GrowConfigError("UNKNOWN_SYMBOL_ID")
+            return mapped
+        if symbol.isdigit():
+            mapped = self._symbol_ids.get(symbol)
+            if not mapped:
+                raise GrowConfigError("UNKNOWN_SYMBOL_ID")
+            return mapped
+        if not symbol:
+            raise GrowConfigError("UNKNOWN_INSTRUMENT")
+        return symbol
+
     def _ingest_tick(self, raw: Mapping[str, Any]) -> None:
         if raw.get("kind") == "tick_csv":
             fields = parse_tick_fields(str(raw.get("line") or ""))
         else:
             fields = parse_tick_fields(raw)
-        symbol = str(fields.get("provider_symbol") or "")
-        if not symbol:
-            raise GrowConfigError("UNKNOWN_INSTRUMENT")
+        symbol = self._resolve_provider_symbol(fields)
         parsed = parse_provider_symbol(symbol)
         seq = fields.get("sequence")
         if seq is not None:
@@ -506,7 +679,10 @@ class TrueDataAdapter:
         if parsed.instrument_type == "INDEX":
             if fields.get("ltp") is None:
                 raise GrowConfigError(f"MISSING_SPOT:{parsed.canonical_symbol}")
+            had_live = parsed.canonical_symbol in self._spots
             self._spots[parsed.canonical_symbol] = float(fields["ltp"])
+            if not had_live:
+                self._refresh_plan()
         else:
             self._quotes[symbol] = quote
 
@@ -564,9 +740,7 @@ class TrueDataAdapter:
 
     def _refresh_plan(self) -> None:
         allowed = self.discover_underlyings()
-        spots = dict(self._spots)
-        for symbol in allowed:
-            spots.setdefault(symbol, 0.0)
+        spots = {**self._plan_spots, **self._spots}
         selected: dict[str, date] = {}
         parsed = []
         for row in self._instruments:
@@ -599,8 +773,12 @@ class TrueDataAdapter:
             max_symbols=self.settings.max_symbols,
             active_underlyings=allowed,
         )
-        if planned:
-            self.transport.subscribe(planned)
+        add, drop = resubscribe_set(self._desired, planned)
+        if drop:
+            self.transport.unsubscribe(drop)
+        if add:
+            self.transport.subscribe(add)
+        if planned != self._desired:
             self._desired = planned
             self.subscription_events.append(
                 {
@@ -610,6 +788,8 @@ class TrueDataAdapter:
                     "timestamp": as_of.isoformat(),
                 }
             )
+        else:
+            self._desired = planned
 
     def _expiry_records(self, symbol: str) -> tuple[HistoricalExpiryRecord, ...]:
         grouped: dict[tuple[date, str], list[datetime]] = {}
@@ -703,4 +883,5 @@ def settings_from_live_config(live: Any) -> TrueDataSettings:
         max_attempts=int(getattr(live, "reconnect_max_attempts", 5)),
         max_backoff_seconds=int(getattr(live, "reconnect_max_backoff_seconds", 30)),
         mode=str(getattr(live, "mode", "replay")),
+        max_staleness_seconds=int(getattr(live, "max_staleness_seconds", 30)),
     )

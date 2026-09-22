@@ -26,6 +26,7 @@ from grow.live_data.models import (
     SessionHealth,
 )
 from grow.live_data.normalize import normalize_event
+from grow.live_data.protocol import CONTROL_KINDS
 from grow.live_data.provider import LiveDataProvider, open_provider
 from grow.market.session import SessionCalendar
 from grow.options.engine import IndexOptionsEngine
@@ -136,13 +137,17 @@ class LivePaperLoop:
 
     @property
     def health(self) -> LiveHealth:
+        provider = self.provider.health()
         return LiveHealth(
             state=self._state,
             provider_id=self.provider.identity,
             adapter_version=self.provider.adapter_version,
             last_message_at=None if self.last_snapshot is None else self.last_snapshot.received_time,
             last_sequence=self._last_sequence,
-            error=self.provider.health().error,
+            error=provider.error,
+            reconnect_count=provider.reconnect_count,
+            subscribed=provider.subscribed,
+            last_heartbeat_at=provider.last_heartbeat_at,
         )
 
     def start(self) -> None:
@@ -245,6 +250,19 @@ class LivePaperLoop:
                 as_of=self.clock.now(),
                 underlying=underlying or "*",
                 reason="PROVIDER_UNAVAILABLE",
+                provider_id=self.provider.identity,
+                health=self._state,
+            )
+            self.cycles.append(report)
+            return [report]
+        if str(raw.get("kind") or "") in CONTROL_KINDS or str(raw.get("kind") or "") == "catalog":
+            report = _no_trade(
+                session_id=self.session.session_id,
+                event_id=f"{self.session.session_id}:control",
+                sequence=self._last_sequence or 0,
+                as_of=self.clock.now(),
+                underlying=underlying or "*",
+                reason=f"FEED_{str(raw.get('kind')).upper()}",
                 provider_id=self.provider.identity,
                 health=self._state,
             )

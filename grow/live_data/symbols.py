@@ -98,11 +98,21 @@ def parse_tick_fields(raw: Any) -> dict[str, Any]:
     Missing bid/ask stay None. Never fabricated.
     """
     if isinstance(raw, Mapping):
-        symbol = str(raw.get("symbol") or raw.get("Symbol") or raw.get("provider_symbol") or "")
+        symbol = str(
+            raw.get("symbol")
+            or raw.get("Symbol")
+            or raw.get("provider_symbol")
+            or ""
+        )
+        symbol_id = raw.get("symbol_id") or raw.get("symbolid") or raw.get("SymbolId")
         ts = raw.get("timestamp") or raw.get("Date-Time") or raw.get("ltt") or raw.get("event_time")
         seq = raw.get("sequence") or raw.get("tick_sequence") or raw.get("Tick Sequence No")
+        trade = raw.get("trade")
+        if isinstance(trade, (list, tuple)):
+            return parse_tick_fields(list(trade))
         return {
             "provider_symbol": symbol,
+            "symbol_id": None if symbol_id in (None, "") else str(symbol_id),
             "timestamp": ts,
             "ltp": _num(raw.get("ltp") if "ltp" in raw else raw.get("LTP")),
             "bid": _num(raw.get("bid") if "bid" in raw else raw.get("Bid")),
@@ -127,9 +137,13 @@ def parse_tick_fields(raw: Any) -> dict[str, Any]:
         if len(raw) < 3:
             raise GrowConfigError("UNKNOWN_INSTRUMENT")
         padded = list(raw) + [""] * (19 - len(raw))
+        first = str(padded[0]).strip()
+        symbol_id = first if first.isdigit() else None
+        provider_symbol = "" if first.isdigit() else first
         seq = padded[14]
         return {
-            "provider_symbol": str(padded[0]),
+            "provider_symbol": provider_symbol,
+            "symbol_id": symbol_id,
             "timestamp": padded[1],
             "ltp": _num(padded[2]),
             "volume": _int(padded[5]),

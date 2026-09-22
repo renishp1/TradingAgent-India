@@ -45,6 +45,7 @@ class LiveHealth:
     error: str | None = None
     reconnect_count: int = 0
     subscribed: tuple[str, ...] = ()
+    last_heartbeat_at: datetime | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -56,6 +57,7 @@ class LiveHealth:
             "error": self.error,
             "reconnect_count": self.reconnect_count,
             "subscribed": list(self.subscribed),
+            "last_heartbeat_at": None if self.last_heartbeat_at is None else self.last_heartbeat_at.isoformat(),
             "live_trading": False,
         }
 

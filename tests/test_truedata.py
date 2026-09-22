@@ -17,6 +17,7 @@ from grow.history.universe import (
     WEEKLY_PREFERRED,
     default_index_policies,
 )
+from grow.live_data.catalog import parse_catalog_text, merge_catalog
 from grow.live_data.loop import LivePaperLoop
 from grow.live_data.mock import bullish_event
 from grow.live_data.models import TRUEDATA_PROVIDER_ID, CycleStatus, SessionHealth
@@ -403,3 +404,467 @@ class ConfigTests(unittest.TestCase):
         cfg = _live_config(provider="truedata", reconnect_policy="bounded_backoff")
         cfg.assert_safe()
         self.assertEqual(cfg.live_data.provider, "truedata")
+
+
+class ScriptedSocket:
+    def __init__(self, incoming: list[str]):
+        self.incoming = list(incoming)
+        self.sent: list[str] = []
+        self.closed = False
+
+    def send(self, data: str) -> None:
+        self.sent.append(data)
+
+    def recv(self) -> str:
+        if not self.incoming:
+            return ""
+        return self.incoming.pop(0)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _auth_ok() -> str:
+    return '{"success": true, "message": "TrueData Real Time Data Service"}'
+
+
+def _td_symbol(underlying: str, expiry, strike, kind: str) -> str:
+    day = date.fromisoformat(expiry) if isinstance(expiry, str) else expiry
+    return f"{underlying}{day.strftime('%y%m%d')}{int(strike)}{kind}"
+
+
+def _nifty_catalog():
+    event = bullish_event(underlyings=("NIFTY",))
+    instruments = []
+    mapping = []
+    ident = 100
+    instruments.append(
+        {
+            "provider_symbol": "NIFTY 50",
+            "canonical_symbol": "NIFTY",
+            "instrument_type": "INDEX",
+            "lot_size": None,
+            "provider_symbol_id": str(ident),
+        }
+    )
+    mapping.append(["NIFTY 50", ident])
+    ident += 1
+    for row in event["contract_master"]:
+        if row["underlying"] != "NIFTY":
+            continue
+        symbol = _td_symbol(row["underlying"], row["expiry"], row["strike"], row["option_type"])
+        instruments.append(
+            {
+                "provider_symbol": symbol,
+                "canonical_symbol": "NIFTY",
+                "instrument_type": "INDEX_OPTION",
+                "expiry": row["expiry"],
+                "strike": row["strike"],
+                "option_type": row["option_type"],
+                "lot_size": row["lot_size"],
+                "expiry_class": row["expiry_class"],
+                "provider_symbol_id": str(ident),
+            }
+        )
+        mapping.append([symbol, ident])
+        ident += 1
+    quotes = [q for q in event["option_quotes"] if q["underlying"] == "NIFTY"]
+    return {
+        "instruments": instruments,
+        "spot_bars": event["spot_bars"],
+        "mapping": mapping,
+        "quotes": quotes,
+        "spots": event["spots"],
+    }
+
+
+def _trade(symbol_id: int, ltp: float, *, bid=None, ask=None, seq: int, oi=5000, volume=200) -> str:
+    bid_v = ltp - 0.5 if bid is None else bid
+    ask_v = ltp + 0.5 if ask is None else ask
+    return json.dumps(
+        {
+            "trade": [
+                str(symbol_id),
+                AS_OF.isoformat(),
+                str(ltp),
+                "1",
+                str(ltp),
+                str(volume),
+                str(ltp),
+                str(ltp),
+                str(ltp),
+                str(ltp),
+                str(oi),
+                "0",
+                "0",
+                "",
+                str(seq),
+                str(bid_v),
+                "10",
+                str(ask_v),
+                "10",
+            ]
+        }
+    )
+
+
+def _real_adapter(incoming: list[str], catalog, **kwargs):
+    socket = ScriptedSocket(incoming)
+    adapter = TrueDataAdapter(
+        settings=TrueDataSettings(mode="real", reconnect_policy=kwargs.pop("reconnect_policy", "fail_closed"), max_staleness_seconds=30),
+        environ={"TRUEDATA_USERNAME": "user", "TRUEDATA_PASSWORD": "pass"},
+        socket_factory=lambda: socket,
+        catalog_loader=lambda: catalog,
+        clock=kwargs.pop("clock", FrozenClock(AS_OF)),
+        **kwargs,
+    )
+    return adapter, socket
+
+
+class ProtocolDecoderTests(unittest.TestCase):
+    def test_classifies_vendor_frames(self) -> None:
+        from grow.live_data.protocol import decode_truedata_message
+
+        self.assertEqual(decode_truedata_message(_auth_ok()).kind, "auth")
+        self.assertTrue(decode_truedata_message(_auth_ok()).ok)
+        fail = decode_truedata_message('{"success": false, "message": "invalid login"}')
+        self.assertEqual(fail.kind, "auth")
+        self.assertFalse(fail.ok)
+        hb = decode_truedata_message('{"HeartBeat": {"timestamp": "2026-09-18T11:00:00+05:30", "message": "heartbeat"}}')
+        self.assertEqual(hb.kind, "heartbeat")
+        sub = decode_truedata_message('{"success": true, "message": "symbols added", "symbolsadded": [["NIFTY 50", 101]]}')
+        self.assertEqual(sub.kind, "subscribe")
+        self.assertEqual(sub.payload["mapping"]["101"], "NIFTY 50")
+        trade = decode_truedata_message(_trade(101, 25040, seq=1))
+        self.assertEqual(trade.kind, "tick")
+        err = decode_truedata_message('{"error": "limit exceeded"}')
+        self.assertEqual(err.kind, "error")
+        disc = decode_truedata_message('{"message": "user disconnected"}')
+        self.assertEqual(disc.kind, "disconnect")
+        with self.assertRaises(GrowConfigError) as ctx:
+            decode_truedata_message("{not-json")
+        self.assertIn("MALFORMED_MESSAGE", str(ctx.exception))
+
+
+class RealTransportTests(unittest.TestCase):
+    def test_auth_failure_on_real_transport(self) -> None:
+        adapter, _sock = _real_adapter(
+            ['{"success": false, "message": "unauthorized"}'],
+            {"instruments": [{"provider_symbol": "NIFTY 50", "lot_size": None}]},
+        )
+        with self.assertRaises(GrowConfigError) as ctx:
+            adapter.connect()
+        self.assertIn("AUTH_FAILED", str(ctx.exception))
+
+    def test_heartbeat_does_not_trade_or_advance_sequence(self) -> None:
+        catalog = _nifty_catalog()
+        adapter, _sock = _real_adapter(
+            [_auth_ok(), '{"HeartBeat": {"timestamp": "' + AS_OF.isoformat() + '", "message": "heartbeat"}}'],
+            catalog,
+        )
+        adapter.connect()
+        before_seq = adapter._adapter_seq
+        before_quotes = dict(adapter._quotes)
+        raw = adapter.poll()
+        self.assertEqual(raw["kind"], "heartbeat")
+        self.assertIsNotNone(adapter.health().last_heartbeat_at)
+        self.assertEqual(adapter._adapter_seq, before_seq)
+        self.assertEqual(adapter._quotes, before_quotes)
+
+    def test_symbol_id_mapping_and_unknown_id(self) -> None:
+        catalog = _nifty_catalog()
+        index_id = catalog["mapping"][0][1]
+        incoming = [
+            _auth_ok(),
+            '{"success": true, "message": "symbols added", "symbolsadded": ' + str(catalog["mapping"]).replace("'", '"') + "}",
+            _trade(index_id, 25040.0, seq=1),
+            _trade(999999, 80.0, seq=2),
+        ]
+        adapter, _sock = _real_adapter(incoming, catalog)
+        adapter.connect()
+        ack = adapter.poll()
+        self.assertEqual(ack["kind"], "subscribe")
+        self.assertEqual(adapter._symbol_ids[str(index_id)], "NIFTY 50")
+        snap = adapter.poll()
+        self.assertIsNotNone(snap)
+        self.assertEqual(snap["spots"]["NIFTY"], 25040.0)
+        with self.assertRaises(GrowConfigError) as ctx:
+            adapter.poll()
+        self.assertIn("UNKNOWN_SYMBOL_ID", str(ctx.exception))
+
+    def test_csv_tick_resolves_numeric_id(self) -> None:
+        catalog = _nifty_catalog()
+        index_id = catalog["mapping"][0][1]
+        csv = (
+            f"{index_id},{AS_OF.isoformat()},25041,1,25041,10,25000,25100,24900,24950,0,0,0,,8,25040.5,10,25041.5,10"
+        )
+        incoming = [
+            _auth_ok(),
+            '{"success": true, "message": "symbols added", "symbolsadded": ' + str(catalog["mapping"]).replace("'", '"') + "}",
+            csv,
+        ]
+        adapter, _sock = _real_adapter(incoming, catalog)
+        adapter.connect()
+        ack = adapter.poll()
+        self.assertEqual(ack["kind"], "subscribe")
+        snap = adapter.poll()
+        self.assertEqual(snap["spots"]["NIFTY"], 25041.0)
+        self.assertNotEqual(snap["spots"]["NIFTY"], index_id)
+
+    def test_provider_error_and_malformed(self) -> None:
+        catalog = _nifty_catalog()
+        adapter, _sock = _real_adapter([_auth_ok(), '{"error": "upstream"}'], catalog)
+        adapter.connect()
+        with self.assertRaises(GrowConfigError) as ctx:
+            adapter.poll()
+        self.assertIn("PROVIDER_ERROR", str(ctx.exception))
+        adapter2, _sock2 = _real_adapter([_auth_ok(), "{nope"], catalog)
+        adapter2.connect()
+        with self.assertRaises(GrowConfigError) as ctx:
+            adapter2.poll()
+        self.assertIn("MALFORMED_MESSAGE", str(ctx.exception))
+
+    def test_catalog_failure_is_degraded(self) -> None:
+        adapter = TrueDataAdapter(
+            settings=TrueDataSettings(mode="real"),
+            environ={"TRUEDATA_USERNAME": "user", "TRUEDATA_PASSWORD": "pass"},
+            socket_factory=lambda: ScriptedSocket([_auth_ok()]),
+            catalog_loader=lambda: (_ for _ in ()).throw(GrowConfigError("METADATA_UNAVAILABLE")),
+            clock=FrozenClock(AS_OF),
+        )
+        with self.assertRaises(GrowConfigError) as ctx:
+            adapter.connect()
+        self.assertIn("METADATA_UNAVAILABLE", str(ctx.exception))
+        self.assertEqual(adapter.health().state, SessionHealth.DEGRADED)
+
+    def test_empty_catalog_is_degraded(self) -> None:
+        adapter, _sock = _real_adapter([_auth_ok()], {"instruments": []})
+        with self.assertRaises(GrowConfigError) as ctx:
+            adapter.connect()
+        self.assertIn("METADATA_UNAVAILABLE", str(ctx.exception))
+        self.assertEqual(adapter.health().state, SessionHealth.DEGRADED)
+        self.assertFalse(adapter.instrument_catalog())
+
+    def test_subscribes_index_until_live_spot(self) -> None:
+        catalog = dict(_nifty_catalog())
+        catalog["spot_bars"] = []
+        index_id = catalog["mapping"][0][1]
+        spot = float(catalog["spots"]["NIFTY"])
+        adapter, _sock = _real_adapter([_auth_ok(), _trade(index_id, spot, seq=1)], catalog)
+        adapter.connect()
+        self.assertIn("NIFTY 50", adapter._desired)
+        self.assertFalse(any(symbol.endswith(("CE", "PE")) for symbol in adapter._desired))
+        snap = adapter.poll()
+        self.assertIsNotNone(snap)
+        self.assertEqual(snap["spots"]["NIFTY"], spot)
+        self.assertTrue(any(symbol.endswith("CE") for symbol in adapter._desired))
+
+    def test_stale_without_heartbeat_or_ticks(self) -> None:
+        catalog = _nifty_catalog()
+        adapter, _sock = _real_adapter(
+            [_auth_ok(), '{"HeartBeat": {"timestamp": "' + AS_OF.isoformat() + '", "message": "heartbeat"}}'],
+            catalog,
+        )
+        adapter.connect()
+        adapter.poll()
+        adapter.clock.advance(timedelta(seconds=31))
+        with self.assertRaises(GrowConfigError) as ctx:
+            adapter.poll()
+        self.assertIn("STALE_REQUIRED_QUOTE", str(ctx.exception))
+        self.assertEqual(adapter.health().state, SessionHealth.DEGRADED)
+
+    def test_reconnect_resubscribes_real_transport(self) -> None:
+        catalog = _nifty_catalog()
+        socket = ScriptedSocket([_auth_ok(), _auth_ok()])
+        adapter = TrueDataAdapter(
+            settings=TrueDataSettings(mode="real", reconnect_policy="bounded_backoff", max_attempts=3, max_backoff_seconds=8),
+            environ={"TRUEDATA_USERNAME": "user", "TRUEDATA_PASSWORD": "pass"},
+            socket_factory=lambda: socket,
+            catalog_loader=lambda: catalog,
+            clock=FrozenClock(AS_OF),
+        )
+        adapter.connect()
+        desired = adapter._desired
+        self.assertTrue(desired)
+        adapter.transport.connected = False
+        adapter._state = SessionHealth.DEGRADED
+        adapter._on_feed_error("FEED_DISCONNECTED")
+        adapter.clock.advance(timedelta(seconds=2))
+        adapter.poll()
+        self.assertGreaterEqual(adapter.reconnect_count, 1)
+        self.assertGreaterEqual(adapter.transport.sent.count("auth"), 2)
+        self.assertTrue(any(item.startswith("addsymbol:") for item in socket.sent))
+        self.assertTrue(any(item.get("type") == "RESUBSCRIBE" for item in adapter.subscription_events))
+
+
+class RealPathPaperTests(unittest.TestCase):
+    def _protocol_loop(self, extra_ticks: list[str] | None = None):
+        catalog = _nifty_catalog()
+        ticks = [_trade(catalog["mapping"][0][1], float(catalog["spots"]["NIFTY"]), seq=1)]
+        seq = 2
+        by_symbol = {
+            _td_symbol(row["underlying"], row["expiry"], row["strike"], row["option_type"]): row
+            for row in bullish_event(underlyings=("NIFTY",))["contract_master"]
+            if row["underlying"] == "NIFTY"
+        }
+        quotes_by = {
+            (q["underlying"], q["expiry"], float(q["strike"]), q["option_type"]): q
+            for q in catalog["quotes"]
+        }
+        for _name, ident in catalog["mapping"][1:]:
+            master = by_symbol.get(_name)
+            if master is None:
+                continue
+            quote = quotes_by.get(("NIFTY", master["expiry"], float(master["strike"]), master["option_type"]))
+            if quote is None:
+                continue
+            ticks.append(
+                _trade(
+                    ident,
+                    float(quote["ltp"]),
+                    bid=quote["bid"],
+                    ask=quote["ask"],
+                    seq=seq,
+                    oi=quote["oi"],
+                    volume=quote["volume"],
+                )
+            )
+            seq += 1
+        if extra_ticks:
+            ticks.extend(extra_ticks)
+        incoming = [_auth_ok(), '{"success": true, "message": "symbols added", "symbolsadded": ' + str(catalog["mapping"]).replace("'", '"') + "}"] + ticks
+        socket = ScriptedSocket(incoming)
+        adapter = TrueDataAdapter(
+            settings=TrueDataSettings(mode="real", reconnect_policy="fail_closed"),
+            environ={"TRUEDATA_USERNAME": "user", "TRUEDATA_PASSWORD": "pass"},
+            socket_factory=lambda: socket,
+            catalog_loader=lambda: catalog,
+            clock=FrozenClock(AS_OF),
+        )
+        cfg = _live_config(provider="truedata", snapshot_interval_seconds=0, session_timeout_seconds=86400)
+        loop = LivePaperLoop(cfg, adapter, clock=FrozenClock(AS_OF), risk_secret=TEST_RISK_SECRET)
+        loop.start()
+        return loop, catalog, ticks
+
+    def test_protocol_path_opens_paper(self) -> None:
+        loop, _catalog, ticks = self._protocol_loop()
+        opened = None
+        for _ in range(len(ticks) + 3):
+            reports = loop.run_once("NIFTY")
+            for report in reports:
+                if report.status == CycleStatus.PAPER_FILL:
+                    opened = report
+                    break
+            if opened:
+                break
+        self.assertIsNotNone(opened)
+        self.assertEqual(opened.status, CycleStatus.PAPER_FILL, opened.reason if opened else "no fill")
+        self.assertEqual(loop.positions.open_positions()[0].lot_size, 75)
+
+    def test_protocol_path_closes_paper(self) -> None:
+        catalog = _nifty_catalog()
+        loop, _cat, ticks = self._protocol_loop()
+        opened = None
+        for _ in range(len(ticks) + 3):
+            reports = loop.run_once("NIFTY")
+            for report in reports:
+                if report.status == CycleStatus.PAPER_FILL:
+                    opened = report
+                    break
+            if opened:
+                break
+        self.assertIsNotNone(opened)
+        pos = loop.positions.open_positions()[0]
+        stop_ticks = []
+        seq = 900
+        for _name, ident in catalog["mapping"][1:]:
+            if pos.contract_id.split("-")[-1] == "CE" and "CE" not in _name:
+                continue
+            if pos.contract_id.split("-")[-1] == "PE" and "PE" not in _name:
+                continue
+            stop_ticks.append(_trade(ident, 10.0, bid=10.0, ask=11.0, seq=seq, oi=5000, volume=200))
+            seq += 1
+        loop.provider.transport._ws.incoming[:] = stop_ticks
+        closed = None
+        for _ in range(len(stop_ticks) + 8):
+            reports = loop.run_once("NIFTY")
+            for report in reports:
+                if report.status == CycleStatus.PAPER_CLOSE:
+                    closed = report
+                    break
+            if closed:
+                break
+        self.assertIsNotNone(closed)
+        self.assertEqual(loop.positions.all()[0].state, PositionState.CLOSED)
+
+    def test_heartbeat_is_control_no_trade(self) -> None:
+        catalog = _nifty_catalog()
+        adapter, _sock = _real_adapter(
+            [_auth_ok(), '{"HeartBeat": {"timestamp": "' + AS_OF.isoformat() + '", "message": "heartbeat"}}'],
+            catalog,
+        )
+        cfg = _live_config(provider="truedata", snapshot_interval_seconds=0, session_timeout_seconds=86400)
+        loop = LivePaperLoop(cfg, adapter, clock=FrozenClock(AS_OF), risk_secret=TEST_RISK_SECRET)
+        loop.start()
+        report = loop.run_once("NIFTY")[0]
+        self.assertEqual(report.status, CycleStatus.NO_TRADE)
+        self.assertEqual(report.reason, "FEED_HEARTBEAT")
+        self.assertFalse(loop.positions.open_positions())
+        self.assertIsNone(loop.last_snapshot)
+        self.assertIsNone(loop._last_sequence)
+        self.assertIsNotNone(loop.health.last_heartbeat_at)
+
+
+class CatalogTests(unittest.TestCase):
+    def test_parse_symbol_list(self) -> None:
+        rows = parse_catalog_text("NIFTY 50\nNIFTY26092225000CE,75\nFINNIFTY26092225000PE,40\n")
+        self.assertEqual(rows[0]["canonical_symbol"], "NIFTY")
+        self.assertEqual(rows[0]["instrument_type"], "INDEX")
+        self.assertEqual(rows[1]["option_type"], "CE")
+        self.assertEqual(rows[1]["lot_size"], 75)
+        self.assertEqual(rows[1]["expiry"], date(2026, 9, 22))
+        self.assertEqual(rows[2]["canonical_symbol"], "FINNIFTY")
+        merged = merge_catalog(rows)
+        self.assertEqual(len(merged), 3)
+
+    def test_empty_and_malformed_catalog(self) -> None:
+        self.assertEqual(parse_catalog_text(""), [])
+        with self.assertRaises(GrowConfigError) as ctx:
+            parse_catalog_text("{nope")
+        self.assertIn("METADATA_UNAVAILABLE", str(ctx.exception))
+        with self.assertRaises(GrowConfigError) as ctx:
+            parse_catalog_text(None)  # type: ignore[arg-type]
+        self.assertIn("METADATA_UNAVAILABLE", str(ctx.exception))
+
+    def test_json_catalog_keeps_symbol_id(self) -> None:
+        rows = parse_catalog_text(
+            json.dumps(
+                {
+                    "instruments": [
+                        {
+                            "provider_symbol": "NIFTY26092225000CE",
+                            "symbol_id": 42,
+                            "lot_size": 75,
+                            "expiry_class": "WEEKLY",
+                        }
+                    ]
+                }
+            )
+        )
+        self.assertEqual(rows[0]["provider_symbol_id"], "42")
+        self.assertEqual(rows[0]["provider_symbol"], "NIFTY26092225000CE")
+        self.assertNotEqual(rows[0]["provider_symbol"], "NIFTY-2026-09-22-25000-CE")
+
+
+class SmokeScriptTests(unittest.TestCase):
+    def test_smoke_does_not_inject_catalog_or_broker(self) -> None:
+        text = (ROOT / "scripts" / "run_truedata_smoke.py").read_text(encoding="utf-8")
+        self.assertNotIn("catalog_loader", text)
+        self.assertNotIn("sample_ticks", text)
+        self.assertNotIn("place_order", text)
+        self.assertNotIn("kiteconnect", text.lower())
+        self.assertIn("TRUEDATA_USERNAME", text)
+        self.assertIn("paper_only", text)
+        self.assertIn("catalog_injected", text)
+
+
