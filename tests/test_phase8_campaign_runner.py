@@ -13,11 +13,11 @@ from grow.campaign import (
     CampaignRunner,
     campaign_paper_config,
 )
-from grow.clock import IST, FrozenClock
+from grow.clock import IST, FrozenClock, SystemClock
 from grow.config import load_config
 from grow.decision.aggregation.debate import DebateSummary
 from grow.decision.contracts.agent_result import AgentResult, AgentStatus, CandidateAction
-from grow.decision.integration.contract import DecisionAction, IntegratedDecisionStatus
+from grow.decision.integration.contract import DecisionAction, DecisionBookState, IntegratedDecisionStatus
 from grow.live_data.loop import LivePaperLoop
 from grow.market_data.normalized.models import DataQualityStatus, OptionQuoteView
 from grow.market_data.snapshots.builder import build_fixture_snapshot
@@ -72,10 +72,18 @@ class _OpenSpecialist:
     agent_name = "strategy_research"
     agent_version = "strategy_research.v2"
 
-    def __init__(self, *, instrument="RELIANCE-2500-CE", direction="BULLISH", option_type="CE") -> None:
+    def __init__(
+        self,
+        *,
+        instrument="RELIANCE-2500-CE",
+        direction="BULLISH",
+        option_type="CE",
+        strike: float = 2500.0,
+    ) -> None:
         self.instrument = instrument
         self.direction = direction
         self.option_type = option_type
+        self.strike = strike
 
     def analyze(self, snapshot, *, cycle_id: str = ""):
         return AgentResult(
@@ -96,7 +104,7 @@ class _OpenSpecialist:
                 "lots": 1,
                 "quantity": 1,
                 "option_type": self.option_type,
-                "strike": 2500.0,
+                "strike": self.strike,
                 "expiry": EXPIRY.isoformat(),
                 "lot_size": 1,
             },
@@ -120,13 +128,13 @@ class _OpenSpecialist:
         return self.analyze(agent_input.snapshot, cycle_id=agent_input.cycle_id)
 
 
-def _runner(*, specialists=None) -> CampaignRunner:
+def _runner(*, specialists=None, clock=None) -> CampaignRunner:
     config = campaign_paper_config(load_config())
-    clock = FrozenClock(AS_OF)
-    guard = make_guard(config, clock=clock)
+    frozen = clock if clock is not None else FrozenClock(AS_OF)
+    guard = make_guard(config, clock=frozen)
     return CampaignRunner(
         config,
-        clock=clock,
+        clock=frozen,
         risk_guard=guard,
         risk_secret=TEST_RISK_SECRET,
         specialists=specialists if specialists is not None else (_OpenSpecialist(),),
@@ -134,9 +142,9 @@ def _runner(*, specialists=None) -> CampaignRunner:
     )
 
 
-def _package(snapshot, result):
+def _package(snapshot, result, *, cycle_id="cycle-p8", digest="pkg-phase8"):
     return AggregateAnalysisPackage(
-        cycle_id="cycle-p8",
+        cycle_id=cycle_id,
         snapshot_id=snapshot.snapshot_id,
         snapshot_version=snapshot.version,
         as_of=snapshot.decision_timestamp,
@@ -158,7 +166,7 @@ def _package(snapshot, result):
             error_agents=(),
         ),
         cycle_summary="phase8",
-        package_digest="pkg-phase8",
+        package_digest=digest,
     )
 
 
@@ -168,14 +176,37 @@ class CampaignConfigTests(unittest.TestCase):
         self.assertEqual(cfg.paper.price_mode, CAMPAIGN_PRICE_MODE)
         self.assertEqual(cfg.paper.starting_cash, 10_000)
         self.assertEqual(cfg.risk.max_daily_loss, 2_000)
-        # Global defaults unchanged.
+        self.assertEqual(cfg.risk.max_per_trade_risk, 1_000)
+        self.assertEqual(cfg.risk.max_open_positions, 2)
         baseline = load_config()
         self.assertNotEqual(baseline.paper.starting_cash, 10_000)
         self.assertIsNone(baseline.paper.price_mode)
 
 
+class CampaignClockTests(unittest.TestCase):
+    def test_default_campaign_runner_uses_system_clock(self) -> None:
+        runner = CampaignRunner(
+            risk_secret=TEST_RISK_SECRET,
+            specialists=(),
+        )
+        self.assertIsInstance(runner.clock, SystemClock)
+        self.assertIsInstance(runner.guard.clock, SystemClock)
+        self.assertIsInstance(runner.paper.clock, SystemClock)
+        self.assertIs(runner.guard.clock, runner.clock)
+        self.assertIs(runner.paper.clock, runner.clock)
+
+    def test_injected_frozen_clock_is_preserved(self) -> None:
+        clock = FrozenClock(AS_OF)
+        runner = _runner(clock=clock)
+        self.assertIs(runner.clock, clock)
+        self.assertIs(runner.guard.clock, clock)
+        self.assertIs(runner.paper.clock, clock)
+        self.assertIsInstance(runner.clock, FrozenClock)
+
+
 class CampaignRunnerTests(unittest.TestCase):
     def test_full_cycle_buys_ce_with_conservative_ask(self) -> None:
+        """13. Existing BUY_CE conservative ASK fill remains passing."""
         snap = _snapshot()
         runner = _runner()
         self.assertEqual(runner.fill_policy_version, CONSERVATIVE_FILL_MODEL)
@@ -202,17 +233,141 @@ class CampaignRunnerTests(unittest.TestCase):
         self.assertEqual(outcome.decision.action, DecisionAction.BUY_CE)
 
     def test_buy_pe_cycle(self) -> None:
+        """14. Existing BUY_PE conservative ASK fill remains passing."""
         snap = _snapshot(quotes=(_quote(option_type="PE", provider_contract_id="RELIANCE-2500-PE"),))
-        runner = _runner(specialists=(_OpenSpecialist(instrument="RELIANCE-2500-PE", direction="BEARISH", option_type="PE"),))
+        runner = _runner(
+            specialists=(_OpenSpecialist(instrument="RELIANCE-2500-PE", direction="BEARISH", option_type="PE"),)
+        )
         result = runner.run_cycle(snap, cycle_id="cycle-p8-pe")
         self.assertEqual(result.decision.action, DecisionAction.BUY_PE)
         self.assertTrue(result.execution.accepted, result.execution.reason)
+        self.assertEqual(result.execution.price_source, "ASK")
+        self.assertEqual(result.execution.broker_order_calls, 0)
 
     def test_missing_chain_is_no_trade(self) -> None:
         snap = _snapshot(quotes=())
         result = _runner().run_cycle(snap, cycle_id="cycle-p8-empty")
         self.assertEqual(result.decision.action, DecisionAction.NO_TRADE)
         self.assertFalse(result.execution.accepted)
+
+    def test_risk_guard_block_no_paper_fill(self) -> None:
+        """7. Risk Guard BLOCK → decision NO_TRADE → PaperExecutionEngine does not fill."""
+        snap = _snapshot()
+        runner = _runner()
+        result = runner.run_cycle(
+            snap,
+            cycle_id="cycle-p8-block",
+            book=DecisionBookState(
+                cash=10_000.0,
+                gross_notional=0.0,
+                daily_pnl=-20_000.0,
+                symbol_notional=0.0,
+                open_positions=0,
+            ),
+        )
+        self.assertEqual(result.decision.status, IntegratedDecisionStatus.BLOCKED)
+        self.assertEqual(result.decision.action, DecisionAction.NO_TRADE)
+        self.assertFalse(result.execution.accepted)
+        self.assertEqual(result.execution.broker_order_calls, 0)
+        self.assertEqual(len(runner.paper.positions.open_positions()), 0)
+
+    def test_max_daily_loss_2000_blocks_new_entry(self) -> None:
+        """8. Max daily loss ₹2,000 prevents a new entry."""
+        snap = _snapshot()
+        runner = _runner()
+        self.assertEqual(runner.config.risk.max_daily_loss, 2_000)
+        result = runner.run_cycle(
+            snap,
+            cycle_id="cycle-p8-daily-loss",
+            book=DecisionBookState(
+                cash=10_000.0,
+                gross_notional=0.0,
+                daily_pnl=-2_001.0,
+                symbol_notional=0.0,
+                open_positions=0,
+            ),
+        )
+        self.assertEqual(result.decision.status, IntegratedDecisionStatus.BLOCKED)
+        self.assertEqual(result.decision.action, DecisionAction.NO_TRADE)
+        self.assertFalse(result.execution.accepted)
+        self.assertEqual(len(runner.paper.positions.open_positions()), 0)
+
+    def test_max_open_positions_two_blocks_third_entry(self) -> None:
+        """9. Max open positions 2 prevents a third entry."""
+        runner = _runner()
+        self.assertEqual(runner.config.risk.max_open_positions, 2)
+        specs = (
+            (2500.0, "cycle-p8-pos-a", "pkg-a"),
+            (2600.0, "cycle-p8-pos-b", "pkg-b"),
+            (2700.0, "cycle-p8-pos-c", "pkg-c"),
+        )
+        for strike, cycle_id, digest in specs[:2]:
+            snap = _snapshot(
+                quotes=(_quote(strike=strike, provider_contract_id=f"RELIANCE-{int(strike)}-CE"),)
+            )
+            specialist = _OpenSpecialist(
+                instrument=f"RELIANCE-{int(strike)}-CE",
+                strike=strike,
+            )
+            row = specialist.analyze(snap, cycle_id=cycle_id)
+            outcome = runner.run_from_package(
+                snap,
+                _package(snap, row, cycle_id=cycle_id, digest=digest),
+            )
+            self.assertTrue(outcome.execution.accepted, outcome.execution.reason)
+        self.assertEqual(len(runner.paper.positions.open_positions()), 2)
+        snap3 = _snapshot(quotes=(_quote(strike=2700.0, provider_contract_id="RELIANCE-2700-CE"),))
+        row3 = _OpenSpecialist(instrument="RELIANCE-2700-CE", strike=2700.0).analyze(
+            snap3, cycle_id="cycle-p8-pos-c"
+        )
+        blocked = runner.run_from_package(
+            snap3,
+            _package(snap3, row3, cycle_id="cycle-p8-pos-c", digest="pkg-c"),
+        )
+        self.assertFalse(blocked.execution.accepted)
+        self.assertIn(blocked.execution.reason, {"MAX_POSITIONS", "RISK_GUARD:positions.count"})
+        self.assertEqual(len(runner.paper.positions.open_positions()), 2)
+        self.assertEqual(blocked.execution.broker_order_calls, 0)
+
+    def test_stale_quote_cannot_produce_paper_fill(self) -> None:
+        """10. Stale/invalid quote cannot produce a paper fill."""
+        snap = _snapshot(quotes=(_quote(quality=DataQualityStatus.STALE),))
+        # Rebuild snapshot quality as STALE for gate.
+        snap = build_fixture_snapshot(
+            underlying="RELIANCE",
+            as_of=AS_OF,
+            spot=2500.0,
+            option_contracts=(_quote(quality=DataQualityStatus.STALE),),
+            quality=DataQualityStatus.STALE,
+            notes=("stale",),
+        )
+        result = _runner().run_cycle(snap, cycle_id="cycle-p8-stale")
+        self.assertEqual(result.decision.action, DecisionAction.NO_TRADE)
+        self.assertFalse(result.execution.accepted)
+        self.assertEqual(result.execution.broker_order_calls, 0)
+
+    def test_live_trading_snapshot_rejected(self) -> None:
+        """11. live_trading=True snapshot is rejected."""
+        snap = _snapshot()
+        object.__setattr__(snap, "live_trading", True)
+        runner = _runner()
+        with self.assertRaises(ValueError):
+            runner.run_cycle(snap, cycle_id="cycle-p8-live")
+
+    def test_paper_mode_false_snapshot_rejected(self) -> None:
+        """12. paper_mode=False snapshot is rejected."""
+        snap = _snapshot()
+        object.__setattr__(snap, "paper_mode", False)
+        runner = _runner()
+        with self.assertRaises(ValueError):
+            runner.run_cycle(snap, cycle_id="cycle-p8-nonpaper")
+
+    def test_broker_order_calls_remain_zero(self) -> None:
+        """15. broker_order_calls remains 0."""
+        snap = _snapshot()
+        result = _runner().run_cycle(snap, cycle_id="cycle-p8-broker-zero")
+        self.assertEqual(result.execution.broker_order_calls, 0)
+        self.assertEqual(result.to_dict()["execution"]["broker_order_calls"], 0)
 
     def test_live_paper_loop_still_importable(self) -> None:
         """Dual paths: LivePaperLoop preserved; campaign uses PaperExecutionEngine."""
@@ -232,11 +387,12 @@ class CampaignRunnerTests(unittest.TestCase):
                 if isinstance(node, ast.Attribute):
                     self.assertNotIn(node.attr, banned)
             self.assertNotIn("grow.execution.live", source)
-        # Campaign runner must reuse PaperExecutionEngine, not invent another fill engine.
         runner_src = (ROOT / "grow" / "campaign" / "runner.py").read_text(encoding="utf-8")
         self.assertIn("PaperExecutionEngine", runner_src)
         self.assertIn("DecisionEngine", runner_src)
         self.assertIn("AnalysisOrchestrator", runner_src)
+        self.assertIn("SystemClock", runner_src)
+        self.assertNotIn("FrozenClock(datetime.now", runner_src)
         self.assertNotIn("class CampaignFillEngine", runner_src)
 
 

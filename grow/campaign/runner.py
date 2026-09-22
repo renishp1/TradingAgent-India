@@ -16,7 +16,7 @@ from typing import Any
 
 from grow.agents.base import SpecialistAgent
 from grow.campaign.config import campaign_paper_config
-from grow.clock import Clock, FrozenClock, IST
+from grow.clock import Clock, SystemClock
 from grow.config import GrowConfig
 from grow.decision.integration.contract import DecisionBookState, IntegratedDecision
 from grow.decision.integration.engine import DecisionEngine
@@ -27,8 +27,6 @@ from grow.orchestration.models import AggregateAnalysisPackage
 from grow.paper.engine import PaperExecutionEngine, PaperExecutionResult
 from grow.paper.fills import policy_from_config
 from grow.risk.guard import RiskGuard
-
-from datetime import datetime
 
 
 CAMPAIGN_RUNNER_VERSION = "campaign.runner.v1"
@@ -82,7 +80,8 @@ class CampaignRunner:
         assert raw is not None
         assert_paper_runtime(raw.execution.mode, raw.execution.live_trading_enabled, "PAPER")
         self.config = raw
-        self.clock = clock or FrozenClock(datetime.now(tz=IST))
+        # Production default is wall-clock IST. Tests inject FrozenClock explicitly.
+        self.clock = clock if clock is not None else SystemClock()
         self.guard = risk_guard or RiskGuard(self.config, clock=self.clock, secret=risk_secret)
         self.orchestrator = AnalysisOrchestrator(
             specialists=specialists,
