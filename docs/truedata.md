@@ -1,7 +1,8 @@
 # Milestone 3C — Real Indian live market-data adapter (TrueData)
 
 Status: **TrueData adapter feeds the existing 3A/3B paper loop.**  
-No broker. No live orders. No silent fixture fallback.
+3C.1 classifies expiries. 3C.2 is the real-account smoke + first-tick evidence
+path. No broker. No live orders. No silent fixture fallback.
 
 ```
 TrueData WebSocket
@@ -156,10 +157,35 @@ around ATM (default 4). 2C still selects ATM ±2. Vendor `max_symbols` is enforc
 before subscribe. On reconnect the full desired set is resubscribed after a
 fresh authenticate.
 
-## Manual smoke
+## Manual smoke (3C.2)
 
-See `scripts/run_truedata_smoke.py`. Requires an explicit licensed subscription.
-The script authenticates, fetches the vendor catalog itself, subscribes, waits
-for the first live snapshot (skipping heartbeat/control frames), then prints
-paper-only diagnostics. Do not inject a catalog file. Do not set any broker
-token or `live_trading` flag.
+See `scripts/run_truedata_smoke.py`. Requires an explicit licensed
+subscription and `TRUEDATA_SMOKE=1`. The script authenticates, fetches the
+vendor catalog itself, classifies expiries with 3C.1, subscribes, waits for
+`mapping_ready` and the first live snapshot (skipping heartbeat/control frames),
+runs the existing 3A/3B paper loop, then writes a **non-secret**
+`grow.smoke.truedata.v1` report under `results/truedata-smoke-<session>.json`.
+
+A paper OPEN is not required. `PASS_WITH_NO_TRADE` is a valid data-path result
+when every upstream gate passed. Do not inject a catalog file. Do not set any
+broker token or `live_trading` flag. Credentials never enter the report.
+
+```
+export TRUEDATA_SMOKE=1
+export TRUEDATA_USERNAME=...
+export TRUEDATA_PASSWORD=...
+export GROW_RISK_SECRET=...
+python scripts/run_truedata_smoke.py
+```
+
+| Result | Meaning |
+|---|---|
+| `PASS` | Real auth + catalog + subscription + mapping + tick + paper OPEN |
+| `PASS_WITH_NO_TRADE` | All data gates passed; 2B/2C/2D/Risk Guard correctly returned NO_TRADE |
+| `FAIL` | Auth, catalog, subscription, mapping, or first valid tick missing |
+| `HARD_FAIL` | Fixture fallback, broker path, live trading, or secret leakage |
+
+Run during an NSE F&O regular session (09:15–15:40 IST, subject to holidays).
+After hours the connection/catalog may still work; a missing first tick is
+`FAIL`, not a fabricated snapshot. Auth/catalog failures still write a
+redacted FAIL report when a session object exists.

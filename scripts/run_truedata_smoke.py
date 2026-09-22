@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
-"""Credential-gated TrueData smoke test. Paper only. Disabled in CI by default.
+"""Credential-gated TrueData 3C.2 smoke. Paper only. Disabled unless TRUEDATA_SMOKE=1.
 
 Usage (never commit secrets):
 
-    export LIVE_DATA_ENABLED=true
-    export LIVE_DATA_PROVIDER=truedata
-    export GROW_LIVE_DATA_MODE=real
+    export TRUEDATA_SMOKE=1
     export TRUEDATA_USERNAME=...
     export TRUEDATA_PASSWORD=...
-    export TRUEDATA_SMOKE=1
+    export GROW_RISK_SECRET=...
     python scripts/run_truedata_smoke.py
 
 Flow:
     credentials → WebSocket auth → vendor catalog discovery (2I overlay)
-    → ATM subscription → first live snapshot → 3A/3B paper loop diagnostics
+    → 3C.1 expiry classification → ATM subscription → mapping_ready
+    → first live snapshot → 3A/3B paper loop diagnostics → smoke report
 
 The catalog is fetched from TrueData symbol lists. Do not inject a fixture
 catalog. Do not set any broker token or live_trading flag.
@@ -31,75 +30,80 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from grow.clock import SystemClock  # noqa: E402
-from grow.config import load_config  # noqa: E402
-from grow.errors import GrowConfigError  # noqa: E402
+from grow.errors import GrowConfigError, GrowLiveTradingDisabled  # noqa: E402
 from grow.execution.lock import LIVE_TRADING_COMPILED  # noqa: E402
 from grow.live_data.loop import open_loop  # noqa: E402
-from grow.live_data.truedata import load_truedata_secrets  # noqa: E402
+from grow.live_data.smoke import (  # noqa: E402
+    HARD_FAIL,
+    PASS,
+    PASS_WITH_NO_TRADE,
+    build_smoke_report,
+    drain_smoke_loop,
+    load_smoke_secrets,
+    smoke_config,
+    smoke_risk_secret,
+    write_smoke_report,
+)
 
 
-def main() -> int:
+def _report_path(session_id: str) -> Path:
+    return ROOT / "results" / f"truedata-smoke-{session_id}.json"
+
+
+def _print_report(report: dict, path: Path) -> int:
+    print(json.dumps(report, indent=2, default=str))
+    print(f"smoke_report={path}", file=sys.stderr)
+    if report["result"] in {PASS, PASS_WITH_NO_TRADE}:
+        return 0
+    if report["result"] == HARD_FAIL:
+        return 1
+    return 2
+
+
+def main(environ: dict[str, str] | None = None) -> int:
+    env = dict(os.environ if environ is None else environ)
     if LIVE_TRADING_COMPILED:
         print("LIVE_TRADING_COMPILED forbids this binary", file=sys.stderr)
         return 1
-    if not os.environ.get("TRUEDATA_SMOKE") and not os.environ.get("TRUEDATA_USERNAME"):
-        print("AUTH_MISSING: set TRUEDATA_USERNAME / TRUEDATA_PASSWORD and TRUEDATA_SMOKE=1", file=sys.stderr)
-        return 2
+    secrets: tuple[str, ...] = ()
+    loop = None
+    reports: list = []
+    error = None
     try:
-        load_truedata_secrets()
-        config = load_config(
-            environ={
-                **os.environ,
-                "GROW_LIVE_DATA_ENABLED": "true",
-                "GROW_LIVE_DATA_PROVIDER": "truedata",
-                "GROW_LIVE_DATA_MODE": "real",
-                "LIVE_DATA_ENABLED": "true",
-                "LIVE_DATA_PROVIDER": "truedata",
-            }
-        )
-        if config.live_data.live_trading or config.execution.live_trading_enabled:
-            print("LIVE_EXECUTION_FORBIDDEN", file=sys.stderr)
+        user, password = load_smoke_secrets(env)
+        secrets = tuple(item for item in (user, password, env.get("GROW_RISK_SECRET", "")) if item)
+        config = smoke_config(env)
+        secret = smoke_risk_secret(env)
+        secrets = tuple(item for item in (*secrets, secret) if item)
+        loop = open_loop(config, clock=SystemClock(), risk_secret=secret)
+        try:
+            loop.start()
+            reports = drain_smoke_loop(loop)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            error = str(exc)
+            reports = list(getattr(loop, "cycles", ()) or reports)
+        try:
+            loop.stop()
+        except Exception:
+            pass
+        report = build_smoke_report(loop, reports, secrets=secrets, root=ROOT, error=error)
+        path = write_smoke_report(report, _report_path(loop.session.session_id))
+        return _print_report(report, path)
+    except (GrowConfigError, GrowLiveTradingDisabled) as exc:
+        message = str(exc)
+        for token in secrets:
+            if token and token in message:
+                message = message.replace(token, "[REDACTED]")
+        print(message, file=sys.stderr)
+        if loop is not None:
+            report = build_smoke_report(loop, reports, secrets=secrets, root=ROOT, error=message)
+            path = write_smoke_report(report, _report_path(loop.session.session_id))
+            return _print_report(report, path)
+        if "LIVE_" in message or "BROKER" in message:
             return 1
-        loop = open_loop(config, clock=SystemClock())
-        loop.start()
-        provider = loop.provider
-        catalog = list(getattr(provider, "instrument_catalog", lambda: ())())
-        discovered = list(getattr(provider, "discover_underlyings", lambda: ())())
-        subscribed = list(provider.health().subscribed)
-        reports = []
-        for _ in range(64):
-            batch = loop.run_once()
-            reports.extend(batch)
-            if loop.last_snapshot is not None:
-                break
-            reason = batch[-1].reason if batch else ""
-            if reason.startswith("FEED_"):
-                continue
-            break
-        snapshot = None if loop.last_snapshot is None else loop.last_snapshot.to_dict()
-        print(
-            json.dumps(
-                {
-                    "health": loop.health.to_dict(),
-                    "catalog_size": len(catalog),
-                    "discovered_underlyings": discovered,
-                    "subscribed": subscribed or list(provider.health().subscribed),
-                    "snapshot": snapshot,
-                    "reports": [row.to_dict() for row in reports],
-                    "paper_only": True,
-                    "live_trading": False,
-                    "broker": False,
-                    "catalog_injected": False,
-                },
-                indent=2,
-                default=str,
-            )
-        )
-        loop.stop()
-    except GrowConfigError as exc:
-        print(str(exc), file=sys.stderr)
         return 2
-    return 0
 
 
 if __name__ == "__main__":

@@ -1111,7 +1111,7 @@ class SmokeScriptTests(unittest.TestCase):
         self.assertNotIn("place_order", text)
         self.assertNotIn("kiteconnect", text.lower())
         self.assertIn("TRUEDATA_USERNAME", text)
-        self.assertIn("paper_only", text)
-        self.assertIn("catalog_injected", text)
+        self.assertIn("build_smoke_report", text)
+        self.assertIn("TRUEDATA_SMOKE", text)
 
 
