@@ -78,6 +78,7 @@ class CampaignRunner:
         apply_campaign_defaults: bool = True,
         checkpoint_path: Path | str | None = None,
         paper: PaperExecutionEngine | None = None,
+        replay_store: Any | None = None,
     ) -> None:
         raw = config
         if apply_campaign_defaults:
@@ -113,6 +114,7 @@ class CampaignRunner:
                 checkpoint_path=self.checkpoint_path,
             )
         self._risk_secret = risk_secret
+        self.replay_store = replay_store
 
     @classmethod
     def from_checkpoint(
@@ -180,16 +182,25 @@ class CampaignRunner:
             raise ValueError("campaign runner requires a paper-only snapshot")
         decision = self.decision_engine.decide(snapshot=snapshot, package=package, book=book)
         execution = self.paper.execute(decision, snapshot, package=package)
-        return CampaignCycleResult(
+        result = CampaignCycleResult(
             snapshot_id=snapshot.snapshot_id,
             cycle_id=package.cycle_id,
             package=package,
             decision=decision,
             execution=execution,
         )
+        if self.replay_store is not None:
+            book_payload = None if book is None else book.to_dict()
+            self.replay_store.record_cycle(result, snapshot, book=book_payload)
+        return result
 
     def on_snapshot(self, snapshot: AgentMarketSnapshot) -> tuple[str, ...]:
         """Mark / timeout / recovery on the shared paper engine."""
         if snapshot.live_trading or not snapshot.paper_mode:
             raise ValueError("campaign runner requires a paper-only snapshot")
-        return self.paper.on_snapshot(snapshot)
+        reasons = self.paper.on_snapshot(snapshot)
+        if self.replay_store is not None:
+            from grow.campaign.replay import sync_exits_from_paper
+
+            sync_exits_from_paper(self.replay_store, self.paper)
+        return reasons
