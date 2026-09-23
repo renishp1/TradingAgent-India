@@ -12,7 +12,7 @@ still a constrained paper-trading foundation, not a desk.
 
 ## What this commit contains
 
-1. `tradingagents/` — clean-room TradingAgents **foundation** (roles, config, sequential research graph). Inspired by [TauricResearch/TradingAgents](https://github.com/TauricResearch/TradingAgents) (Apache-2.0). **Not a copy of that tree.**
+1. `tradingagents/` — clean-room TradingAgents **foundation** (roles, config, sequential research graph). 
 2. `grow/` — firm layout: CEO, market, options, strategies, risk, execution, paper, data, learning, model gateway, dashboard.
 3. Configuration (`configs/grow.default.yaml` + env overlay).
 4. Model gateway abstraction (deterministic **mock** by default).
