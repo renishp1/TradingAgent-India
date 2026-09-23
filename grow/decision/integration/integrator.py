@@ -21,6 +21,7 @@ from grow.decision.integration.contract import (
     digest_payload,
     resolve_decision_action,
 )
+from grow.decision.integration.ceo_gate import campaign_ceo_gate
 from grow.decision.integration.policy import PolicyResult, evaluate_policy
 from grow.errors import GrowConfigError, GrowLiveTradingDisabled, GrowSafetyError
 from grow.execution.lock import assert_paper_runtime
@@ -197,6 +198,20 @@ class DecisionIntegrator:
                 reasons=policy.reason_codes or ("NO_VALID_STRATEGY_CANDIDATE",),
                 risk_result="NOT_EVALUATED",
                 risk_reason="NOT_EVALUATED",
+                rules=(),
+            )
+
+        ceo_ok, ceo_reasons = campaign_ceo_gate(policy.candidate)
+        if not ceo_ok:
+            return self._finish(
+                snapshot,
+                package,
+                book,
+                policy=policy,
+                status=IntegratedDecisionStatus.NO_TRADE,
+                reasons=("CEO_GATE_REJECTED", *ceo_reasons),
+                risk_result="NOT_EVALUATED",
+                risk_reason="CEO_GATE_REJECTED",
                 rules=(),
             )
 

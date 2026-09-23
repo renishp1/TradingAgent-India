@@ -25,7 +25,7 @@ from grow.paper.positions import PositionState
 from grow.paper.quotes import live_snapshot_from_agent
 from grow.paper.exits import ExitReason
 
-from tests.helpers import TEST_RISK_SECRET, make_guard
+from tests.helpers import TEST_RISK_SECRET, make_guard, research_fixture_config
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -139,7 +139,9 @@ def _package(snapshot, output, *, cycle_id="cycle-paper", instrument_ok=True):
 
 
 def _config(**risk):
-    config = load_config()
+    # PaperExecution unit fixtures use research-sized capital / LTP fills, not
+    # the operator ₹10K + conservative profile (covered by dedicated profile tests).
+    config = research_fixture_config()
     config = replace(
         config,
         live_data=replace(config.live_data, session_timeout_seconds=86400),
@@ -863,9 +865,10 @@ class PaperCapitalAndPriceModeTests(unittest.TestCase):
         self.assertEqual(config.risk.max_per_trade_risk, 1_000)
         self.assertEqual(config.risk.max_open_positions, 2)
         self.assertEqual(config.paper.capital_profile, "INDIA_INDEX_OPTIONS_PAPER_10K")
-        # Global defaults remain unchanged when profile is not applied.
-        baseline = load_config()
-        self.assertEqual(baseline.paper.starting_cash, 1_000_000)
+        # Default YAML ships the same operator-facing ₹10K profile (ignore local .env cash overlay).
+        baseline = load_config(environ={"GROW_EXECUTION_MODE": "paper"})
+        self.assertEqual(baseline.paper.starting_cash, 10_000)
+        self.assertEqual(baseline.paper.capital_profile, "INDIA_INDEX_OPTIONS_PAPER_10K")
         engine, clock = _engine(config)
         self.assertEqual(engine.positions.starting_cash, 10_000)
         snap = _snapshot()

@@ -172,15 +172,17 @@ def _package(snapshot, result, *, cycle_id="cycle-p8", digest="pkg-phase8"):
 
 class CampaignConfigTests(unittest.TestCase):
     def test_campaign_defaults_are_conservative_and_10k(self) -> None:
-        cfg = campaign_paper_config(load_config())
+        cfg = campaign_paper_config(load_config(environ={"GROW_EXECUTION_MODE": "paper"}))
         self.assertEqual(cfg.paper.price_mode, CAMPAIGN_PRICE_MODE)
         self.assertEqual(cfg.paper.starting_cash, 10_000)
         self.assertEqual(cfg.risk.max_daily_loss, 2_000)
         self.assertEqual(cfg.risk.max_per_trade_risk, 1_000)
         self.assertEqual(cfg.risk.max_open_positions, 2)
-        baseline = load_config()
-        self.assertNotEqual(baseline.paper.starting_cash, 10_000)
-        self.assertIsNone(baseline.paper.price_mode)
+        baseline = load_config(environ={"GROW_EXECUTION_MODE": "paper"})
+        self.assertEqual(baseline.paper.starting_cash, 10_000)
+        self.assertEqual(baseline.paper.price_mode, "conservative")
+        self.assertEqual(baseline.paper.capital_profile, "INDIA_INDEX_OPTIONS_PAPER_10K")
+        self.assertEqual(baseline.risk.max_daily_loss, 2_000)
 
 
 class CampaignClockTests(unittest.TestCase):

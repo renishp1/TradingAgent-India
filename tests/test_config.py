@@ -20,13 +20,20 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.paper.starting_cash, 250000)
 
     def test_square_off_is_before_close(self) -> None:
-        config = load_config()
+        # Explicit environ skips local .env overlays (e.g. GROW_STARTING_CASH).
+        config = load_config(environ={"GROW_EXECUTION_MODE": "paper"})
         self.assertEqual(config.market.square_off, "15:15")
         self.assertEqual(config.market.session_close, "15:30")
         self.assertEqual(config.timezone, "Asia/Kolkata")
         self.assertEqual(config.market.product, "CASH")
         self.assertFalse(config.risk.allow_short)
         self.assertEqual(config.risk.concentration_basis, "cost_notional")
+        self.assertEqual(config.paper.starting_cash, 10_000)
+        self.assertEqual(config.risk.max_daily_loss, 2_000)
+        self.assertEqual(config.risk.max_per_trade_risk, 1_000)
+        self.assertEqual(config.risk.max_open_positions, 2)
+        self.assertEqual(config.paper.capital_profile, "INDIA_INDEX_OPTIONS_PAPER_10K")
+        self.assertEqual(config.paper.price_mode, "conservative")
         self.assertEqual(config.data.provider, "fixture")
         self.assertFalse(config.data.allow_live_feed)
         self.assertEqual(config.strategies.universe, ("NIFTY", "BANKNIFTY"))

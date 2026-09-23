@@ -19,14 +19,15 @@ from grow.market.session import SessionCalendar
 from grow.data.schema import Timeframe
 from grow.options.models import DecisionStatus
 from grow.strategies.signal import StrategySignal
-from tests.helpers import TEST_RISK_SECRET
+from tests.helpers import TEST_RISK_SECRET, research_fixture_config
 
 
 AS_OF = datetime(2026, 9, 18, 11, 0, tzinfo=IST)
 
 
 def _live_config(**changes):
-    base = load_config()
+    # LivePaperLoop fixtures use research-sized capital, not the ₹10K operator profile.
+    base = research_fixture_config()
     live = replace(base.live_data, enabled=True, **changes) if changes else replace(base.live_data, enabled=True)
     cfg = replace(base, live_data=live)
     cfg.assert_safe()

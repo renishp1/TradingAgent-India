@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TradingAgent-India · Paper Dashboard</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-name">TradingAgent-India</div>
+        <div class="brand-sub">Grow · Paper Research Console</div>
+      </div>
+      <div class="banners" id="safety-banners">
+        <span class="banner banner-paper">PAPER TRADING</span>
+        <span class="banner banner-live">LIVE TRADING DISABLED</span>
+        <span class="banner banner-broker">BROKER ORDERS DISABLED</span>
+        <span class="banner banner-paper">READ ONLY</span>
+      </div>
+      <div class="top-meta">
+        <div class="pill pill-paper">PAPER MODE <span class="dot"></span></div>
+        <div class="meta-line" id="market-status-pill">Market: …</div>
+      </div>
+    </header>
+
+    <div class="shell">
+      <nav class="sidebar" aria-label="Dashboard sections">
+        <button class="nav-item active" data-view="dashboard">Dashboard</button>
+        <button class="nav-item" data-view="positions">Positions</button>
+        <button class="nav-item" data-view="option-chain">Option Chain</button>
+        <button class="nav-item" data-view="signals">Signals</button>
+        <button class="nav-item" data-view="agents">AI Agents</button>
+        <button class="nav-item" data-view="risk">Risk Guard</button>
+        <button class="nav-item" data-view="research">Research</button>
+        <button class="nav-item" data-view="settings">Settings</button>
+      </nav>
+
+      <main class="main">
+        <section class="view active" id="view-dashboard">
+          <div class="grid">
+            <article class="card span-3">
+              <h2>Market Overview</h2>
+              <div class="kpi-row" id="market-overview"></div>
+              <p class="muted" id="market-data-note"></p>
+            </article>
+
+            <article class="card span-3">
+              <h2>System</h2>
+              <div class="kv" id="system-panel"></div>
+            </article>
+
+            <article class="card span-3">
+              <h2>Capital</h2>
+              <div class="kv" id="capital-panel"></div>
+            </article>
+
+            <article class="card span-3">
+              <h2>AI / CEO Decision</h2>
+              <div id="ceo-panel"></div>
+            </article>
+
+            <article class="card span-2">
+              <h2>Option Chain / Selected Contract</h2>
+              <div id="option-panel-dash"></div>
+            </article>
+
+            <article class="card span-4">
+              <h2>Paper Positions</h2>
+              <div id="positions-panel"></div>
+            </article>
+
+            <article class="card span-3 risk-card">
+              <h2>Risk &amp; Capital</h2>
+              <div class="risk-status" id="risk-status"></div>
+              <div class="kv" id="risk-panel"></div>
+            </article>
+          </div>
+        </section>
+
+        <section class="view" id="view-positions">
+          <article class="card">
+            <h2>Paper Positions</h2>
+            <div id="positions-page"></div>
+          </article>
+        </section>
+
+        <section class="view" id="view-option-chain">
+          <article class="card">
+            <h2>Option Chain</h2>
+            <div id="option-page"></div>
+          </article>
+        </section>
+
+        <section class="view" id="view-signals">
+          <article class="card">
+            <h2>Signals</h2>
+            <div id="signals-page"></div>
+          </article>
+        </section>
+
+        <section class="view" id="view-agents">
+          <article class="card">
+            <h2>AI Agents</h2>
+            <div id="agents-page"></div>
+          </article>
+        </section>
+
+        <section class="view" id="view-risk">
+          <article class="card risk-card">
+            <h2>Risk Guard</h2>
+            <div class="risk-status" id="risk-status-page"></div>
+            <div class="kv" id="risk-page"></div>
+          </article>
+        </section>
+
+        <section class="view" id="view-research">
+          <article class="card">
+            <h2>Research</h2>
+            <div id="research-page"></div>
+          </article>
+        </section>
+
+        <section class="view" id="view-settings">
+          <article class="card">
+            <h2>Zerodha market data</h2>
+            <p class="muted">
+              Enter API key + secret once. They auto-save in this browser and on this PC
+              when you Connect. Quotes / ticks only — no orders. Live trading stays disabled.
+            </p>
+            <div class="kv" id="zerodha-status"></div>
+            <div class="cred-form" id="zerodha-cred-form">
+              <label class="field">
+                <span>API key</span>
+                <input type="password" id="zerodha-api-key" name="api_key"
+                       placeholder="API key (remembered in this browser)"
+                       spellcheck="false" autocomplete="off" />
+              </label>
+              <label class="field">
+                <span>API secret</span>
+                <input type="password" id="zerodha-api-secret" name="api_secret"
+                       placeholder="API secret (remembered in this browser)"
+                       spellcheck="false" autocomplete="off" />
+              </label>
+              <p class="muted" id="zerodha-save-msg"></p>
+            </div>
+            <div class="actions" id="zerodha-actions"></div>
+            <p class="muted" id="zerodha-message"></p>
+            <p class="muted">
+              Redirect URI must be
+              <code>http://127.0.0.1:8765/auth/zerodha/callback</code>.
+              Daily access tokens expire — Connect again when status is DISCONNECTED.
+            </p>
+          </article>
+          <article class="card">
+            <h2>Settings</h2>
+            <p class="muted">Trading controls remain view-only. There is no control to enable live trading.</p>
+            <pre class="code" id="settings-page"></pre>
+          </article>
+        </section>
+      </main>
+    </div>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

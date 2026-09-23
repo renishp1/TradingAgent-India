@@ -1,7 +1,9 @@
 """Phase 8 — campaign paper config helpers.
 
 Applies the campaign paper profile without mutating global YAML defaults.
-LivePaperLoop remains available; this path targets PaperExecutionEngine only.
+Default YAML now ships with INDIA_INDEX_OPTIONS_PAPER_10K values; this helper
+still re-applies the named profile + conservative fills for explicit campaign
+runners. LivePaperLoop remains available; this path targets PaperExecutionEngine only.
 """
 
 from __future__ import annotations

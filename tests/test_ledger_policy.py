@@ -11,13 +11,13 @@ from grow.market.research import MarketResearch
 from grow.paper.ledger import PaperBook, PaperLedger, Position
 from grow.types import Intent, Regime, Side, Symbol, TradeProposal, Venue
 
-from tests.helpers import make_guard
+from tests.helpers import make_guard, research_fixture_config
 
 
 class LedgerPolicyTests(unittest.TestCase):
     def setUp(self) -> None:
         self.clock = FrozenClock(datetime(2026, 9, 21, 11, 0, tzinfo=IST))
-        self.config = load_config()
+        self.config = research_fixture_config()
         self.guard = make_guard(self.config, clock=self.clock)
         self.ledger = PaperLedger(self.config, self.guard, clock=self.clock)
 

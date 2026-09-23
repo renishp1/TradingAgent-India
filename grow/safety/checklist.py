@@ -456,14 +456,31 @@ def run_production_safety_checklist(
             )
         )
 
-    # Default YAML still ₹10L — campaign path applies ₹10K profile explicitly
+    # Default YAML now ships ₹10K — campaign helper re-asserts the named profile.
     default_cfg = load_config()
-    if default_cfg.paper.starting_cash != 10_000:
+    if default_cfg.paper.starting_cash == 10_000 and cfg.paper.starting_cash == 10_000:
+        items.append(
+            _pass(
+                "default_yaml_vs_campaign_profile",
+                "Default YAML and campaign_paper_config both use ₹10K INDIA_INDEX_OPTIONS_PAPER_10K",
+                f"default starting_cash={default_cfg.paper.starting_cash}; "
+                f"capital_profile={default_cfg.paper.capital_profile}; campaign={cfg.paper.starting_cash}",
+            )
+        )
+    elif default_cfg.paper.starting_cash != 10_000:
         items.append(
             _pass(
                 "default_yaml_vs_campaign_profile",
                 "Default YAML is not ₹10K; campaign_paper_config applies profile explicitly (by design)",
                 f"default starting_cash={default_cfg.paper.starting_cash}; campaign={cfg.paper.starting_cash}",
+            )
+        )
+    else:
+        items.append(
+            _fail(
+                "default_yaml_vs_campaign_profile",
+                "campaign profile does not match ₹10K operator default",
+                f"default={default_cfg.paper.starting_cash} campaign={cfg.paper.starting_cash}",
             )
         )
 

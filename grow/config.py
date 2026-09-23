@@ -13,7 +13,11 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from grow.errors import GrowConfigError, GrowLiveTradingDisabled
-from grow.execution.lock import inspect_environment, normalize_execution_mode
+from grow.execution.lock import (
+    inspect_environment,
+    normalize_execution_mode,
+    scrub_broker_credentials_for_paper,
+)
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "configs" / "grow.default.yaml"
 
@@ -181,6 +185,9 @@ PAPER_CAPITAL_PROFILES: dict[str, dict[str, float | int]] = {
         "max_daily_loss": 2_000,
         "max_per_trade_risk": 1_000,
         "max_open_positions": 2,
+        # ₹10K books cannot keep a 35% cash-era concentration cap — one option
+        # premium routinely exceeds it. Position count + per-trade risk remain.
+        "max_symbol_concentration": 0.85,
     },
 }
 
@@ -193,6 +200,13 @@ def apply_paper_capital_profile(config: "GrowConfig", profile_name: str) -> "Gro
     if key not in PAPER_CAPITAL_PROFILES:
         raise GrowConfigError(f"Unknown paper capital profile {profile_name!r}")
     body = PAPER_CAPITAL_PROFILES[key]
+    risk_kwargs: dict[str, float | int] = {
+        "max_daily_loss": float(body["max_daily_loss"]),
+        "max_per_trade_risk": float(body["max_per_trade_risk"]),
+        "max_open_positions": int(body["max_open_positions"]),
+    }
+    if "max_symbol_concentration" in body:
+        risk_kwargs["max_symbol_concentration"] = float(body["max_symbol_concentration"])
     return replace(
         config,
         paper=replace(
@@ -202,9 +216,7 @@ def apply_paper_capital_profile(config: "GrowConfig", profile_name: str) -> "Gro
         ),
         risk=replace(
             config.risk,
-            max_daily_loss=float(body["max_daily_loss"]),
-            max_per_trade_risk=float(body["max_per_trade_risk"]),
-            max_open_positions=int(body["max_open_positions"]),
+            **risk_kwargs,
         ),
     )
 
@@ -834,7 +846,7 @@ def _build(raw: dict[str, Any], source_path: str) -> GrowConfig:
         risk=RiskConfig(
             max_position_notional=_as_float(risk.get("max_position_notional", 100000), "max_position_notional"),
             max_gross_notional=_as_float(risk.get("max_gross_notional", 300000), "max_gross_notional"),
-            max_daily_loss=_as_float(risk.get("max_daily_loss", 15000), "max_daily_loss"),
+            max_daily_loss=_as_float(risk.get("max_daily_loss", 2_000), "max_daily_loss"),
             require_stop_loss=_as_bool(risk.get("require_stop_loss", True), "require_stop_loss"),
             max_symbol_concentration=_as_float(
                 risk.get("max_symbol_concentration", 0.35), "max_symbol_concentration"
@@ -848,7 +860,7 @@ def _build(raw: dict[str, Any], source_path: str) -> GrowConfig:
             ),
         ),
         paper=PaperConfig(
-            starting_cash=_as_float(paper.get("starting_cash", 1_000_000), "starting_cash"),
+            starting_cash=_as_float(paper.get("starting_cash", 10_000), "starting_cash"),
             venue_id=str(paper.get("venue_id", "GROW_PAPER")),
             fill_model=str(paper.get("fill_model", "deterministic")).strip().lower(),
             entry_price_source=str(paper.get("entry_price_source", "LTP")).strip().upper(),
@@ -908,14 +920,57 @@ def _build(raw: dict[str, Any], source_path: str) -> GrowConfig:
     return config
 
 
+def apply_dotenv(path: str | Path | None = None) -> Path | None:
+    """Load KEY=VALUE pairs from a .env file into os.environ for unset keys.
+
+    Existing process environment always wins. Returns the path loaded, or None.
+    """
+    candidates: list[Path] = []
+    if path is not None:
+        candidates.append(Path(path))
+    else:
+        candidates.append(Path.cwd() / ".env")
+        candidates.append(Path(__file__).resolve().parents[1] / ".env")
+    env_path = next((p for p in candidates if p.is_file()), None)
+    if env_path is None:
+        return None
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        os.environ[key] = value
+    return env_path
+
+
 def load_config(
     path: str | Path | None = None,
     environ: dict[str, str] | None = None,
+    *,
+    scrub_broker_credentials: bool = True,
 ) -> GrowConfig:
+    """Load Grow config. Paper boot scrubs broker tokens from the inspect environ by default.
+
+    Pass ``scrub_broker_credentials=False`` only when intentionally verifying that
+    credential presence refuses boot (tests) or when a caller already prepared a
+    scrubbed mapping. Live-trading flags are never scrubbed and still refuse boot.
+    Smoke scripts that need Kite secrets should read them from the raw process
+    environ (or ``.env``) after config load — they are not deleted from ``os.environ``.
+    """
+    if environ is None:
+        apply_dotenv()
     env = dict(os.environ if environ is None else environ)
-    inspect_environment(env.items())
+    inspect_env = scrub_broker_credentials_for_paper(env) if scrub_broker_credentials else env
+    inspect_environment(inspect_env.items())
     config_path = Path(path) if path is not None else DEFAULT_CONFIG_PATH
     text = config_path.read_text(encoding="utf-8")
     raw = parse_simple_yaml(text)
-    raw = _overlay_env(raw, env)
+    # Overlay uses the scrubbed mapping so broker tokens cannot affect YAML overlays.
+    raw = _overlay_env(raw, inspect_env)
     return _build(raw, str(config_path))

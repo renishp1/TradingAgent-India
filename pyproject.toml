@@ -21,16 +21,28 @@ classifiers = [
     "Topic :: Office/Business :: Financial :: Investment",
     "Private :: Do Not Upload",
 ]
-dependencies = ["websocket-client>=1.8.0"]
+dependencies = [
+    "websocket-client>=1.8.0",
+    # Windows (and some minimal Linux images) need IANA tz data for ZoneInfo.
+    "tzdata>=2024.1",
+    # Phase 1 read-only paper dashboard (no broker / live trading).
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "httpx>=0.27.0",
+]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "httpx>=0.27.0"]
 
 [project.scripts]
 grow-paper-cycle = "scripts.run_paper_cycle:main"
+grow-dashboard = "scripts.run_dashboard:main"
 
 [tool.setuptools.packages.find]
 include = ["grow*", "tradingagents*"]
+
+[tool.setuptools.package-data]
+"grow.dashboard" = ["static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -65,27 +65,86 @@ TradingAgent-India/
 │   ├── data/               # 2A fixture OHLCV (no live feed)
 │   ├── learning/           # interface only
 │   ├── model_gateway/
-│   └── dashboard/          # snapshot schema
+│   └── dashboard/          # snapshot schema + Phase 1 read-only web UI
 ├── tests/
 ├── docs/
 ├── configs/
-└── scripts/run_paper_cycle.py
+├── scripts/run_paper_cycle.py
+└── scripts/run_dashboard.py
 ```
 
 ## Quick start
 
-Python 3.10+. The paper core is stdlib. The Zerodha market-data smoke declares `websocket-client` and does not import a broker order client.
+Python 3.10+. The paper core is mostly stdlib. Dependencies include `websocket-client`
+and `tzdata` (required on Windows for `Asia/Kolkata`).
+
+Operator-facing paper defaults are **₹10,000 capital / ₹2,000 max daily loss /
+₹1,000 max risk per trade / 2 open positions** (`INDIA_INDEX_OPTIONS_PAPER_10K`
+in [`configs/grow.default.yaml`](configs/grow.default.yaml)).
 
 ```bash
+python -m venv .venv
+# Windows: .venv\Scripts\activate
+# macOS/Linux: source .venv/bin/activate
 python -m pip install -e .
 python -m unittest discover -s tests -v
-export GROW_RISK_SECRET=$(python -c "import secrets; print(secrets.token_hex(32))")
+python scripts/bootstrap_env.py
+# Prefer the options campaign path for paper sessions:
+python scripts/run_paper_campaign.py
+# Legacy M1 cash probe (not options):
 python scripts/run_paper_cycle.py RELIANCE
 ```
 
-Copy `.env.example` only if you need env overlays. Leave live flags false.
+### Paper runtime paths (do not conflate)
+
+| Path | Entry | Role |
+| --- | --- | --- |
+| **Campaign (canonical options paper)** | `CampaignRunner` / `scripts/run_paper_campaign.py` / `run_paper_session.py` | 4B specialists (incl. `CampaignOptionsAgent`) → DecisionEngine + CEO gate → RiskGuard → `PaperExecutionEngine` |
+| **LivePaperLoop (legacy 3A)** | `grow.live_data.loop.LivePaperLoop` | StrategyEngine → IndexOptionsEngine → ResearchOrchestrator/`CEOAgent` → RiskGuard → PaperLedger |
+| **GrowRuntime (M1 cash probe)** | `scripts/run_paper_cycle.py` | Stub market → cash `CEO` → RiskGuard → PaperLedger (not index options) |
+
+UI and operator docs should describe the **campaign** path. The other two remain supported for research/legacy tests.
+
+### Paper dashboard (Phase 1, read-only)
+
+Browser console for paper mode. No buy/sell controls. No live trading toggle.
+Does not require Zerodha credentials. Cannot enable live trading.
+
+`load_config()` **scrubs** `KITE_*` / broker token keys from the boot *inspect*
+environ by default so a local `.env` used for Zerodha market-data smoke does
+not block paper or dashboard startup. Live-trading **flags** still refuse boot.
+Smoke scripts still read secrets from the process environ after config load.
+
+```bash
+# Windows
+.venv\Scripts\python.exe -m pip install -e .
+.venv\Scripts\python.exe scripts\run_dashboard.py
+
+# macOS / Linux
+.venv/bin/python -m pip install -e .
+.venv/bin/python scripts/run_dashboard.py
+```
+
+Open [http://127.0.0.1:8765/](http://127.0.0.1:8765/).
+
+API (GET only): `/api/health`, `/api/dashboard`, `/api/config`, `/api/positions`,
+`/api/risk`, `/api/agents`, `/api/safety`.
+
+Optional read-only checkpoint display:
+
+```bash
+.venv\Scripts\python.exe scripts\run_dashboard.py --checkpoint results\paper_checkpoint.json
+```
+
+`bootstrap_env.py` writes a private `.env` (gitignored) with `GROW_RISK_SECRET`.
+`load_config` reads `.env` for unset keys only. Leave live flags false.
+If your `.env` still has `GROW_STARTING_CASH=1000000` from an older bootstrap,
+update it to `10000` (or remove the key) so it matches the YAML ₹10K default.
 `GROW_RISK_SECRET` is required for any process that mints a RiskStamp.
 Tests inject their own secret and do not read a default.
+
+On Windows, if `python` opens the Store, use the venv interpreter explicitly:
+`.venv\Scripts\python.exe`.
 
 
 ## Safety

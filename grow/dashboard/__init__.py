@@ -1,7 +1,7 @@
-"""Dashboard snapshot schema.
+"""Dashboard snapshot schema and Phase 1 read-only web console.
 
-Milestone 1 does not ship a web server. This module is the contract a later
-console can consume. The Grok architecture console mirrors the same fields.
+``lock_status`` / ``snapshot`` remain the programmatic contract.
+``grow.dashboard.app`` serves the browser UI (FastAPI + static assets).
 """
 
 from __future__ import annotations
@@ -59,4 +59,3 @@ def provider_evaluation_view(store=None, result=None) -> dict[str, Any]:
         "public_candidates": [c.to_dict() for c in PUBLIC_CANDIDATES],
         "checks": [c.to_dict() for c in evaluation.checks],
     }
-

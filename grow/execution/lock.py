@@ -9,12 +9,18 @@ Three independent layers, all fail-closed:
 There is no code path that sets LIVE_TRADING_COMPILED to True in milestone 1.
 Environment variables cannot override the constant. Broker SDKs are not
 imported anywhere in this tree.
+
+Paper boot (``load_config`` default) scrubs broker credential keys from the
+*inspect* environ so a local ``.env`` used for Zerodha market-data smoke does
+not block paper/dashboard startup. Live-trading flags still refuse boot.
+``inspect_environment`` itself still rejects credential presence when those
+keys remain in the environ under inspection (tests / intentional checks).
 """
 
 from __future__ import annotations
 
 import os
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from grow.errors import GrowLiveTradingDisabled
 
@@ -31,6 +37,31 @@ _FORBIDDEN_ENV = (
     "UPSTOX_ACCESS_TOKEN",
     "DHAN_ACCESS_TOKEN",
 )
+
+# Dropped from paper boot inspect environ only. Never enables live trading.
+# Smoke / live-proof scripts read secrets from the raw process environ or an
+# explicit mapping after paper config has loaded.
+BROKER_BOOT_KEYS = (
+    "KITE_API_KEY",
+    "KITE_ACCESS_TOKEN",
+    "UPSTOX_ACCESS_TOKEN",
+    "DHAN_ACCESS_TOKEN",
+    "BROKER_API_KEY",
+)
+
+
+def scrub_broker_credentials_for_paper(
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Return a copy of environ without broker credential keys.
+
+    Does not mutate ``os.environ``. Live-trading *flags* are left intact so
+    ``inspect_environment`` still refuses ``GROW_LIVE_TRADING=true``.
+    """
+    env = dict(os.environ if environ is None else environ)
+    for key in BROKER_BOOT_KEYS:
+        env.pop(key, None)
+    return env
 
 
 def assert_paper_compiled() -> None:

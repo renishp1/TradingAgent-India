@@ -196,10 +196,8 @@ class Phase11LockBackendTests(unittest.TestCase):
             self.assertGreaterEqual(len(calls), 2)  # lock + unlock
         if saved_fcntl is not None:
             sys.modules["fcntl"] = saved_fcntl
-        elif "fcntl" not in sys.modules:
-            import fcntl as _fcntl  # noqa: F401 — restore for later POSIX tests
-
-            sys.modules["fcntl"] = _fcntl
+        # On Windows, fcntl is unavailable; leave it absent. POSIX hosts that
+        # never had it cached will import on demand in the fcntl backend path.
 
     def test_posix_backend_is_exercised_on_this_host(self) -> None:
         if filesystem_lock_backend() != "fcntl":

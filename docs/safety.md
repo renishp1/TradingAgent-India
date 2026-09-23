@@ -11,8 +11,17 @@ setting.
 2. **Boot-time.** `load_config()` and `inspect_environment()` reject:
    - `GROW_EXECUTION_MODE` other than `paper`
    - `GROW_LIVE_TRADING` / `LIVE_TRADING_ENABLED` truthy
-   - broker token env vars (`KITE_ACCESS_TOKEN`, …)
+   - broker token env vars (`KITE_ACCESS_TOKEN`, …) when present in the
+     *inspect* environ
    - `execution.live_trading_enabled: true` in YAML
+
+   Paper boot **scrubs** broker credential keys from the inspect environ by
+   default (`scrub_broker_credentials=True` on `load_config`, helper
+   `scrub_broker_credentials_for_paper`). That lets a local `.env` hold Kite
+   smoke credentials without blocking paper/dashboard startup. Live-trading
+   flags are never scrubbed. Pass `scrub_broker_credentials=False` only for
+   intentional credential-presence checks. Smoke scripts read secrets from
+   the raw process environ after config load.
 3. **Runtime.** `assert_paper_runtime` runs before every fill. The `Venue`
    enum has a single member: `PAPER`. `LiveBroker` and `place_live_order`
    exist only to raise `GrowLiveTradingDisabled`.

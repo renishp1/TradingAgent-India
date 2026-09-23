@@ -31,23 +31,25 @@ grow:
   risk:
     max_position_notional: 100000
     max_gross_notional: 300000
-    max_daily_loss: 15000
+    max_daily_loss: 2000
     require_stop_loss: true
-    max_symbol_concentration: 0.35
+    max_symbol_concentration: 0.85
     ruleset: "grow.risk.v1"
     allow_short: false
     concentration_basis: cost_notional
+    max_open_positions: 2
+    max_per_trade_risk: 1000
 
   paper:
-    starting_cash: 1000000
+    starting_cash: 10000
     venue_id: GROW_PAPER
     fill_model: deterministic
     entry_price_source: LTP
     exit_price_source: BID
-    # Optional named modes: conservative | midpoint | ltp (ltp is research/test only).
-    # price_mode: conservative
-    # Optional named capital profile: INDIA_INDEX_OPTIONS_PAPER_10K (apply via apply_paper_capital_profile).
-    # capital_profile: INDIA_INDEX_OPTIONS_PAPER_10K
+    # Operator-facing India index options paper defaults (₹10K / ₹2K / ₹1K / 2).
+    capital_profile: INDIA_INDEX_OPTIONS_PAPER_10K
+    # conservative | midpoint | ltp (ltp is research/test only).
+    price_mode: conservative
 
   model:
     provider: mock

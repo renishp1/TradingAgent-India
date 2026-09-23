@@ -8,7 +8,12 @@ from pathlib import Path
 from grow.config import load_config
 from grow.errors import GrowLiveTradingDisabled
 from grow.execution.live import LiveBroker, place_live_order
-from grow.execution.lock import LIVE_TRADING_COMPILED, inspect_environment, normalize_execution_mode
+from grow.execution.lock import (
+    LIVE_TRADING_COMPILED,
+    inspect_environment,
+    normalize_execution_mode,
+    scrub_broker_credentials_for_paper,
+)
 from grow.types import Venue
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +44,40 @@ class PaperLockTests(unittest.TestCase):
             inspect_environment({"GROW_EXECUTION_MODE": "live"})
         with self.assertRaises(GrowLiveTradingDisabled):
             inspect_environment({"KITE_ACCESS_TOKEN": "abc"})
+
+    def test_paper_load_config_scrubs_broker_credentials(self) -> None:
+        """Kite keys in environ must not block default paper load_config."""
+        config = load_config(
+            environ={
+                "GROW_EXECUTION_MODE": "paper",
+                "KITE_ACCESS_TOKEN": "smoke-only-token",
+                "KITE_API_KEY": "smoke-only-key",
+            }
+        )
+        self.assertEqual(config.execution.mode, "paper")
+        self.assertFalse(config.execution.live_trading_enabled)
+
+    def test_scrub_helper_drops_broker_keys_keeps_live_flags(self) -> None:
+        scrubbed = scrub_broker_credentials_for_paper(
+            {
+                "KITE_ACCESS_TOKEN": "x",
+                "KITE_API_KEY": "y",
+                "GROW_LIVE_TRADING": "true",
+                "GROW_EXECUTION_MODE": "paper",
+            }
+        )
+        self.assertNotIn("KITE_ACCESS_TOKEN", scrubbed)
+        self.assertNotIn("KITE_API_KEY", scrubbed)
+        self.assertEqual(scrubbed["GROW_LIVE_TRADING"], "true")
+        with self.assertRaises(GrowLiveTradingDisabled):
+            inspect_environment(scrubbed)
+
+    def test_unscrubbed_load_config_still_refuses_broker_token(self) -> None:
+        with self.assertRaises(GrowLiveTradingDisabled):
+            load_config(
+                environ={"KITE_ACCESS_TOKEN": "abc"},
+                scrub_broker_credentials=False,
+            )
 
     def test_config_live_flag_refuses_boot(self) -> None:
         with self.assertRaises(GrowLiveTradingDisabled):

@@ -1,11 +1,14 @@
 """Phase-4/7 Decision Engine — BUY_CE / BUY_PE / NO_TRADE with campaign signal.
 
 Wraps ``DecisionIntegrator`` so Risk Guard remains the final safety authority.
-Phase 7 evaluates ``SignalEngine`` for explained supporting/counter-evidence, then
-attaches the ``CampaignSignal`` to the integrator decision.
+Policy selection is followed by a deterministic campaign CEO gate (bull→CE /
+bear→PE), then Risk Guard. Phase 7 evaluates ``SignalEngine`` for explained
+supporting/counter-evidence, then attaches the ``CampaignSignal`` to the
+integrator decision.
 
 Order of authority:
-1. DecisionIntegrator + Risk Guard produce the authoritative decision.
+1. DecisionIntegrator policy + campaign CEO gate + Risk Guard produce the
+   authoritative decision.
 2. SignalEngine explains intent; it is never an execution authority.
 3. No paper fills and no broker order path live here.
 """

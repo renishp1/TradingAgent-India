@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Any
 
 from grow.agents.base import SpecialistAgent
+from grow.agents.campaign_options import CampaignOptionsAgent
 from grow.agents.market_data import MarketDataAgent
 from grow.agents.options import OptionsChainAgent
 from grow.agents.regime import RegimeAgent
@@ -48,6 +49,10 @@ class AnalysisOrchestrator:
 
     Dispatch (concurrent, bounded wait) → validate → conflict-preserving
     aggregate → optional replay. Paper-only; no broker order path.
+
+    Default specialists include ``CampaignOptionsAgent``, which may emit a
+    buyer-only ``PAPER_OPEN`` after chain filter + DTE scoring. Risk Guard
+    (via DecisionEngine) remains the only execution authority.
     """
 
     def __init__(
@@ -70,6 +75,7 @@ class AnalysisOrchestrator:
                 OptionsChainAgent(),
                 RegimeAgent(),
                 StrategyResearchAgent(configured_strategies),
+                CampaignOptionsAgent(),
             )
         self.specialists = specialists
 
