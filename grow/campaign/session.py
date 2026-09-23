@@ -139,6 +139,10 @@ class PaperSessionRunner:
     def cycles(self) -> tuple[CampaignCycleResult, ...]:
         return tuple(self._cycles)
 
+    @property
+    def monitor_events(self) -> tuple[dict[str, Any], ...]:
+        return tuple(dict(row) for row in self._monitor_events)
+
     def start(self) -> str:
         """Begin a paper-only session. Lifecycle: CREATED → RUNNING → ENDED.
 
