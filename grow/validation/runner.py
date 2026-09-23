@@ -39,6 +39,7 @@ class WalkForwardValidationResult:
     artifacts: dict[str, str]
     combined_test_net: float
     leakage_status: str
+    evaluation_label: str = "FIXTURE"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -52,6 +53,7 @@ class WalkForwardValidationResult:
             "artifacts": dict(self.artifacts),
             "combined_test_net": self.combined_test_net,
             "leakage_status": self.leakage_status,
+            "evaluation_label": self.evaluation_label,
             "live": False,
             "broker_order_path": False,
             "label": "WALK-FORWARD VALIDATION / NOT LIVE",
@@ -73,6 +75,7 @@ class WalkForwardValidationRunner:
         provider_name: str = "fixture",
         artifact_store: ArtifactStore | None = None,
         listed_contracts: dict[str, Any] | None = None,
+        evaluation_label: str = "FIXTURE",
     ) -> None:
         self.config = config or load_config()
         self.config.assert_safe()
@@ -83,6 +86,7 @@ class WalkForwardValidationRunner:
         self.dataset_version = dataset_version
         self.dataset_fingerprint = dataset_fingerprint
         self.provider_name = provider_name
+        self.evaluation_label = evaluation_label
         self.artifacts = artifact_store or ArtifactStore()
         self.listed_contracts = listed_contracts
         self.frozen = freeze_config(self.config)
@@ -226,6 +230,7 @@ class WalkForwardValidationRunner:
             artifacts=refs,
             combined_test_net=combined,
             leakage_status=leakage_status,
+            evaluation_label=self.evaluation_label,
         )
 
     def replay_deterministic(
