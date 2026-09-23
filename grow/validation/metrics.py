@@ -53,6 +53,11 @@ def calculate_metrics(
     loss_sum = abs(sum(float(t["net_pnl"]) for t in losses))
     avg_win = (win_sum / len(wins)) if wins else 0.0
     avg_loss = (loss_sum / len(losses)) if losses else 0.0
+    trade_n = len(trades)
+    average_trade = (net / trade_n) if trade_n else 0.0
+    win_rate = (len(wins) / trade_n) if trade_n else 0.0
+    loss_rate = (len(losses) / trade_n) if trade_n else 0.0
+    expectancy = average_trade
     profit_factor = (win_sum / loss_sum) if loss_sum else (None if not win_sum else None)
     if loss_sum and win_sum:
         profit_factor = round(win_sum / loss_sum, 4)
@@ -61,7 +66,9 @@ def calculate_metrics(
     no_trade = sum(1 for d in decisions if d.get("status") in {"NO_TRADE", "no_trade"})
     executed = sum(1 for d in decisions if d.get("status") in {"FILL", "FILLED", "EXECUTED", "CANDIDATE_FILLED"})
     decision_n = len(decisions)
-    trade_n = len(trades)
+    spread_cost = round(sum(float(t.get("spread_cost", 0)) for t in trades), 4)
+    slippage = round(sum(float(t.get("slippage", t.get("slippage_cost", 0))) for t in trades), 4)
+    charges = round(sum(float(t.get("charges", t.get("fees", 0))) for t in trades), 4)
     returns = []
     prev = starting_cash
     for value in equity[1:] if equity else []:
@@ -85,10 +92,17 @@ def calculate_metrics(
         "net_pnl": net,
         "win_count": len(wins),
         "loss_count": len(losses),
+        "win_rate": round(win_rate, 4),
+        "loss_rate": round(loss_rate, 4),
         "average_win": round(avg_win, 4),
         "average_loss": round(avg_loss, 4),
+        "average_trade": round(average_trade, 4),
+        "expectancy": round(expectancy, 4),
         "profit_factor": profit_factor,
         "max_drawdown": _drawdown(list(equity) if equity else [starting_cash]),
+        "slippage": slippage,
+        "spread_cost": spread_cost,
+        "charges": charges if charges else costs,
         "daily_loss_limit_breaches": daily_loss_breaches,
         "per_trade_risk_breaches": per_trade_risk_breaches,
         "exposure_notional": round(exposure_notional, 4),
