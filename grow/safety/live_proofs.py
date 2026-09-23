@@ -124,14 +124,41 @@ def _quote_usable(quote: Mapping[str, Any], *, option_type: str) -> bool:
     return True
 
 
-def _evidence_quote(quote: Mapping[str, Any]) -> str:
+def _quote_matches_selected(quote: Mapping[str, Any], selected: Any) -> bool:
+    """Require the tick to be the exact selected contract (token preferred)."""
+    if selected is None:
+        return False
+    token = str(quote.get("provider_symbol_id") or "").strip()
+    if token and token == str(selected.instrument_token):
+        return True
+    symbol = str(quote.get("provider_symbol") or "").strip()
+    if symbol and symbol == str(selected.tradingsymbol):
+        return True
+    return False
+
+
+def _quote_fingerprint(quote: Mapping[str, Any]) -> tuple[str, ...]:
+    return (
+        str(quote.get("provider_symbol_id") or ""),
+        str(quote.get("provider_symbol") or quote.get("canonical_id") or ""),
+        str(quote.get("quote_timestamp") or quote.get("ts") or ""),
+        str(quote.get("ltp")),
+        str(quote.get("bid")),
+        str(quote.get("ask")),
+        str(quote.get("option_type") or ""),
+    )
+
+
+def _evidence_quote(quote: Mapping[str, Any], *, selected: Any | None = None) -> str:
     parts = [
+        f"selected_contract={getattr(selected, 'tradingsymbol', None)}",
+        f"selected_token={getattr(selected, 'instrument_token', None)}",
+        f"received_contract={quote.get('provider_symbol') or quote.get('canonical_id')}",
+        f"received_token={quote.get('provider_symbol_id')}",
         f"underlying={quote.get('underlying')}",
         f"option_type={quote.get('option_type')}",
         f"expiry={quote.get('expiry')}",
         f"strike={quote.get('strike')}",
-        f"symbol={quote.get('provider_symbol') or quote.get('canonical_id')}",
-        f"token={quote.get('provider_symbol_id')}",
         f"ltp={quote.get('ltp')}",
         f"bid={quote.get('bid')}",
         f"ask={quote.get('ask')}",
@@ -187,9 +214,16 @@ def _poll_quotes(
     return accepted
 
 
-def _find_side(quotes: Sequence[Mapping[str, Any]], option_type: str) -> dict[str, Any] | None:
+def _find_selected_quote(
+    quotes: Sequence[Mapping[str, Any]],
+    *,
+    selected: Any,
+    option_type: str,
+) -> dict[str, Any] | None:
     for quote in quotes:
-        if _quote_usable(quote, option_type=option_type):
+        if not _quote_usable(quote, option_type=option_type):
+            continue
+        if _quote_matches_selected(quote, selected):
             return dict(quote)
     return None
 
@@ -208,17 +242,34 @@ def _prove_side_tick(
             f"No live {option_type} contract selected after authenticate/subscribe",
             f"selected_{option_type.lower()}=None",
         )
-    quote = _find_side(quotes, option_type)
+    quote = _find_selected_quote(quotes, selected=selected, option_type=option_type)
     if quote is None:
+        # Distinguish "no tick" vs "wrong contract tick".
+        same_side = [
+            row
+            for row in quotes
+            if _quote_usable(row, option_type=option_type) and not _quote_matches_selected(row, selected)
+        ]
+        if same_side:
+            other = same_side[0]
+            return _fail(
+                item_id,
+                f"Live {option_type} tick did not match selected contract",
+                (
+                    f"selected_contract={selected.tradingsymbol} selected_token={selected.instrument_token} "
+                    f"received_contract={other.get('provider_symbol') or other.get('canonical_id')} "
+                    f"received_token={other.get('provider_symbol_id')}"
+                ),
+            )
         return _fail(
             item_id,
-            f"Authenticated session did not yield a usable live {option_type} tick",
-            f"contract={selected.tradingsymbol} token={selected.instrument_token}",
+            f"Authenticated session did not yield a usable live {option_type} tick for selected contract",
+            f"selected_contract={selected.tradingsymbol} selected_token={selected.instrument_token}",
         )
     return _pass(
         item_id,
-        f"Received real live {option_type} tick for {quote.get('provider_symbol') or selected.tradingsymbol}",
-        _evidence_quote(quote),
+        f"Received real live {option_type} tick for selected {selected.tradingsymbol}",
+        _evidence_quote(quote, selected=selected),
     )
 
 
@@ -276,17 +327,25 @@ def _prove_websocket_reconnect(
     max_staleness_seconds: int,
     reconnect_wait_seconds: float,
     calendar: SessionCalendar,
+    pre_reconnect_quotes: Sequence[Mapping[str, Any]] = (),
 ) -> LiveProofResult:
     item_id = "websocket_reconnect_live_proof"
     transport = provider.transport
     if transport is None or not getattr(transport, "connected", False):
         return _fail(item_id, "WebSocket transport not connected before reconnect proof", "transport=None")
     before = int(provider.reconnect_count)
+    pre_fps = {_quote_fingerprint(row) for row in pre_reconnect_quotes}
     # Confirm initial data flow already happened (caller supplies prior quotes) via RUNNING/READY.
     if provider.health().state not in {SessionHealth.READY, SessionHealth.RUNNING}:
         return _fail(
             item_id,
             f"Provider not healthy before reconnect (state={provider.health().state.value})",
+            f"reconnect_count={before}",
+        )
+    if not pre_reconnect_quotes:
+        return _fail(
+            item_id,
+            "Reconnect proof requires initial valid live market data before disconnect",
             f"reconnect_count={before}",
         )
     # Force disconnect → FEED_DISCONNECTED → bounded reconnect path.
@@ -297,39 +356,36 @@ def _prove_websocket_reconnect(
     except GrowConfigError as exc:
         if _is_auth_block(str(exc)):
             return _blocked(item_id, f"Reconnect blocked ({exc})", "AUTH_MISSING")
-        # Operational failure during forced disconnect is expected to continue into reconnect;
-        # only hard-stop here if provider is stopped without reconnect.
         if provider.health().state is SessionHealth.STOPPED:
             return _fail(item_id, f"Reconnect aborted ({exc})", str(exc))
     _advance_clock(provider.clock, max(reconnect_wait_seconds, 1.0))
-    resumed: list[dict[str, Any]] = []
+
+    after = before
+    connected = False
+    subscribed: tuple[Any, ...] = ()
+    new_quotes: list[dict[str, Any]] = []
     try:
         for _ in range(max(1, attempts)):
-            raw = provider.poll()
-            if provider.reconnect_count > before and provider.health().state in {
-                SessionHealth.READY,
-                SessionHealth.RUNNING,
-            }:
-                # Drain a post-reconnect quote if available.
-                if isinstance(raw, dict) and raw.get("option_quotes"):
-                    resumed = _poll_quotes(
-                        provider,
-                        attempts=max(1, attempts // 2),
-                        max_staleness_seconds=max_staleness_seconds,
-                        calendar=calendar,
-                    )
-                    break
-                # Even without an immediate quote, resubscribe success counts once we see
-                # additional market data OR a successful RUNNING resubscribe with subscribed tokens.
-                if getattr(transport, "connected", False) and getattr(transport, "subscribed", ()):
-                    resumed = _poll_quotes(
-                        provider,
-                        attempts=max(1, attempts // 2),
-                        max_staleness_seconds=max_staleness_seconds,
-                        calendar=calendar,
-                    )
-                    if resumed or provider.reconnect_count > before:
-                        break
+            provider.poll()
+            after = int(provider.reconnect_count)
+            connected = bool(getattr(transport, "connected", False))
+            subscribed = tuple(getattr(transport, "subscribed", ()) or ())
+            if after <= before or not connected or not subscribed:
+                _advance_clock(provider.clock, 0.05)
+                continue
+            if provider.health().state not in {SessionHealth.READY, SessionHealth.RUNNING}:
+                _advance_clock(provider.clock, 0.05)
+                continue
+            # Only quotes received after reconnect count increases count as post-reconnect.
+            polled = _poll_quotes(
+                provider,
+                attempts=max(1, attempts // 2),
+                max_staleness_seconds=max_staleness_seconds,
+                calendar=calendar,
+            )
+            new_quotes = [row for row in polled if _quote_fingerprint(row) not in pre_fps]
+            if new_quotes:
+                break
             _advance_clock(provider.clock, 0.05)
     except GrowConfigError as exc:
         if _is_auth_block(str(exc)):
@@ -345,27 +401,23 @@ def _prove_websocket_reconnect(
             "Reconnect did not restore websocket subscription",
             f"reconnect_before={before} after={after} connected={connected} subscribed={list(subscribed)}",
         )
-    # Prefer resumed market data; accept resubscribe + healthy state if feed is quiet but connected.
-    if resumed:
-        sample = resumed[0]
-        return _pass(
+    if not new_quotes:
+        return _fail(
             item_id,
-            "WebSocket reconnect restored live market-data flow",
+            "Reconnect restored subscription but no NEW post-reconnect market-data tick arrived",
             (
                 f"reconnect_count={after} subscribed={list(subscribed)} "
-                f"post_reconnect_quote={_evidence_quote(sample)}"
+                f"state={provider.health().state.value} pre_quotes={len(pre_fps)} post_new=0"
             ),
         )
-    if provider.health().state in {SessionHealth.READY, SessionHealth.RUNNING}:
-        return _pass(
-            item_id,
-            "WebSocket reconnect resubscribed and resumed healthy session",
-            f"reconnect_count={after} subscribed={list(subscribed)} state={provider.health().state.value}",
-        )
-    return _fail(
+    sample = new_quotes[0]
+    return _pass(
         item_id,
-        "Reconnect completed without healthy market-data session",
-        f"reconnect_count={after} state={provider.health().state.value}",
+        "WebSocket reconnect restored live market-data flow with new post-reconnect tick",
+        (
+            f"reconnect_count={after} subscribed={list(subscribed)} "
+            f"post_reconnect_quote={_evidence_quote(sample)}"
+        ),
     )
 
 
@@ -481,17 +533,21 @@ def run_zerodha_live_proofs(
             max_staleness_seconds=staleness,
             calendar=calendar,
         )
-        # Ensure CE+PE opportunity: poll a bit more if only one side so far.
-        if _find_side(quotes, "CE") is None or _find_side(quotes, "PE") is None:
+        # Ensure CE+PE opportunity for the selected contracts.
+        need_more = (
+            _find_selected_quote(quotes, selected=provider.selected, option_type="CE") is None
+            or _find_selected_quote(quotes, selected=provider.selected_put, option_type="PE") is None
+        )
+        if need_more:
             more = _poll_quotes(
                 provider,
                 attempts=hooks.poll_attempts,
                 max_staleness_seconds=staleness,
                 calendar=calendar,
             )
-            seen = {(q.get("option_type"), q.get("provider_symbol")) for q in quotes}
+            seen = {(q.get("option_type"), q.get("provider_symbol_id"), q.get("provider_symbol")) for q in quotes}
             for row in more:
-                key = (row.get("option_type"), row.get("provider_symbol"))
+                key = (row.get("option_type"), row.get("provider_symbol_id"), row.get("provider_symbol"))
                 if key not in seen:
                     quotes.append(row)
                     seen.add(key)
@@ -516,6 +572,7 @@ def run_zerodha_live_proofs(
             max_staleness_seconds=staleness,
             reconnect_wait_seconds=hooks.reconnect_wait_seconds,
             calendar=calendar,
+            pre_reconnect_quotes=quotes,
         )
         return (ce, pe, reconnect, chain)
     finally:
