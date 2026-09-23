@@ -7,11 +7,12 @@ Paper-only; no broker path; not a third executor.
 
 from __future__ import annotations
 
+import fcntl
 import json
+from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 from grow.campaign.runner import CampaignCycleResult
 from grow.decision.integration.contract import IntegratedDecision
@@ -276,7 +277,12 @@ def pnl_payload_from_position(position: PaperPosition) -> dict[str, Any]:
 
 
 class TradeReplayStore:
-    """Append-only durable store for campaign trade replay records."""
+    """Append-only durable store for campaign trade replay records.
+
+    Durable append-only semantics are enforced under an OS-level exclusive
+    ``fcntl.flock`` on a per-decision lock file so separate processes cannot
+    race on the same ``decision_id``.
+    """
 
     def __init__(self, root: Path | str) -> None:
         self.root = Path(root)
@@ -284,12 +290,47 @@ class TradeReplayStore:
         self._by_id: dict[str, TradeReplayRecord] = {}
         self._load_existing()
 
+    def _safe_id(self, decision_id: str) -> str:
+        return decision_id.replace("/", "_")
+
     def _path_for(self, decision_id: str) -> Path:
-        safe = decision_id.replace("/", "_")
-        return self.root / f"{safe}.json"
+        return self.root / f"{self._safe_id(decision_id)}.json"
+
+    def _lock_path_for(self, decision_id: str) -> Path:
+        return self.root / f".{self._safe_id(decision_id)}.lock"
+
+    @contextmanager
+    def _decision_lock(self, decision_id: str) -> Iterator[None]:
+        """Exclusive cross-process critical section for one decision_id."""
+        lock_path = self._lock_path_for(decision_id)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock_path, "a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def _read_disk(self, decision_id: str) -> TradeReplayRecord | None:
+        path = self._path_for(decision_id)
+        if not path.is_file():
+            return None
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise GrowSafetyError(f"trade replay unreadable: {path}") from exc
+        if not raw.strip():
+            raise GrowSafetyError(f"trade replay empty: {path}")
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise GrowSafetyError(f"trade replay corrupt: {path}") from exc
+        return TradeReplayRecord.from_dict(payload)
 
     def _load_existing(self) -> None:
         for path in sorted(self.root.glob("*.json")):
+            if path.name.startswith("."):
+                continue
             payload = json.loads(path.read_text(encoding="utf-8"))
             record = TradeReplayRecord.from_dict(payload)
             self._by_id[record.decision_id] = record
@@ -301,23 +342,31 @@ class TradeReplayStore:
         return tuple(self._by_id)
 
     def get(self, decision_id: str) -> TradeReplayRecord:
+        # Prefer durable truth when present so a sibling process's write is visible.
+        disk = self._read_disk(decision_id)
+        if disk is not None:
+            self._by_id[decision_id] = disk
+            return disk
         try:
             return self._by_id[decision_id]
         except KeyError as exc:
             raise GrowSafetyError(f"UNKNOWN_REPLAY_DECISION:{decision_id}") from exc
 
     def append(self, record: TradeReplayRecord) -> TradeReplayRecord:
-        existing = self._by_id.get(record.decision_id)
-        if existing is not None:
-            if existing.to_dict() != record.to_dict():
-                raise GrowSafetyError(
-                    f"trade replay is append-only; refusing overwrite of {record.decision_id}"
-                )
-            return existing
-        path = self._path_for(record.decision_id)
-        atomic_write_json(path, record.to_dict())
-        self._by_id[record.decision_id] = record
-        return record
+        """Durable append-only write under an exclusive filesystem lock."""
+        with self._decision_lock(record.decision_id):
+            disk = self._read_disk(record.decision_id)
+            if disk is not None:
+                if disk.to_dict() != record.to_dict():
+                    raise GrowSafetyError(
+                        f"trade replay is append-only; refusing overwrite of {record.decision_id}"
+                    )
+                self._by_id[record.decision_id] = disk
+                return disk
+            path = self._path_for(record.decision_id)
+            atomic_write_json(path, record.to_dict())
+            self._by_id[record.decision_id] = record
+            return record
 
     def record_cycle(
         self,
@@ -327,10 +376,16 @@ class TradeReplayStore:
         book: Mapping[str, Any] | None = None,
     ) -> TradeReplayRecord:
         """Record the first durable row for a decision_id. Later cycles do not overwrite."""
-        existing = self._by_id.get(cycle.decision.decision_id)
-        if existing is not None:
-            return existing
-        return self.append(build_replay_record(cycle, snapshot, book=book))
+        candidate = build_replay_record(cycle, snapshot, book=book)
+        with self._decision_lock(candidate.decision_id):
+            disk = self._read_disk(candidate.decision_id)
+            if disk is not None:
+                # First durable writer wins — later duplicate/reject cycles stay out.
+                self._by_id[candidate.decision_id] = disk
+                return disk
+            atomic_write_json(self._path_for(candidate.decision_id), candidate.to_dict())
+            self._by_id[candidate.decision_id] = candidate
+            return candidate
 
     def attach_exit(
         self,
@@ -338,31 +393,35 @@ class TradeReplayStore:
         *,
         position: PaperPosition,
     ) -> TradeReplayRecord:
-        """Attach exit + P&L once. Refuses conflicting rewrites."""
+        """Attach exit + P&L once under an exclusive filesystem lock."""
         if position.state is not PositionState.CLOSED:
             raise GrowSafetyError("trade replay exit requires a CLOSED position")
-        current = self.get(decision_id)
         exit_row = exit_payload_from_position(position)
         pnl_row = pnl_payload_from_position(position)
-        if current.exit is not None or current.pnl is not None:
-            if current.exit == exit_row and current.pnl == pnl_row:
-                return current
-            raise GrowSafetyError(
-                f"trade replay exit already recorded for {decision_id}; refusing overwrite"
+        with self._decision_lock(decision_id):
+            current = self._read_disk(decision_id)
+            if current is None:
+                raise GrowSafetyError(f"UNKNOWN_REPLAY_DECISION:{decision_id}")
+            if current.exit is not None or current.pnl is not None:
+                if current.exit == exit_row and current.pnl == pnl_row:
+                    self._by_id[decision_id] = current
+                    return current
+                raise GrowSafetyError(
+                    f"trade replay exit already recorded for {decision_id}; refusing overwrite"
+                )
+            fill = dict(current.paper_fill or {})
+            if fill.get("position_id") and fill["position_id"] != position.position_id:
+                raise GrowSafetyError("trade replay exit position_id mismatch")
+            updated = TradeReplayRecord.from_dict(
+                {
+                    **current.to_dict(),
+                    "exit": exit_row,
+                    "pnl": pnl_row,
+                }
             )
-        fill = dict(current.paper_fill or {})
-        if fill.get("position_id") and fill["position_id"] != position.position_id:
-            raise GrowSafetyError("trade replay exit position_id mismatch")
-        updated = TradeReplayRecord.from_dict(
-            {
-                **current.to_dict(),
-                "exit": exit_row,
-                "pnl": pnl_row,
-            }
-        )
-        atomic_write_json(self._path_for(decision_id), updated.to_dict())
-        self._by_id[decision_id] = updated
-        return updated
+            atomic_write_json(self._path_for(decision_id), updated.to_dict())
+            self._by_id[decision_id] = updated
+            return updated
 
 
 def replay_decision(engine: DecisionEngine, decision_id: str) -> IntegratedDecision:

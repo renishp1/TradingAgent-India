@@ -11,12 +11,14 @@ from pathlib import Path
 from grow.campaign import (
     REPLAY_SCHEMA,
     CampaignRunner,
+    TradeReplayRecord,
     TradeReplayStore,
     campaign_paper_config,
     verify_decision_replay,
     verify_paper_fill_replay,
     verify_pnl_replay,
 )
+from grow.campaign.replay import build_replay_record
 from grow.clock import IST, FrozenClock
 from grow.config import load_config
 from grow.decision.contracts.agent_result import AgentResult, AgentStatus, CandidateAction
@@ -188,9 +190,8 @@ class Phase11TradeReplayTests(unittest.TestCase):
             self.assertFalse(again.execution.accepted)
             # Identical re-append is idempotent; conflicting overwrite fails closed.
             same = store.get(cycle.decision.decision_id)
-            self.assertIs(store.append(same), same)
-            from grow.campaign.replay import TradeReplayRecord, build_replay_record
-
+            again_record = store.append(same)
+            self.assertEqual(again_record.to_dict(), same.to_dict())
             forged = build_replay_record(cycle, snap).to_dict()
             forged["paper_fill"] = dict(forged["paper_fill"] or {})
             forged["paper_fill"]["execution_price"] = 1.0
@@ -262,6 +263,300 @@ class Phase11TradeReplayTests(unittest.TestCase):
             self.assertTrue(payload["paper_mode"])
             self.assertFalse(payload["live_trading"])
             self.assertFalse(payload["broker_order_path"])
+
+
+def _base_replay_payload(decision_id: str = "dec-concurrent-1") -> dict:
+    return {
+        "schema": REPLAY_SCHEMA,
+        "snapshot_id": "snap-concurrent",
+        "cycle_id": "cycle-concurrent",
+        "decision_id": decision_id,
+        "package_digest": "pkg-concurrent",
+        "agent_versions": ["strategy_research@strategy_research.v2"],
+        "market_data_provider": "grow.fixture.agent.v1",
+        "contract_id": "RELIANCE-2500-CE",
+        "expiry": EXPIRY.isoformat(),
+        "strike": 2500.0,
+        "option_type": "CE",
+        "bid": 99.0,
+        "ask": 101.0,
+        "ltp": 100.0,
+        "timestamp": AS_OF.isoformat(),
+        "decision": {
+            "decision_id": decision_id,
+            "action": "BUY_CE",
+            "status": "CANDIDATE",
+            "risk_guard_result": "APPROVED",
+            "snapshot_id": "snap-concurrent",
+            "analysis_cycle_id": "cycle-concurrent",
+        },
+        "risk_guard_result": "APPROVED",
+        "paper_fill": {
+            "accepted": True,
+            "reason": "FILLED",
+            "paper_order_id": "po-1",
+            "position_id": "pos-1",
+            "execution_price": 101.0,
+            "price_source": "ASK",
+            "broker_order_calls": 0,
+            "side": "BUY",
+        },
+        "exit": None,
+        "pnl": None,
+        "paper_mode": True,
+        "live_trading": False,
+        "broker_order_path": False,
+        "broker_order_calls": 0,
+    }
+
+
+def _mp_append_worker(root: str, payload: dict, ready, go, results, index: int) -> None:
+    """Separate-process append worker. ready/go are multiprocessing.Event."""
+    from grow.campaign.replay import TradeReplayRecord, TradeReplayStore
+    from grow.errors import GrowSafetyError
+
+    store = TradeReplayStore(root)
+    ready.set()
+    go.wait(timeout=30)
+    try:
+        store.append(TradeReplayRecord.from_dict(payload))
+        results[index] = ("ok", None)
+    except GrowSafetyError as exc:
+        results[index] = ("err", str(exc))
+    except Exception as exc:  # noqa: BLE001 — surface unexpected failures to parent
+        results[index] = ("boom", f"{type(exc).__name__}:{exc}")
+
+
+def _mp_exit_worker(root: str, decision_id: str, exit_row: dict, pnl_row: dict, ready, go, results, index: int) -> None:
+    from grow.campaign.replay import TradeReplayStore
+    from grow.errors import GrowSafetyError
+    from grow.paper.positions import PaperPosition, PositionState
+
+    store = TradeReplayStore(root)
+    position = PaperPosition(
+        position_id="pos-1",
+        session_id="session-concurrent",
+        candidate_id=None,
+        contract_id="RELIANCE-2500-CE",
+        underlying="RELIANCE",
+        expiry=EXPIRY,
+        strike=2500.0,
+        option_type="CE",
+        provider_id="grow.fixture.agent.v1",
+        lot_size=1,
+        lots=1,
+        quantity=1,
+        entry_price=101.0,
+        opened_at=AS_OF,
+        stop_loss_price=80.0,
+        take_profit_price=140.0,
+        state=PositionState.CLOSED,
+        current_price=float(exit_row["exit_price"]),
+        realized_pnl=float(pnl_row["realized_pnl"]),
+        realized_gross=float(pnl_row["realized_gross"]),
+        total_costs=float(pnl_row["total_costs"]),
+        exit_reason=str(exit_row["exit_reason"]),
+        closed_at=AS_OF + timedelta(minutes=10),
+        close_snapshot_id="snap-exit",
+    )
+    ready.set()
+    go.wait(timeout=30)
+    try:
+        store.attach_exit(decision_id, position=position)
+        results[index] = ("ok", None)
+    except GrowSafetyError as exc:
+        results[index] = ("err", str(exc))
+    except Exception as exc:  # noqa: BLE001
+        results[index] = ("boom", f"{type(exc).__name__}:{exc}")
+
+
+class Phase11ConcurrentReplayTests(unittest.TestCase):
+    def test_concurrent_conflicting_initial_append(self) -> None:
+        """Two store processes race on the same decision_id; one wins, one raises."""
+        import multiprocessing as mp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            decision_id = "dec-concurrent-append"
+            left = _base_replay_payload(decision_id)
+            right = _base_replay_payload(decision_id)
+            right["paper_fill"] = dict(right["paper_fill"])
+            right["paper_fill"]["execution_price"] = 199.0
+            ctx = mp.get_context("spawn")
+            ready_a = ctx.Event()
+            ready_b = ctx.Event()
+            go = ctx.Event()
+            results = ctx.Manager().list([None, None])
+            procs = [
+                ctx.Process(target=_mp_append_worker, args=(tmp, left, ready_a, go, results, 0)),
+                ctx.Process(target=_mp_append_worker, args=(tmp, right, ready_b, go, results, 1)),
+            ]
+            for proc in procs:
+                proc.start()
+            self.assertTrue(ready_a.wait(30) and ready_b.wait(30))
+            go.set()
+            for proc in procs:
+                proc.join(30)
+                self.assertFalse(proc.is_alive())
+                self.assertEqual(proc.exitcode, 0)
+            outcomes = list(results)
+            self.assertEqual({row[0] for row in outcomes}, {"ok", "err"})
+            self.assertTrue(any("append-only" in (row[1] or "") or "refusing overwrite" in (row[1] or "") for row in outcomes if row[0] == "err"))
+            reloaded = TradeReplayStore(tmp)
+            durable = reloaded.get(decision_id).to_dict()
+            price = durable["paper_fill"]["execution_price"]
+            self.assertIn(price, {101.0, 199.0})
+            self.assertEqual(durable["broker_order_calls"], 0)
+            self.assertEqual(durable["paper_fill"]["broker_order_calls"], 0)
+            # Internally consistent: only one fill price on disk.
+            self.assertEqual(len(list(Path(tmp).glob("*.json"))), 1)
+
+    def test_concurrent_identical_append_is_idempotent(self) -> None:
+        import multiprocessing as mp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = _base_replay_payload("dec-concurrent-same")
+            ctx = mp.get_context("spawn")
+            ready_a = ctx.Event()
+            ready_b = ctx.Event()
+            go = ctx.Event()
+            results = ctx.Manager().list([None, None])
+            procs = [
+                ctx.Process(target=_mp_append_worker, args=(tmp, payload, ready_a, go, results, 0)),
+                ctx.Process(target=_mp_append_worker, args=(tmp, payload, ready_b, go, results, 1)),
+            ]
+            for proc in procs:
+                proc.start()
+            self.assertTrue(ready_a.wait(30) and ready_b.wait(30))
+            go.set()
+            for proc in procs:
+                proc.join(30)
+                self.assertEqual(proc.exitcode, 0)
+            self.assertEqual(list(results), [("ok", None), ("ok", None)])
+            durable = TradeReplayStore(tmp).get("dec-concurrent-same")
+            self.assertEqual(durable.paper_fill["execution_price"], 101.0)
+            self.assertEqual(durable.broker_order_calls, 0)
+
+    def test_concurrent_conflicting_exit_attachment(self) -> None:
+        import multiprocessing as mp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            decision_id = "dec-concurrent-exit"
+            base = _base_replay_payload(decision_id)
+            TradeReplayStore(tmp).append(TradeReplayRecord.from_dict(base))
+            exit_a = {
+                "position_id": "pos-1",
+                "contract_id": "RELIANCE-2500-CE",
+                "exit_reason": "TAKE_PROFIT",
+                "exit_price": 150.0,
+                "closed_at": (AS_OF + timedelta(minutes=10)).isoformat(),
+                "close_snapshot_id": "snap-exit",
+                "side": "SELL",
+            }
+            pnl_a = {
+                "realized_pnl": 40.0,
+                "realized_gross": 49.0,
+                "total_costs": 9.0,
+                "entry_price": 101.0,
+                "exit_price": 150.0,
+                "quantity": 1,
+                "identity": "net == gross - costs",
+                "net_equals_gross_minus_costs": True,
+            }
+            exit_b = dict(exit_a)
+            exit_b["exit_price"] = 90.0
+            exit_b["exit_reason"] = "STOP_LOSS"
+            pnl_b = dict(pnl_a)
+            pnl_b["realized_pnl"] = -20.0
+            pnl_b["realized_gross"] = -11.0
+            pnl_b["exit_price"] = 90.0
+
+            ctx = mp.get_context("spawn")
+            ready_a = ctx.Event()
+            ready_b = ctx.Event()
+            go = ctx.Event()
+            results = ctx.Manager().list([None, None])
+            procs = [
+                ctx.Process(
+                    target=_mp_exit_worker,
+                    args=(tmp, decision_id, exit_a, pnl_a, ready_a, go, results, 0),
+                ),
+                ctx.Process(
+                    target=_mp_exit_worker,
+                    args=(tmp, decision_id, exit_b, pnl_b, ready_b, go, results, 1),
+                ),
+            ]
+            for proc in procs:
+                proc.start()
+            self.assertTrue(ready_a.wait(30) and ready_b.wait(30))
+            go.set()
+            for proc in procs:
+                proc.join(30)
+                self.assertEqual(proc.exitcode, 0)
+            outcomes = list(results)
+            self.assertEqual({row[0] for row in outcomes}, {"ok", "err"})
+            durable = TradeReplayStore(tmp).get(decision_id)
+            self.assertIsNotNone(durable.exit)
+            self.assertIsNotNone(durable.pnl)
+            self.assertIn(durable.exit["exit_reason"], {"TAKE_PROFIT", "STOP_LOSS"})
+            self.assertEqual(durable.broker_order_calls, 0)
+            # Identity still holds on the durable winner.
+            verify_pnl_replay(TradeReplayStore(tmp), decision_id)
+
+    def test_concurrent_identical_exit_attachment_is_idempotent(self) -> None:
+        import multiprocessing as mp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            decision_id = "dec-concurrent-exit-same"
+            base = _base_replay_payload(decision_id)
+            from grow.campaign.replay import TradeReplayRecord
+
+            TradeReplayStore(tmp).append(TradeReplayRecord.from_dict(base))
+            exit_row = {
+                "position_id": "pos-1",
+                "contract_id": "RELIANCE-2500-CE",
+                "exit_reason": "TAKE_PROFIT",
+                "exit_price": 150.0,
+                "closed_at": (AS_OF + timedelta(minutes=10)).isoformat(),
+                "close_snapshot_id": "snap-exit",
+                "side": "SELL",
+            }
+            pnl_row = {
+                "realized_pnl": 40.0,
+                "realized_gross": 49.0,
+                "total_costs": 9.0,
+                "entry_price": 101.0,
+                "exit_price": 150.0,
+                "quantity": 1,
+                "identity": "net == gross - costs",
+                "net_equals_gross_minus_costs": True,
+            }
+            ctx = mp.get_context("spawn")
+            ready_a = ctx.Event()
+            ready_b = ctx.Event()
+            go = ctx.Event()
+            results = ctx.Manager().list([None, None])
+            procs = [
+                ctx.Process(
+                    target=_mp_exit_worker,
+                    args=(tmp, decision_id, exit_row, pnl_row, ready_a, go, results, 0),
+                ),
+                ctx.Process(
+                    target=_mp_exit_worker,
+                    args=(tmp, decision_id, exit_row, pnl_row, ready_b, go, results, 1),
+                ),
+            ]
+            for proc in procs:
+                proc.start()
+            self.assertTrue(ready_a.wait(30) and ready_b.wait(30))
+            go.set()
+            for proc in procs:
+                proc.join(30)
+                self.assertEqual(proc.exitcode, 0)
+            self.assertEqual(list(results), [("ok", None), ("ok", None)])
+            durable = TradeReplayStore(tmp).get(decision_id)
+            self.assertEqual(durable.exit["exit_reason"], "TAKE_PROFIT")
+            self.assertEqual(durable.pnl["realized_pnl"], 40.0)
+            self.assertEqual(durable.broker_order_calls, 0)
 
 
 if __name__ == "__main__":
