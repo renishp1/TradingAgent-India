@@ -1,6 +1,7 @@
 """Read-only dashboard views.
 
-Consumes existing config, PaperBook snapshots, and safety lock state.
+Consumes existing config, PaperBook snapshots, safety lock state, optional
+replay/cycle artifacts, and Zerodha market-data auth status.
 Does not mint RiskStamps, place fills, or talk to brokers.
 """
 
@@ -9,12 +10,16 @@ from __future__ import annotations
 import json
 import os
 import re
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Mapping
 
+from grow.campaign.config import campaign_paper_config
+from grow.clock import IST, SystemClock
 from grow.config import GrowConfig, load_config
 from grow.execution.lock import LIVE_TRADING_COMPILED, scrub_broker_credentials_for_paper
 from grow.market.session import SessionCalendar
+from grow.options.select import session_day
 from grow.paper.checkpoint import load_paper_checkpoint
 from grow.paper.ledger import PaperBook, Position
 from grow.types import Symbol
@@ -32,7 +37,19 @@ def _snapshot(config: GrowConfig, book: PaperBook, last_cycle: Any | None = None
 
     return snapshot(config, book, last_cycle)
 
-_NOT_AVAILABLE = "Not available"
+
+def align_dashboard_config(config: GrowConfig) -> GrowConfig:
+    """Use the same capital/risk profile as CampaignRunner / RiskGuard paper path.
+
+    ``GROW_STARTING_CASH`` (and similar env overlays) can otherwise leave the
+    dashboard on a larger book while the campaign profile is ₹10K.
+    """
+    if config.paper.capital_profile:
+        return campaign_paper_config(config)
+    return config
+
+
+_NOT_AVAILABLE = "NOT AVAILABLE"
 
 _SECRET_KEY_RE = re.compile(
     r"(secret|password|token|api[_-]?key|access[_-]?token|authorization|credential|kite)",
@@ -96,7 +113,7 @@ def _book_from_checkpoint_ledger(config: GrowConfig, ledger: Mapping[str, Any]) 
 
 
 class DashboardService:
-    """In-process read model for the paper dashboard (Phase 1)."""
+    """In-process read model for the paper dashboard (read-only)."""
 
     def __init__(
         self,
@@ -106,17 +123,28 @@ class DashboardService:
         last_cycle: Any | None = None,
         checkpoint_path: Path | str | None = None,
         option_positions: list[dict[str, Any]] | None = None,
+        replay_root: Path | str | None = None,
+        market_snapshot: Mapping[str, Any] | None = None,
     ) -> None:
-        self.config = config or load_config()
+        raw = config if config is not None else load_config()
+        self.config = align_dashboard_config(raw)
         self.config.assert_safe()
         self.checkpoint_path = self._resolve_checkpoint_path(checkpoint_path)
+        self.replay_root = self._resolve_replay_root(replay_root)
         self.last_cycle = last_cycle
         self._engine_positions: list[dict[str, Any]] = list(option_positions or [])
         self._checkpoint_meta: dict[str, Any] | None = None
         self._last_risk_daily_pnl: float | None = None
+        self._replay_record: dict[str, Any] | None = None
+        self._market_snapshot: dict[str, Any] | None = (
+            dict(market_snapshot) if market_snapshot is not None else None
+        )
+        self._nifty_cache: dict[str, Any] | None = None
         self.book = book if book is not None else _empty_book(self.config)
         if book is None:
             self._try_load_checkpoint()
+        if self.last_cycle is None:
+            self._try_load_cycle_artifacts()
 
     @staticmethod
     def _resolve_checkpoint_path(explicit: Path | str | None) -> Path | None:
@@ -127,6 +155,71 @@ class DashboardService:
             return Path(env)
         default = Path.cwd() / "results" / "paper_checkpoint.json"
         return default if default.is_file() else None
+
+    @staticmethod
+    def _resolve_replay_root(explicit: Path | str | None) -> Path | None:
+        if explicit is not None:
+            return Path(explicit)
+        env = (os.environ.get("GROW_DASHBOARD_REPLAY") or "").strip()
+        if env:
+            return Path(env)
+        default = Path.cwd() / "results" / "trade_replay"
+        return default if default.is_dir() else None
+
+    def _try_load_cycle_artifacts(self) -> None:
+        """Load last cycle / replay JSON if present (read-only artifacts)."""
+        cycle_path = (os.environ.get("GROW_DASHBOARD_LAST_CYCLE") or "").strip()
+        if cycle_path:
+            path = Path(cycle_path)
+            if path.is_file():
+                try:
+                    self.last_cycle = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    pass
+        snap_path = (os.environ.get("GROW_DASHBOARD_MARKET_SNAPSHOT") or "").strip()
+        if snap_path:
+            path = Path(snap_path)
+            if path.is_file():
+                try:
+                    self._market_snapshot = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    pass
+        if self.replay_root is None or not self.replay_root.is_dir():
+            return
+        latest: dict[str, Any] | None = None
+        latest_mtime = -1.0
+        for path in self.replay_root.glob("*.json"):
+            if path.name.startswith("."):
+                continue
+            try:
+                mtime = path.stat().st_mtime
+                if mtime < latest_mtime:
+                    continue
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            latest = payload
+            latest_mtime = mtime
+        if latest is not None:
+            self._replay_record = latest
+            if self.last_cycle is None:
+                # Prefer full cycle-shaped payload when present; else wrap decision.
+                if "decision" in latest and "cycle_id" in latest:
+                    self.last_cycle = {
+                        "snapshot_id": latest.get("snapshot_id"),
+                        "cycle_id": latest.get("cycle_id"),
+                        "decision": latest.get("decision"),
+                        "execution": latest.get("paper_fill"),
+                        "package_digest": latest.get("package_digest"),
+                        "runner_version": "campaign.replay.v1",
+                        "paper_mode": True,
+                        "live_trading": False,
+                        "broker_order_path": False,
+                    }
+            if self._market_snapshot is None and isinstance(latest.get("snapshot"), dict):
+                self._market_snapshot = dict(latest["snapshot"])
 
     def _try_load_checkpoint(self) -> None:
         path = self.checkpoint_path
@@ -179,21 +272,121 @@ class DashboardService:
                 "READ ONLY UI",
             ],
             "can_enable_live_trading": False,
-            "ui_phase": 1,
             "ui_mode": "read_only",
             "canonical_paper_path": "campaign",
             "note": (
-                "Phase 1 dashboard is read-only. No buy/sell controls. "
-                "Canonical paper path is CampaignRunner "
-                "(Analysis → CampaignOptions → Decision → CEO gate → RiskGuard → paper)."
+                "Read-only paper console. No buy/sell controls. "
+                "Canonical path: Analysis → CampaignOptions → Decision → CEO gate → RiskGuard → paper."
             ),
         }
+
+    def _zerodha_public(self, *, probe: bool = False) -> dict[str, Any]:
+        from grow.dashboard.zerodha_auth import auth_status
+
+        return auth_status(probe=probe).to_public_dict()
+
+    def _probe_nifty_ltp(self) -> dict[str, Any]:
+        """Best-effort LIVE index LTP via existing Kite market-data transport (quotes only)."""
+        if self._nifty_cache is not None:
+            return dict(self._nifty_cache)
+        result: dict[str, Any] = {
+            "price": _NOT_AVAILABLE,
+            "timestamp": _NOT_AVAILABLE,
+            "provenance": _NOT_AVAILABLE,
+            "freshness": _NOT_AVAILABLE,
+            "quote_age_seconds": _NOT_AVAILABLE,
+            "reason": "Zerodha market-data session not available",
+        }
+        try:
+            from grow.live_data.kite_market import RealKiteTransport, load_kite_market_secrets
+
+            api_key, access_token = load_kite_market_secrets(dict(os.environ))
+            transport = RealKiteTransport(api_key=api_key, access_token=access_token)
+            transport.connect()
+            try:
+                price, _token = transport.fetch_index_quote("NIFTY")
+            finally:
+                transport.disconnect()
+            now = SystemClock().now().astimezone(IST)
+            result = {
+                "price": float(price),
+                "timestamp": now.isoformat(),
+                "provenance": "LIVE",
+                "freshness": "REST_QUOTE",
+                "quote_age_seconds": _NOT_AVAILABLE,
+                "reason": None,
+            }
+        except Exception as exc:
+            result["reason"] = type(exc).__name__
+        self._nifty_cache = dict(result)
+        return result
 
     def market_status(self) -> dict[str, Any]:
         calendar = SessionCalendar(self.config.market)
         state = calendar.state()
-        live_connected = bool(self.config.live_data.enabled and self.config.data.allow_live_feed)
-        # Phase 1 dashboard never attaches a live feed itself.
+        zerodha = self._zerodha_public(probe=False)
+        connected = str(zerodha.get("status") or "").upper() == "CONNECTED"
+        token_present = bool(zerodha.get("access_token_present"))
+        nifty = {"price": _NOT_AVAILABLE, "label": _NOT_AVAILABLE, "timestamp": _NOT_AVAILABLE}
+        provenance = _NOT_AVAILABLE
+        freshness = _NOT_AVAILABLE
+        quote_age: Any = _NOT_AVAILABLE
+        note_parts: list[str] = []
+
+        snap = self._market_snapshot
+        if isinstance(snap, Mapping):
+            provenance = str(snap.get("market_data_source") or snap.get("diagnostics", {}).get("market_data_source") or _NOT_AVAILABLE)
+            under = (snap.get("underlyings") or {}).get("NIFTY") or {}
+            if isinstance(under, Mapping):
+                price = under.get("ltp") if under.get("ltp") is not None else under.get("spot")
+                if price is not None:
+                    nifty = {
+                        "price": price,
+                        "label": provenance,
+                        "timestamp": under.get("quote_timestamp") or snap.get("decision_timestamp") or _NOT_AVAILABLE,
+                    }
+                age = under.get("quote_age_seconds")
+                if age is not None:
+                    quote_age = age
+            quality = snap.get("data_quality")
+            freshness = str(quality) if quality is not None else freshness
+            notes = snap.get("quality_notes") or ()
+            if notes:
+                note_parts.append(", ".join(str(n) for n in notes[:6]))
+
+        # Prefer campaign/replay snapshot. Live REST probe only when no snapshot
+        # exists — never overwrite STALE/MIXED campaign data with a fresh quote.
+        snap_quality = str(freshness).upper() if freshness != _NOT_AVAILABLE else ""
+        allow_probe = snap is None and nifty["price"] is _NOT_AVAILABLE and token_present
+        if allow_probe:
+            probed = self._probe_nifty_ltp()
+            if probed.get("price") is not _NOT_AVAILABLE:
+                nifty = {
+                    "price": probed["price"],
+                    "label": probed.get("provenance") or "LIVE",
+                    "timestamp": probed.get("timestamp") or _NOT_AVAILABLE,
+                }
+                provenance = probed.get("provenance") or provenance
+                freshness = probed.get("freshness") or freshness
+                quote_age = probed.get("quote_age_seconds", quote_age)
+            elif probed.get("reason"):
+                note_parts.append(f"NIFTY probe: {probed['reason']}")
+        elif snap is not None and snap_quality in {"STALE", "INSUFFICIENT", "REJECTED"}:
+            note_parts.append(f"Snapshot data quality: {snap_quality} (fail-closed; not replaced with live quote).")
+
+        if connected:
+            market_data = "CONNECTED"
+        elif token_present:
+            market_data = "TOKEN PRESENT (not verified)"
+        else:
+            market_data = "NOT CONNECTED"
+            note_parts.append(
+                "Zerodha market-data not connected. Use Settings → Connect (quotes only; no orders)."
+            )
+
+        if provenance == "MIXED":
+            note_parts.append("MIXED provenance is rejected for paper campaign trading.")
+
         return {
             "exchange": self.config.market.exchange,
             "session_state": state.value,
@@ -201,15 +394,23 @@ class DashboardService:
             "session_close": self.config.market.session_close,
             "square_off": self.config.market.square_off,
             "timezone": self.config.timezone,
-            "market_data": "NOT CONNECTED" if not live_connected else "CONFIGURED (not connected by UI)",
-            "market_data_connected": False,
+            "market_data": market_data,
+            "market_data_connected": connected,
+            "zerodha_status": zerodha.get("status"),
             "data_provider": self.config.data.provider,
-            "data_label": "FIXTURE / PAPER DATA" if self.config.data.provider == "fixture" else "PAPER DATA",
+            "data_label": provenance if provenance != _NOT_AVAILABLE else (
+                "FIXTURE / PAPER DATA" if self.config.data.provider == "fixture" else "PAPER DATA"
+            ),
+            "provenance": provenance,
+            "freshness": freshness,
+            "quote_age_seconds": quote_age,
             "indices": {
-                "NIFTY": {"price": _NOT_AVAILABLE, "label": "Not available"},
-                "BANKNIFTY": {"price": _NOT_AVAILABLE, "label": "Not available"},
+                "NIFTY": nifty,
+                "BANKNIFTY": {"price": _NOT_AVAILABLE, "label": _NOT_AVAILABLE, "timestamp": _NOT_AVAILABLE},
             },
-            "note": "Dashboard Phase 1 does not connect to live market data.",
+            "note": " · ".join(note_parts) if note_parts else (
+                f"Session {state.value}. Market-data via existing Zerodha path when connected."
+            ),
         }
 
     def config_view(self) -> dict[str, Any]:
@@ -370,86 +571,450 @@ class DashboardService:
                 else _NOT_AVAILABLE,
                 "max_position_notional": risk.max_position_notional,
                 "max_gross_notional": risk.max_gross_notional,
+                "starting_capital": self.config.paper.starting_cash,
                 "current_exposure": book.gross_notional,
                 "open_positions": open_count,
+                "max_positions": risk.max_open_positions
+                if risk.max_open_positions is not None
+                else _NOT_AVAILABLE,
                 "today_pnl": today_pnl,
+                "daily_pnl": today_pnl,
                 "realized_pnl_at_cost": realized,
                 "remaining_daily_risk": remaining,
                 "require_stop_loss": risk.require_stop_loss,
                 "allow_short": risk.allow_short,
+                "capital_profile": self.config.paper.capital_profile,
                 "read_only": True,
                 "note": (
-                    "Limits come from GrowConfig.risk / paper. "
-                    "True daily P&L may be Not available until valuation exists."
+                    "Limits from effective GrowConfig (same profile as RiskGuard / campaign). "
+                    f"True daily P&L may be {_NOT_AVAILABLE} until valuation exists."
                 ),
             }
         )
 
-    def agents_view(self) -> dict[str, Any]:
+    def _decision_payload(self) -> dict[str, Any] | None:
+        """Extract IntegratedDecision-shaped dict from cycle / replay artifacts."""
         cycle = self.last_cycle
-        if cycle is None:
-            return {
-                "available": False,
-                "message": "AI decision data not available",
-                "model_provider": self.config.model.provider,
-                "tradingagents_enabled": self.config.tradingagents.enabled,
-                "decisions": [],
-            }
+        if cycle is not None:
+            payload = cycle.to_dict() if hasattr(cycle, "to_dict") else dict(cycle)
+            decision = payload.get("decision")
+            if isinstance(decision, Mapping):
+                return dict(decision)
+            # Flattened CampaignCycleResult fields without nested decision.
+            if payload.get("decision_action") is not None or payload.get("action") is not None:
+                return {
+                    "analysis_cycle_id": payload.get("cycle_id") or payload.get("analysis_cycle_id"),
+                    "snapshot_id": payload.get("snapshot_id"),
+                    "status": payload.get("decision_status") or payload.get("status"),
+                    "action": payload.get("decision_action") or payload.get("action"),
+                    "campaign_signal": payload.get("campaign_signal"),
+                    "reason_codes": payload.get("reason_codes") or (),
+                    "risk_guard_result": payload.get("risk_guard_result"),
+                    "risk_guard_reason": payload.get("risk_guard_reason"),
+                    "trade_candidate": payload.get("trade_candidate"),
+                    "data_quality_status": payload.get("data_quality_status"),
+                    "gate_results": payload.get("gate_results") or (),
+                }
+        replay = self._replay_record
+        if isinstance(replay, Mapping) and isinstance(replay.get("decision"), Mapping):
+            return dict(replay["decision"])
+        return None
 
-        payload = cycle.to_dict() if hasattr(cycle, "to_dict") else dict(cycle)
-        proposal = payload.get("proposal") or {}
-        verdict = payload.get("verdict") or {}
+    def _stale_no_trade_reason(self) -> str | None:
+        snap = self._market_snapshot
+        if not isinstance(snap, Mapping):
+            return None
+        quality = str(snap.get("data_quality") or "").upper()
+        if quality in {"STALE", "INSUFFICIENT", "REJECTED"}:
+            notes = snap.get("quality_notes") or ()
+            detail = ", ".join(str(n) for n in notes[:4]) if notes else quality
+            return f"NO TRADE — market data {quality}: {detail}"
+        source = str(snap.get("market_data_source") or "").upper()
+        if source == "MIXED":
+            return "NO TRADE — MIXED market-data provenance rejected"
+        return None
+
+    def agents_view(self) -> dict[str, Any]:
+        decision = self._decision_payload()
+        stale_reason = self._stale_no_trade_reason()
+        base_meta = {
+            "model_provider": self.config.model.provider,
+            "tradingagents_enabled": self.config.tradingagents.enabled,
+        }
+        if decision is None:
+            message = stale_reason or "AI decision data not available"
+            final_action = "NO TRADE" if stale_reason else _NOT_AVAILABLE
+            return redact_secrets(
+                {
+                    "available": bool(stale_reason),
+                    "message": message,
+                    **base_meta,
+                    "decisions": [
+                        {
+                            "agent": "DecisionEngine",
+                            "cycle_id": _NOT_AVAILABLE,
+                            "snapshot_id": (
+                                (self._market_snapshot or {}).get("snapshot_id")
+                                if self._market_snapshot
+                                else _NOT_AVAILABLE
+                            ),
+                            "candidate": _NOT_AVAILABLE,
+                            "option_type": _NOT_AVAILABLE,
+                            "ce_pe": _NOT_AVAILABLE,
+                            "strike": _NOT_AVAILABLE,
+                            "expiry": _NOT_AVAILABLE,
+                            "dte": _NOT_AVAILABLE,
+                            "score": _NOT_AVAILABLE,
+                            "ceo_gate": _NOT_AVAILABLE,
+                            "risk_guard": _NOT_AVAILABLE,
+                            "final_action": final_action,
+                            "decision": final_action,
+                            "signal": final_action,
+                            "confidence": _NOT_AVAILABLE,
+                            "timestamp": _NOT_AVAILABLE,
+                            "reason": message,
+                            "risk_verdict": _NOT_AVAILABLE,
+                            "risk_reason": message if stale_reason else _NOT_AVAILABLE,
+                            "provenance": (
+                                (self._market_snapshot or {}).get("market_data_source")
+                                if self._market_snapshot
+                                else _NOT_AVAILABLE
+                            ),
+                            "symbol": _NOT_AVAILABLE,
+                        }
+                    ]
+                    if stale_reason
+                    else [],
+                    "last_cycle": None
+                    if self.last_cycle is None
+                    else (
+                        self.last_cycle.to_dict()
+                        if hasattr(self.last_cycle, "to_dict")
+                        else dict(self.last_cycle)
+                    ),
+                }
+            )
+
+        candidate = decision.get("trade_candidate") or {}
+        signal = decision.get("campaign_signal") or {}
+        reasons = list(decision.get("reason_codes") or [])
+        action = str(decision.get("action") or "NO_TRADE").upper()
+        status = str(decision.get("status") or "").upper()
+        if action in {"NO_TRADE", "NO TRADE"} or status in {"NO_TRADE", "BLOCKED"}:
+            final_action = "NO TRADE"
+        else:
+            final_action = action
+
+        gate_rows = decision.get("gate_results") or []
+        ceo_gate: Any = _NOT_AVAILABLE
+        for row in gate_rows:
+            if not isinstance(row, Mapping):
+                continue
+            gate_name = str(row.get("gate") or "").lower()
+            if "ceo" in gate_name:
+                ceo_gate = "PASS" if row.get("passed") else f"REJECTED ({row.get('detail')})"
+                break
+        if ceo_gate is _NOT_AVAILABLE:
+            if any(str(r).startswith("CEO_GATE") for r in reasons):
+                ceo_gate = "REJECTED"
+            elif final_action != "NO TRADE" and decision.get("risk_guard_result") not in (
+                None,
+                "NOT_EVALUATED",
+            ):
+                ceo_gate = "PASS"
+            elif final_action == "NO TRADE" and any("CEO" in str(r).upper() for r in reasons):
+                ceo_gate = "REJECTED"
+
+        risk_result = decision.get("risk_guard_result")
+        risk_reason = decision.get("risk_guard_reason") or _NOT_AVAILABLE
+        if risk_result in (None, "", "NOT_EVALUATED"):
+            risk_guard_label = "NOT EVALUATED"
+        else:
+            risk_guard_label = str(risk_result)
+
+        score = signal.get("score") if isinstance(signal, Mapping) else None
+        if score is None and isinstance(signal, Mapping) and isinstance(signal.get("diagnostics"), Mapping):
+            score = signal["diagnostics"].get("score")
+        if score is None:
+            evidence = decision.get("calculated_evidence") or {}
+            if isinstance(evidence, Mapping):
+                score = evidence.get("score")
+        if score is None:
+            score = _NOT_AVAILABLE
+
+        option_type = (
+            (candidate.get("option_type") if isinstance(candidate, Mapping) else None)
+            or (signal.get("option_type") if isinstance(signal, Mapping) else None)
+            or _NOT_AVAILABLE
+        )
+        strike = candidate.get("strike") if isinstance(candidate, Mapping) else None
+        if strike is None and isinstance(signal, Mapping):
+            strike = signal.get("strike")
+        if strike is None:
+            strike = _NOT_AVAILABLE
+        expiry = (
+            (candidate.get("expiry") if isinstance(candidate, Mapping) else None)
+            or (signal.get("expiry") if isinstance(signal, Mapping) else None)
+            or _NOT_AVAILABLE
+        )
+        dte = signal.get("dte_days") if isinstance(signal, Mapping) else None
+        if dte is None and isinstance(signal, Mapping) and isinstance(signal.get("diagnostics"), Mapping):
+            dte = signal["diagnostics"].get("dte_days")
+        if dte is None and expiry not in (_NOT_AVAILABLE, None) and self._market_snapshot:
+            try:
+                exp = date.fromisoformat(str(expiry)[:10])
+                sess = self._market_snapshot.get("session_date")
+                sess_d = date.fromisoformat(str(sess)[:10]) if sess else session_day(
+                    SystemClock().now().astimezone(IST)
+                )
+                dte = (exp - sess_d).days
+            except (TypeError, ValueError):
+                dte = _NOT_AVAILABLE
+        if dte is None:
+            dte = _NOT_AVAILABLE
+
+        instrument = _NOT_AVAILABLE
+        if isinstance(candidate, Mapping) and candidate.get("instrument"):
+            instrument = candidate["instrument"]
+        elif decision.get("candidate_instrument"):
+            instrument = decision["candidate_instrument"]
+        elif isinstance(signal, Mapping) and signal.get("instrument"):
+            instrument = signal["instrument"]
+
+        reason_text = "; ".join(str(r) for r in reasons) if reasons else (
+            risk_reason if risk_reason != _NOT_AVAILABLE else _NOT_AVAILABLE
+        )
+        if final_action == "NO TRADE" and (not reasons) and stale_reason:
+            reason_text = stale_reason
+
+        provenance = _NOT_AVAILABLE
+        if self._market_snapshot:
+            provenance = self._market_snapshot.get("market_data_source") or provenance
+        if provenance == _NOT_AVAILABLE and self._replay_record:
+            provenance = self._replay_record.get("market_data_provider") or provenance
+
+        cycle_id = decision.get("analysis_cycle_id")
+        if cycle_id is None and self.last_cycle is not None:
+            lc = (
+                self.last_cycle.to_dict()
+                if hasattr(self.last_cycle, "to_dict")
+                else self.last_cycle
+            )
+            if isinstance(lc, Mapping):
+                cycle_id = lc.get("cycle_id")
+        if cycle_id is None:
+            cycle_id = _NOT_AVAILABLE
+
+        row = {
+            "agent": "DecisionEngine",
+            "cycle_id": cycle_id,
+            "snapshot_id": decision.get("snapshot_id") or _NOT_AVAILABLE,
+            "candidate": instrument,
+            "option_type": option_type,
+            "ce_pe": option_type,
+            "strike": strike,
+            "expiry": expiry,
+            "dte": dte,
+            "score": score,
+            "ceo_gate": ceo_gate,
+            "risk_guard": risk_guard_label,
+            "final_action": final_action,
+            "decision": final_action,
+            "signal": option_type if final_action != "NO TRADE" else final_action,
+            "confidence": (
+                candidate.get("confidence")
+                if isinstance(candidate, Mapping) and candidate.get("confidence") is not None
+                else _NOT_AVAILABLE
+            ),
+            "timestamp": decision.get("decision_timestamp") or decision.get("as_of") or _NOT_AVAILABLE,
+            "reason": reason_text,
+            "risk_verdict": risk_result,
+            "risk_reason": risk_reason,
+            "provenance": provenance,
+            "symbol": (
+                (candidate.get("underlying") if isinstance(candidate, Mapping) else None)
+                or decision.get("candidate_instrument")
+            ),
+            "data_quality_status": decision.get("data_quality_status") or _NOT_AVAILABLE,
+        }
         return redact_secrets(
             {
                 "available": True,
-                "message": None,
-                "model_provider": self.config.model.provider,
-                "tradingagents_enabled": self.config.tradingagents.enabled,
-                "decisions": [
-                    {
-                        "agent": "CEO",
-                        "decision": proposal.get("intent") or _NOT_AVAILABLE,
-                        "signal": proposal.get("side") or _NOT_AVAILABLE,
-                        "confidence": proposal.get("confidence")
-                        if proposal.get("confidence") is not None
-                        else _NOT_AVAILABLE,
-                        "timestamp": proposal.get("created_at") or _NOT_AVAILABLE,
-                        "reason": proposal.get("thesis") or _NOT_AVAILABLE,
-                        "risk_verdict": verdict.get("approved"),
-                        "risk_reason": verdict.get("reason") or _NOT_AVAILABLE,
-                        "symbol": payload.get("symbol") or proposal.get("symbol"),
-                    }
-                ],
-                "last_cycle": payload,
+                "message": None if final_action != "NO TRADE" else reason_text,
+                **base_meta,
+                "decisions": [row],
+                "last_cycle": None
+                if self.last_cycle is None
+                else (
+                    self.last_cycle.to_dict()
+                    if hasattr(self.last_cycle, "to_dict")
+                    else dict(self.last_cycle)
+                ),
+                "replay": {
+                    "decision_id": (self._replay_record or {}).get("decision_id"),
+                    "schema": (self._replay_record or {}).get("schema"),
+                }
+                if self._replay_record
+                else None,
             }
         )
 
     def option_chain_view(self) -> dict[str, Any]:
-        return {
-            "available": False,
-            "message": "Not available",
-            "label": "Option chain not connected in dashboard Phase 1",
-            "data_label": "FIXTURE / PAPER DATA",
-            "selected": None,
-            "ce": _NOT_AVAILABLE,
-            "strike": _NOT_AVAILABLE,
-            "pe": _NOT_AVAILABLE,
-        }
+        snap = self._market_snapshot
+        if not isinstance(snap, Mapping):
+            return {
+                "available": False,
+                "message": _NOT_AVAILABLE,
+                "label": "Option chain artifact not loaded (set GROW_DASHBOARD_MARKET_SNAPSHOT or trade replay).",
+                "data_label": _NOT_AVAILABLE,
+                "provenance": _NOT_AVAILABLE,
+                "rows": [],
+                "selected": None,
+                "ce": _NOT_AVAILABLE,
+                "strike": _NOT_AVAILABLE,
+                "pe": _NOT_AVAILABLE,
+            }
+
+        contracts = snap.get("option_contracts") or []
+        session_raw = snap.get("session_date")
+        try:
+            sess_d = date.fromisoformat(str(session_raw)[:10]) if session_raw else session_day(
+                SystemClock().now().astimezone(IST)
+            )
+        except ValueError:
+            sess_d = session_day(SystemClock().now().astimezone(IST))
+
+        # Optional score / rejection hints from replay decision signal or package.
+        score_by_id: dict[str, Any] = {}
+        rejection: Any = _NOT_AVAILABLE
+        decision = self._decision_payload() or {}
+        signal = decision.get("campaign_signal") or {}
+        if isinstance(signal, Mapping):
+            if signal.get("score") is not None and signal.get("instrument"):
+                score_by_id[str(signal["instrument"])] = signal["score"]
+            if signal.get("provider_contract_id") and signal.get("score") is not None:
+                score_by_id[str(signal["provider_contract_id"])] = signal["score"]
+        reasons = list(decision.get("reason_codes") or [])
+        for code in reasons:
+            text = str(code).upper()
+            if "CHAIN" in text or "FILTER" in text or "ELIGIB" in text or "MISSING_OPTION" in text:
+                rejection = code
+                break
+
+        # Pair CE/PE by (underlying, expiry, strike).
+        buckets: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
+        for raw in contracts:
+            if not isinstance(raw, Mapping):
+                continue
+            key = (raw.get("underlying"), raw.get("expiry"), raw.get("strike"))
+            bucket = buckets.setdefault(
+                key,
+                {
+                    "underlying": raw.get("underlying"),
+                    "expiry": raw.get("expiry"),
+                    "strike": raw.get("strike"),
+                    "dte": _NOT_AVAILABLE,
+                    "ce_ltp": _NOT_AVAILABLE,
+                    "ce_bid": _NOT_AVAILABLE,
+                    "ce_ask": _NOT_AVAILABLE,
+                    "pe_ltp": _NOT_AVAILABLE,
+                    "pe_bid": _NOT_AVAILABLE,
+                    "pe_ask": _NOT_AVAILABLE,
+                    "score": _NOT_AVAILABLE,
+                    "eligibility": _NOT_AVAILABLE,
+                    "rejection_reason": _NOT_AVAILABLE,
+                },
+            )
+            try:
+                exp = date.fromisoformat(str(raw.get("expiry"))[:10])
+                bucket["dte"] = (exp - sess_d).days
+            except (TypeError, ValueError):
+                pass
+            side = str(raw.get("option_type") or "").upper()
+            prefix = "ce" if side == "CE" else "pe" if side == "PE" else None
+            if prefix:
+                for field in ("ltp", "bid", "ask"):
+                    val = raw.get(field)
+                    bucket[f"{prefix}_{field}"] = val if val is not None else _NOT_AVAILABLE
+            cid = str(raw.get("provider_contract_id") or "")
+            if cid and cid in score_by_id:
+                bucket["score"] = score_by_id[cid]
+            if raw.get("quality") and str(raw.get("quality")).upper() in {
+                "STALE",
+                "INSUFFICIENT",
+                "REJECTED",
+            }:
+                bucket["eligibility"] = "REJECTED"
+                bucket["rejection_reason"] = f"quote_quality:{raw.get('quality')}"
+            elif rejection != _NOT_AVAILABLE:
+                bucket["eligibility"] = "SEE_DECISION"
+                bucket["rejection_reason"] = rejection
+            else:
+                bucket["eligibility"] = "PRESENT"
+
+        rows = sorted(
+            buckets.values(),
+            key=lambda r: (str(r.get("expiry")), float(r.get("strike") or 0)),
+        )
+        selected = None
+        cand = decision.get("trade_candidate") or {}
+        if cand:
+            selected = {
+                "strike": cand.get("strike", _NOT_AVAILABLE),
+                "expiry": cand.get("expiry", _NOT_AVAILABLE),
+                "option_type": cand.get("option_type", _NOT_AVAILABLE),
+                "instrument": cand.get("instrument", _NOT_AVAILABLE),
+            }
+        provenance = snap.get("market_data_source") or _NOT_AVAILABLE
+        return redact_secrets(
+            {
+                "available": bool(rows),
+                "message": None if rows else "Option chain empty in loaded snapshot",
+                "label": f"{len(rows)} strike(s) from campaign/replay snapshot",
+                "data_label": provenance,
+                "provenance": provenance,
+                "freshness": snap.get("data_quality") or _NOT_AVAILABLE,
+                "snapshot_id": snap.get("snapshot_id"),
+                "rows": rows,
+                "selected": selected,
+                "ce": selected.get("option_type") if selected and selected.get("option_type") == "CE" else _NOT_AVAILABLE,
+                "strike": (selected or {}).get("strike", _NOT_AVAILABLE),
+                "pe": selected.get("option_type") if selected and selected.get("option_type") == "PE" else _NOT_AVAILABLE,
+            }
+        )
 
     def signals_view(self) -> dict[str, Any]:
-        return {
-            "available": False,
-            "message": "Not available",
-            "signals": [],
-            "note": "SignalEngine output is not attached to the Phase 1 dashboard.",
-        }
+        decision = self._decision_payload()
+        if decision is None:
+            return {
+                "available": False,
+                "message": _NOT_AVAILABLE,
+                "signals": [],
+                "note": "No campaign signal artifact loaded.",
+            }
+        signal = decision.get("campaign_signal")
+        if not signal:
+            return {
+                "available": False,
+                "message": _NOT_AVAILABLE,
+                "signals": [],
+                "note": "Decision present but campaign_signal absent.",
+            }
+        return redact_secrets(
+            {
+                "available": True,
+                "message": None,
+                "signals": [dict(signal)],
+                "note": "Campaign signal from last decision/replay.",
+            }
+        )
 
     def research_view(self) -> dict[str, Any]:
         return {
             "available": False,
-            "message": "Not available",
+            "message": _NOT_AVAILABLE,
             "research_label": "HISTORICAL RESEARCH / NOT LIVE",
-            "note": "Research artifacts are not streamed into the Phase 1 dashboard.",
+            "note": "Research artifacts are not streamed into the dashboard read model.",
         }
 
     def settings_view(self, *, probe_zerodha: bool = False) -> dict[str, Any]:
@@ -470,6 +1035,8 @@ class DashboardService:
 
     def dashboard(self) -> dict[str, Any]:
         base = _snapshot(self.config, self.book, self.last_cycle)
+        market = self.market_status()
+        risk = self.risk_view()
         body = {
             "safety": self.safety(),
             "system": {
@@ -477,21 +1044,29 @@ class DashboardService:
                 "live_trading_status": "DISABLED",
                 "live_trading_compiled": bool(LIVE_TRADING_COMPILED),
                 "broker_order_path": "DISABLED",
-                "risk_guard_status": "ACTIVE",
-                "market_data_status": "NOT CONNECTED",
+                "risk_guard_status": risk.get("status_label") or "ACTIVE",
+                "market_data_status": market.get("market_data"),
+                "zerodha_status": market.get("zerodha_status"),
+                "provenance": market.get("provenance"),
+                "freshness": market.get("freshness"),
             },
             "capital": {
                 "paper_capital": self.config.paper.starting_cash,
+                "starting_capital": self.config.paper.starting_cash,
                 "available_capital": self.book.cash,
-                "today_pnl": self.risk_view()["today_pnl"],
+                "today_pnl": risk["today_pnl"],
                 "daily_loss_limit": self.config.risk.max_daily_loss,
-                "remaining_daily_risk": self.risk_view()["remaining_daily_risk"],
+                "max_daily_loss": self.config.risk.max_daily_loss,
+                "max_per_trade_risk": self.config.risk.max_per_trade_risk,
+                "max_open_positions": self.config.risk.max_open_positions,
+                "remaining_daily_risk": risk["remaining_daily_risk"],
                 "currency": self.config.market.currency,
-                "data_label": "FIXTURE / PAPER DATA",
+                "capital_profile": self.config.paper.capital_profile,
+                "data_label": market.get("provenance") or market.get("data_label"),
             },
-            "market": self.market_status(),
+            "market": market,
             "positions": self.positions_view(),
-            "risk": self.risk_view(),
+            "risk": risk,
             "agents": self.agents_view(),
             "option_chain": self.option_chain_view(),
             "signals": self.signals_view(),

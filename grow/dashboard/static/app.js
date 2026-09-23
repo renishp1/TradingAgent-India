@@ -1,4 +1,4 @@
-/* TradingAgent-India Phase 1 dashboard — read-only client. */
+/* TradingAgent-India paper dashboard — read-only client. */
 
 const state = {
   dashboard: null,
@@ -13,7 +13,7 @@ function esc(value) {
 }
 
 function fmt(value) {
-  if (value === null || value === undefined || value === "") return "Not available";
+  if (value === null || value === undefined || value === "") return "NOT AVAILABLE";
   if (typeof value === "number") {
     return Number.isInteger(value)
       ? value.toLocaleString("en-IN")
@@ -45,20 +45,29 @@ function renderMarket(market) {
     <div class="kpi">
       <div class="label">NIFTY</div>
       <div class="value">${esc(fmt(nifty.price))}</div>
-      <div class="tag">${esc(nifty.label || market.data_label || "FIXTURE / PAPER DATA")}</div>
+      <div class="tag">${esc(nifty.label || market.provenance || market.data_label || "NOT AVAILABLE")}</div>
     </div>
     <div class="kpi">
       <div class="label">BANK NIFTY</div>
       <div class="value">${esc(fmt(bank.price))}</div>
-      <div class="tag">${esc(bank.label || market.data_label || "FIXTURE / PAPER DATA")}</div>
+      <div class="tag">${esc(bank.label || market.provenance || market.data_label || "NOT AVAILABLE")}</div>
     </div>
     <div class="kpi">
       <div class="label">Market Status</div>
       <div class="value">${esc(fmt(market.session_state))}</div>
       <div class="tag">Market Data: ${esc(fmt(market.market_data))}</div>
     </div>`;
+  const noteBits = [
+    market.note,
+    market.provenance ? `Provenance: ${market.provenance}` : null,
+    market.freshness ? `Freshness: ${market.freshness}` : null,
+    nifty.timestamp ? `NIFTY ts: ${nifty.timestamp}` : null,
+    market.quote_age_seconds != null && market.quote_age_seconds !== "NOT AVAILABLE"
+      ? `Quote age (s): ${market.quote_age_seconds}`
+      : null,
+  ].filter(Boolean);
   document.getElementById("market-data-note").textContent =
-    market.note || "Dashboard Phase 1 does not connect to live market data.";
+    noteBits.join(" · ") || "Market state from session calendar + Zerodha / snapshot artifacts.";
   document.getElementById("market-status-pill").textContent =
     `Market: ${fmt(market.session_state)} · Data: ${fmt(market.market_data)}`;
 }
@@ -70,6 +79,9 @@ function renderSystem(system) {
     ["Broker order path", system.broker_order_path],
     ["Risk Guard status", system.risk_guard_status],
     ["Market data status", system.market_data_status],
+    ["Zerodha status", system.zerodha_status],
+    ["Provenance", system.provenance],
+    ["Freshness", system.freshness],
     ["LIVE_TRADING_COMPILED", system.live_trading_compiled],
   ]);
 }
@@ -80,7 +92,10 @@ function renderCapital(capital) {
     ["Available capital", capital.available_capital],
     ["Today's P&L", capital.today_pnl],
     ["Daily loss limit", capital.daily_loss_limit],
+    ["Max risk / trade", capital.max_per_trade_risk],
+    ["Max open positions", capital.max_open_positions],
     ["Remaining daily risk", capital.remaining_daily_risk],
+    ["Capital profile", capital.capital_profile],
     ["Currency", capital.currency],
     ["Data label", capital.data_label],
   ]);
@@ -123,25 +138,79 @@ function renderCeo(agents) {
   }
   const d = agents.decisions[0];
   el.innerHTML = `<div class="decision-grid">
-    <div><div class="label">Agent</div><div class="value">${esc(fmt(d.agent))}</div></div>
-    <div><div class="label">Decision</div><div class="value">${esc(fmt(d.decision))}</div></div>
-    <div><div class="label">Signal</div><div class="value">${esc(fmt(d.signal))}</div></div>
-    <div><div class="label">Confidence</div><div class="value">${esc(fmt(d.confidence))}</div></div>
-    <div><div class="label">Timestamp</div><div class="value">${esc(fmt(d.timestamp))}</div></div>
-    <div><div class="label">Risk verdict</div><div class="value">${esc(fmt(d.risk_verdict))}</div></div>
-    <div style="grid-column:1/-1"><div class="label">Reason / evidence</div><div class="value">${esc(fmt(d.reason))}</div></div>
+    <div><div class="label">Cycle ID</div><div class="value">${esc(fmt(d.cycle_id))}</div></div>
+    <div><div class="label">Snapshot ID</div><div class="value">${esc(fmt(d.snapshot_id))}</div></div>
+    <div><div class="label">Candidate</div><div class="value">${esc(fmt(d.candidate))}</div></div>
+    <div><div class="label">CE/PE</div><div class="value">${esc(fmt(d.ce_pe || d.option_type))}</div></div>
+    <div><div class="label">Strike</div><div class="value">${esc(fmt(d.strike))}</div></div>
+    <div><div class="label">Expiry</div><div class="value">${esc(fmt(d.expiry))}</div></div>
+    <div><div class="label">DTE</div><div class="value">${esc(fmt(d.dte))}</div></div>
+    <div><div class="label">Score</div><div class="value">${esc(fmt(d.score))}</div></div>
+    <div><div class="label">CEO Gate</div><div class="value">${esc(fmt(d.ceo_gate))}</div></div>
+    <div><div class="label">RiskGuard</div><div class="value">${esc(fmt(d.risk_guard))}</div></div>
+    <div><div class="label">Final action</div><div class="value">${esc(fmt(d.final_action || d.decision))}</div></div>
+    <div><div class="label">Provenance</div><div class="value">${esc(fmt(d.provenance))}</div></div>
+    <div style="grid-column:1/-1"><div class="label">Reason</div><div class="value">${esc(fmt(d.reason))}</div></div>
   </div>`;
 }
 
-function renderOption(chain) {
-  const html = chain.available
-    ? kvHtml([
-        ["CE", chain.ce],
-        ["Strike", chain.strike],
-        ["PE", chain.pe],
-      ])
-    : `<div class="empty">${esc(chain.message || "Not available")}</div>
+function optionChainHtml(chain) {
+  if (!chain.available) {
+    return `<div class="empty">${esc(chain.message || "NOT AVAILABLE")}</div>
        <p class="muted">${esc(chain.label || "")}</p>`;
+  }
+  const rows = chain.rows || [];
+  if (!rows.length) {
+    return kvHtml([
+      ["CE", chain.ce],
+      ["Strike", chain.strike],
+      ["PE", chain.pe],
+      ["Provenance", chain.provenance],
+    ]);
+  }
+  const body = rows
+    .map(
+      (r) => `<tr>
+        <td>${esc(fmt(r.expiry))}</td>
+        <td>${esc(fmt(r.dte))}</td>
+        <td>${esc(fmt(r.strike))}</td>
+        <td>${esc(fmt(r.ce_ltp))}</td>
+        <td>${esc(fmt(r.ce_bid))}</td>
+        <td>${esc(fmt(r.ce_ask))}</td>
+        <td>${esc(fmt(r.pe_ltp))}</td>
+        <td>${esc(fmt(r.pe_bid))}</td>
+        <td>${esc(fmt(r.pe_ask))}</td>
+        <td>${esc(fmt(r.score))}</td>
+        <td>${esc(fmt(r.eligibility))}</td>
+        <td>${esc(fmt(r.rejection_reason))}</td>
+      </tr>`
+    )
+    .join("");
+  const selected = chain.selected
+    ? `<p class="muted">Selected: ${esc(fmt(chain.selected.instrument))} · ${esc(
+        fmt(chain.selected.option_type)
+      )} ${esc(fmt(chain.selected.strike))} ${esc(fmt(chain.selected.expiry))}</p>`
+    : "";
+  return `${selected}<div class="kv" style="margin-bottom:0.75rem">${kvHtml([
+    ["Provenance", chain.provenance],
+    ["Freshness", chain.freshness],
+    ["Snapshot", chain.snapshot_id],
+  ])}</div>
+  <table class="data">
+    <thead>
+      <tr>
+        <th>Expiry</th><th>DTE</th><th>Strike</th>
+        <th>CE LTP</th><th>CE bid</th><th>CE ask</th>
+        <th>PE LTP</th><th>PE bid</th><th>PE ask</th>
+        <th>Score</th><th>Eligibility</th><th>Rejection</th>
+      </tr>
+    </thead>
+    <tbody>${body}</tbody>
+  </table>`;
+}
+
+function renderOption(chain) {
+  const html = optionChainHtml(chain);
   document.getElementById("option-panel-dash").innerHTML = html;
   document.getElementById("option-page").innerHTML = html;
 }
@@ -151,15 +220,17 @@ function renderRisk(risk) {
   document.getElementById("risk-status").innerHTML = status;
   document.getElementById("risk-status-page").innerHTML = status;
   const rows = [
-    ["Paper capital", risk.paper_capital],
+    ["Starting capital", risk.starting_capital ?? risk.paper_capital],
     ["Available capital", risk.available_capital],
+    ["Daily P&L", risk.daily_pnl ?? risk.today_pnl],
     ["Max daily loss", risk.max_daily_loss],
+    ["Remaining daily risk", risk.remaining_daily_risk],
     ["Max risk / trade", risk.max_per_trade_risk],
-    ["Max open positions", risk.max_open_positions],
     ["Current exposure", risk.current_exposure],
     ["Open positions", risk.open_positions],
-    ["Today's P&L", risk.today_pnl],
-    ["Remaining daily risk", risk.remaining_daily_risk],
+    ["Max positions", risk.max_positions ?? risk.max_open_positions],
+    ["RiskGuard status", risk.status_label || risk.status],
+    ["Capital profile", risk.capital_profile],
     ["Ruleset", risk.ruleset],
   ];
   const html = kvHtml(rows);
@@ -170,7 +241,7 @@ function renderRisk(risk) {
 
 function renderAgentsPage(agents) {
   const el = document.getElementById("agents-page");
-  if (!agents.available) {
+  if (!agents.available && !(agents.decisions || []).length) {
     el.innerHTML = `<div class="empty">${esc(agents.message || "AI decision data not available")}</div>
       <div class="kv" style="margin-top:0.75rem">${kvHtml([
         ["Model provider", agents.model_provider],
@@ -183,7 +254,7 @@ function renderAgentsPage(agents) {
 
 function renderPlaceholder(id, payload) {
   const el = document.getElementById(id);
-  el.innerHTML = `<div class="empty">${esc(payload.message || "Not available")}</div>
+  el.innerHTML = `<div class="empty">${esc(payload.message || "NOT AVAILABLE")}</div>
     <p class="muted">${esc(payload.note || payload.label || "")}</p>`;
 }
 

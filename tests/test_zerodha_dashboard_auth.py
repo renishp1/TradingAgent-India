@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -110,7 +111,17 @@ class ZerodhaDashboardRouteTests(unittest.TestCase):
         self.assertFalse(body["can_place_orders"])
 
     def test_connect_requires_credentials(self) -> None:
-        res = _client().get("/api/zerodha/connect", follow_redirects=False)
+        cleared = {
+            "KITE_API_KEY": "",
+            "KITE_API_SECRET": "",
+            "KITE_ACCESS_TOKEN": "",
+            **_TEST_ENV,
+        }
+        with patch.dict("os.environ", cleared, clear=False):
+            # Ensure blanks win over a developer .env loaded earlier in the suite.
+            for key in ("KITE_API_KEY", "KITE_API_SECRET", "KITE_ACCESS_TOKEN"):
+                os.environ.pop(key, None)
+            res = _client().get("/api/zerodha/connect", follow_redirects=False)
         self.assertEqual(res.status_code, 400)
         self.assertIn("AUTH_MISSING", res.json()["error"])
 

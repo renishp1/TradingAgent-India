@@ -23,7 +23,15 @@ def lock_status() -> dict[str, Any]:
     }
 
 
-def snapshot(config: GrowConfig, book: PaperBook, last_cycle: CycleReport | None = None) -> dict[str, Any]:
+def snapshot(config: GrowConfig, book: PaperBook, last_cycle: CycleReport | Any | None = None) -> dict[str, Any]:
+    if last_cycle is None:
+        cycle_payload = None
+    elif hasattr(last_cycle, "to_dict"):
+        cycle_payload = last_cycle.to_dict()
+    elif isinstance(last_cycle, dict):
+        cycle_payload = dict(last_cycle)
+    else:
+        cycle_payload = last_cycle
     return {
         "lock": lock_status(),
         "config": {
@@ -35,7 +43,7 @@ def snapshot(config: GrowConfig, book: PaperBook, last_cycle: CycleReport | None
             "model_provider": config.model.provider,
         },
         "book": book.snapshot(),
-        "last_cycle": None if last_cycle is None else last_cycle.to_dict(),
+        "last_cycle": cycle_payload,
         "research_label": "HISTORICAL RESEARCH / NOT LIVE",
     }
 

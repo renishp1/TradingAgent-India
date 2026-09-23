@@ -347,9 +347,9 @@ class RemainingDailyRiskTests(unittest.TestCase):
         self.assertIn("remaining_daily_risk", risk)
         self.assertIn("max_daily_loss", risk)
         self.assertEqual(risk["max_daily_loss"], 2_000)
-        # Gap is acceptable if documented as Not available
+        # Gap is acceptable if documented as NOT AVAILABLE
         self.assertTrue(
-            risk["remaining_daily_risk"] == "Not available"
+            risk["remaining_daily_risk"] in {"Not available", "NOT AVAILABLE"}
             or isinstance(risk["remaining_daily_risk"], (int, float))
         )
 

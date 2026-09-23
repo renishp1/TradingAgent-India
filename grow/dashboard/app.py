@@ -281,7 +281,7 @@ def create_app(service: DashboardService | None = None) -> FastAPI:
         return JSONResponse(
             status_code=405,
             content={
-                "error": "Dashboard Phase 1 is read-only",
+                "error": "Dashboard is read-only",
                 "path": path,
                 "live_trading": False,
                 "broker_order_path": False,
