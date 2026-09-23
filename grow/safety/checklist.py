@@ -10,7 +10,7 @@ from __future__ import annotations
 import ast
 import inspect
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 from grow.campaign.config import (
     CAMPAIGN_CAPITAL_PROFILE,
@@ -29,6 +29,7 @@ from grow.market_data.provenance import MIXED_MARKET_DATA_SOURCE, MarketDataSour
 from grow.paper.engine import PaperExecutionEngine
 from grow.validation.historical import HISTORICAL_VALIDATION_VERSION
 from grow.validation.labels import EvaluationLabel
+from grow.safety.live_proofs import LIVE_PROOF_IDS, LiveProofHooks, run_zerodha_live_proofs
 
 
 CHECKLIST_SCHEMA = "grow.safety.production_checklist.v1"
@@ -60,16 +61,22 @@ class ProductionSafetyReport:
     schema: str = CHECKLIST_SCHEMA
 
     def to_dict(self) -> dict[str, Any]:
+        ready = self.live_trading_qualification_ready
         return {
             "schema": self.schema,
             "items": [item.to_dict() for item in self.items],
             "passed": self.passed,
             "failed": self.failed,
             "blocked": self.blocked,
-            "live_trading_qualification_ready": False,
+            "live_trading_qualification_ready": ready,
             "recommendation": (
-                "Do not start a live-trading qualification project until all "
-                "BLOCKED live-market proof items are cleared and failed count is 0."
+                "Live-trading qualification may proceed only when failed=0, blocked=0, "
+                "and every required live market-data proof is PASS."
+                if ready
+                else (
+                    "Do not start a live-trading qualification project until all "
+                    "BLOCKED live-market proof items are cleared and failed count is 0."
+                )
             ),
             "paper_mode": True,
             "live_trading": False,
@@ -103,7 +110,22 @@ def _module_forbids_broker(module: Any) -> bool:
     return not (names & forbidden or attrs & forbidden) and "place_live_order" not in source
 
 
-def run_production_safety_checklist() -> ProductionSafetyReport:
+def _qualification_ready(items: Sequence[ChecklistItem], *, failed: int, blocked: int) -> bool:
+    if failed != 0 or blocked != 0:
+        return False
+    by_id = {item.id: item for item in items}
+    for proof_id in LIVE_PROOF_IDS:
+        item = by_id.get(proof_id)
+        if item is None or item.status != "PASS":
+            return False
+    return True
+
+
+def run_production_safety_checklist(
+    *,
+    environ: Mapping[str, str] | None = None,
+    live_proof_hooks: LiveProofHooks | None = None,
+) -> ProductionSafetyReport:
     """Evaluate the post-Phase-13 production safety checklist against current main."""
 
     items: list[ChecklistItem] = []
@@ -159,15 +181,24 @@ def run_production_safety_checklist() -> ProductionSafetyReport:
         else _fail("no_broker_order_calls", "broker path did not refuse", "grow.execution.live")
     )
 
+    from grow.safety import live_proofs as live_proofs_mod
+
+    live_proofs_clean = True
+    try:
+        live_proofs_mod.assert_live_proofs_forbid_broker_orders()
+    except Exception:
+        live_proofs_clean = False
+
     items.append(
         _pass(
             "broker_order_path_false",
-            "Campaign / session / paper campaign modules forbid broker APIs",
-            "ast scan CampaignRunner/PaperSessionRunner/PaperCampaign",
+            "Campaign / session / paper campaign / live-proof modules forbid broker APIs",
+            "ast scan CampaignRunner/PaperSessionRunner/PaperCampaign + live_proofs call guard",
         )
         if _module_forbids_broker(CampaignRunner)
         and _module_forbids_broker(PaperSessionRunner)
         and _module_forbids_broker(PaperCampaign)
+        and live_proofs_clean
         else _fail("broker_order_path_false", "broker API symbols found in campaign path", "campaign modules")
     )
 
@@ -414,35 +445,16 @@ def run_production_safety_checklist() -> ProductionSafetyReport:
         else _fail("evaluation_labels", "label set incomplete", "grow.validation.labels")
     )
 
-    # Live Zerodha proof — known blocked without credentials
-    items.append(
-        _blocked(
-            "real_zerodha_ce_tick",
-            "Adapter + unit coverage exist; live CE tick not proven in this environment (AUTH_MISSING)",
-            "scripts/run_zerodha_smoke.py / tests/test_zerodha_market.py",
+    # Live Zerodha market-data proofs (attempted when credentials present).
+    for proof in run_zerodha_live_proofs(environ=environ, hooks=live_proof_hooks):
+        items.append(
+            ChecklistItem(
+                id=proof.id,
+                status=proof.status,
+                detail=proof.detail,
+                evidence=proof.evidence,
+            )
         )
-    )
-    items.append(
-        _blocked(
-            "real_zerodha_pe_tick",
-            "Adapter + unit coverage exist; live PE tick not proven in this environment (AUTH_MISSING)",
-            "scripts/run_zerodha_smoke.py / tests/test_zerodha_market.py",
-        )
-    )
-    items.append(
-        _blocked(
-            "websocket_reconnect_live_proof",
-            "Reconnect unit paths exist; live reconnect proof blocked on credentials (AUTH_MISSING)",
-            "grow.live_data.kite_market + phase3 tests",
-        )
-    )
-    items.append(
-        _blocked(
-            "real_option_chain_live_proof",
-            "Normalized option-chain path exists; live chain proof blocked on credentials (AUTH_MISSING)",
-            "KiteMarketProvider + option chain filter",
-        )
-    )
 
     # Default YAML still ₹10L — campaign path applies ₹10K profile explicitly
     default_cfg = load_config()
@@ -463,7 +475,7 @@ def run_production_safety_checklist() -> ProductionSafetyReport:
         passed=passed,
         failed=failed,
         blocked=blocked,
-        live_trading_qualification_ready=False,
+        live_trading_qualification_ready=_qualification_ready(items, failed=failed, blocked=blocked),
     )
 
 
