@@ -7,13 +7,13 @@ Paper-only; no broker path; not a third executor.
 
 from __future__ import annotations
 
-import fcntl
 import json
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
+from grow.campaign.fs_lock import exclusive_filesystem_lock
 from grow.campaign.runner import CampaignCycleResult
 from grow.decision.integration.contract import IntegratedDecision
 from grow.decision.integration.engine import DecisionEngine
@@ -279,9 +279,10 @@ def pnl_payload_from_position(position: PaperPosition) -> dict[str, Any]:
 class TradeReplayStore:
     """Append-only durable store for campaign trade replay records.
 
-    Durable append-only semantics are enforced under an OS-level exclusive
-    ``fcntl.flock`` on a per-decision lock file so separate processes cannot
-    race on the same ``decision_id``.
+    Durable append-only semantics are enforced under an exclusive cross-process
+    filesystem lock (``fcntl.flock`` on POSIX, ``msvcrt.locking`` on Windows)
+    on a per-decision lock file so separate processes cannot race on the same
+    ``decision_id``.
     """
 
     def __init__(self, root: Path | str) -> None:
@@ -300,16 +301,10 @@ class TradeReplayStore:
         return self.root / f".{self._safe_id(decision_id)}.lock"
 
     @contextmanager
-    def _decision_lock(self, decision_id: str) -> Iterator[None]:
+    def _decision_lock(self, decision_id: str) -> Iterator[str]:
         """Exclusive cross-process critical section for one decision_id."""
-        lock_path = self._lock_path_for(decision_id)
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(lock_path, "a+", encoding="utf-8") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        with exclusive_filesystem_lock(self._lock_path_for(decision_id)) as backend:
+            yield backend
 
     def _read_disk(self, decision_id: str) -> TradeReplayRecord | None:
         path = self._path_for(decision_id)

@@ -18,6 +18,7 @@ from grow.campaign import (
     verify_paper_fill_replay,
     verify_pnl_replay,
 )
+from grow.campaign.fs_lock import exclusive_filesystem_lock, filesystem_lock_backend
 from grow.campaign.replay import build_replay_record
 from grow.clock import IST, FrozenClock
 from grow.config import load_config
@@ -130,6 +131,84 @@ def _runner(store: TradeReplayStore, *, clock=None) -> CampaignRunner:
         apply_campaign_defaults=False,
         replay_store=store,
     )
+
+
+class Phase11LockBackendTests(unittest.TestCase):
+    def test_replay_module_imports_without_top_level_fcntl(self) -> None:
+        """replay.py must not import fcntl at module scope (Windows-safe)."""
+        import ast
+        from pathlib import Path as P
+
+        source = (P(__file__).resolve().parents[1] / "grow" / "campaign" / "replay.py").read_text(
+            encoding="utf-8"
+        )
+        tree = ast.parse(source)
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    self.assertNotEqual(alias.name, "fcntl")
+            if isinstance(node, ast.ImportFrom):
+                self.assertNotEqual(node.module, "fcntl")
+        # Module must still import cleanly on this host.
+        import grow.campaign.replay as replay_mod
+
+        self.assertTrue(hasattr(replay_mod, "TradeReplayStore"))
+        self.assertNotIn("fcntl", getattr(replay_mod, "__dict__", {}))
+
+    def test_filesystem_lock_backend_selection(self) -> None:
+        self.assertEqual(filesystem_lock_backend("linux"), "fcntl")
+        self.assertEqual(filesystem_lock_backend("darwin"), "fcntl")
+        self.assertEqual(filesystem_lock_backend("win32"), "msvcrt")
+        self.assertEqual(filesystem_lock_backend("win_amd64"), "msvcrt")
+
+    def test_windows_backend_path_is_exercised_without_fcntl_import(self) -> None:
+        """Simulate win32: exclusive_filesystem_lock must use msvcrt, not fcntl."""
+        import sys
+        import types
+        from unittest import mock
+
+        calls: list[str] = []
+        saved_fcntl = sys.modules.get("fcntl")
+
+        class _FakeMsvcrt:
+            LK_NBLCK = 1
+            LK_UNLCK = 2
+
+            @staticmethod
+            def locking(fd, mode, nbytes):
+                calls.append(f"lock:{mode}:{nbytes}")
+
+        fake = types.ModuleType("msvcrt")
+        fake.LK_NBLCK = _FakeMsvcrt.LK_NBLCK
+        fake.LK_UNLCK = _FakeMsvcrt.LK_UNLCK
+        fake.locking = _FakeMsvcrt.locking
+
+        with tempfile.TemporaryDirectory() as tmp:
+            lock_path = Path(tmp) / "win.lock"
+            with mock.patch.object(sys, "platform", "win32"), mock.patch.dict(
+                sys.modules, {"msvcrt": fake}, clear=False
+            ):
+                sys.modules.pop("fcntl", None)
+                with exclusive_filesystem_lock(lock_path) as backend:
+                    self.assertEqual(backend, "msvcrt")
+                    self.assertNotIn("fcntl", sys.modules)
+            self.assertTrue(any(c.startswith("lock:") for c in calls))
+            self.assertGreaterEqual(len(calls), 2)  # lock + unlock
+        if saved_fcntl is not None:
+            sys.modules["fcntl"] = saved_fcntl
+        elif "fcntl" not in sys.modules:
+            import fcntl as _fcntl  # noqa: F401 — restore for later POSIX tests
+
+            sys.modules["fcntl"] = _fcntl
+
+    def test_posix_backend_is_exercised_on_this_host(self) -> None:
+        if filesystem_lock_backend() != "fcntl":
+            self.skipTest("POSIX fcntl backend not active on this host")
+        with tempfile.TemporaryDirectory() as tmp:
+            lock_path = Path(tmp) / "posix.lock"
+            with exclusive_filesystem_lock(lock_path) as backend:
+                self.assertEqual(backend, "fcntl")
+                self.assertTrue(lock_path.is_file())
 
 
 class Phase11TradeReplayTests(unittest.TestCase):
