@@ -140,8 +140,13 @@ class PaperSessionRunner:
         return tuple(self._cycles)
 
     def start(self) -> str:
-        """Begin a paper-only session. Rejects live/broker configuration."""
-        if self._status not in {"CREATED", "ENDED"}:
+        """Begin a paper-only session. Lifecycle: CREATED → RUNNING → ENDED.
+
+        Once ENDED, the runner is terminal. Construct a new ``PaperSessionRunner``
+        (with a fresh ``CampaignRunner`` / paper engine) for another session —
+        do not restart this instance over an inherited ledger.
+        """
+        if self._status != "CREATED":
             raise GrowSafetyError(f"paper session cannot start from status={self._status}")
         assert_paper_runtime(self.config.execution.mode, self.config.execution.live_trading_enabled, "PAPER")
         if self.config.execution.live_trading_enabled or self.config.live_data.live_trading:
@@ -151,9 +156,6 @@ class PaperSessionRunner:
         self._started_at = self.clock.now()
         self._ended_at = None
         self._status = "RUNNING"
-        self._cycles.clear()
-        self._monitor_events.clear()
-        self._equity = SessionEquityTracker(starting_cash=float(self.config.paper.starting_cash))
         self._equity.record(self._started_at, cash=float(self.paper.ledger.book.cash), unrealized=0.0)
         return self.session_id
 

@@ -279,6 +279,38 @@ class Phase10SessionRunnerTests(unittest.TestCase):
         with self.assertRaises(GrowSafetyError):
             runner.process_snapshot(_snapshot(), monitor=False)
 
+    def test_lifecycle_created_running_ended_is_terminal(self) -> None:
+        """CREATED → RUNNING → ENDED; start() after ENDED must fail closed."""
+        runner, _clock = _session()
+        self.assertEqual(runner.status, "CREATED")
+        session_id = runner.start()
+        self.assertEqual(runner.status, "RUNNING")
+        self.assertTrue(session_id)
+
+        runner.process_snapshot(_snapshot(), cycle_id="cycle-p10-life-open", monitor=False)
+        self.assertEqual(len(runner.paper.positions.open_positions()), 1)
+        open_ids = {row.position_id for row in runner.paper.positions.open_positions()}
+        cash_after_fill = runner.paper.ledger.book.cash
+        fills_after_fill = len(runner.paper.ledger.book.fills)
+
+        summary = runner.end()
+        self.assertEqual(runner.status, "ENDED")
+        self.assertEqual(summary.status, "ENDED")
+
+        with self.assertRaises(GrowSafetyError) as start_ctx:
+            runner.start()
+        self.assertIn("ENDED", str(start_ctx.exception))
+
+        with self.assertRaises(GrowSafetyError):
+            runner.process_snapshot(_snapshot(), cycle_id="cycle-p10-life-again", monitor=False)
+
+        # Inherited paper book must remain the ended session's book — not a fresh session.
+        self.assertEqual({row.position_id for row in runner.paper.positions.open_positions()}, open_ids)
+        self.assertEqual(runner.paper.ledger.book.cash, cash_after_fill)
+        self.assertEqual(len(runner.paper.ledger.book.fills), fills_after_fill)
+        self.assertEqual(len(runner.cycles), 1)
+        self.assertEqual(runner.paper.broker_order_calls, 0)
+
     def test_live_trading_snapshot_rejected(self) -> None:
         runner, _clock = _session()
         runner.start()
