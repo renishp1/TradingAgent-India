@@ -267,6 +267,93 @@ class Phase13PaperCampaignTests(unittest.TestCase):
             assert_campaign_snapshot_label("FIXTURE", (fixture, live))
         self.assertIn("PAPER_CAMPAIGN_SNAPSHOT_PROVENANCE_MIXED", str(ctx.exception))
 
+    def test_live_paper_rejects_quote_level_mixed_provenance(self) -> None:
+        """LIVE-intended snapshot with one fixture option quote → MIXED → reject."""
+        day = date(2026, 9, 22)
+        as_of = datetime(day.year, day.month, day.day, 11, 0, tzinfo=IST)
+        live_ce = replace(_quote(as_of), is_fixture=False)
+        fixture_pe = replace(
+            _quote(as_of, option_type="PE", provider_contract_id="RELIANCE-2500-PE", strike=2500.0),
+            is_fixture=True,
+        )
+        # Top-level builder starts fixture; replace options so classification is MIXED.
+        base = build_fixture_snapshot(
+            underlying="RELIANCE",
+            as_of=as_of,
+            spot=2500.0,
+            option_contracts=(live_ce, fixture_pe),
+            provider="kite.paper.live.test",
+        )
+        mixed = replace(base, option_contracts=(live_ce, fixture_pe), provider="kite.paper.live.test")
+        self.assertEqual(mixed.market_data_source, MarketDataSource.MIXED)
+        self.assertFalse(mixed.is_fixture)
+
+        campaign = PaperCampaign(
+            _config(),
+            risk_secret=TEST_RISK_SECRET,
+            evaluation_label="LIVE-PAPER",
+            specialists=(_AbstainSpecialist(),),
+            apply_campaign_defaults=False,
+        )
+        feed = SessionFeed(session_date=day, snapshots=(mixed,))
+        with self.assertRaises(GrowConfigError) as ctx:
+            campaign.run_session(feed)
+        self.assertIn("MIXED_MARKET_DATA_SOURCE", str(ctx.exception))
+        self.assertEqual(campaign.eod_reports, ())
+        self.assertEqual(campaign.status, "CREATED")
+        # Fail-closed with no completed session and no broker activity claim.
+        with self.assertRaises(GrowConfigError):
+            campaign.report()
+
+    def test_worst_session_drawdown_is_min_of_session_drawdowns(self) -> None:
+        campaign = PaperCampaign(
+            _config(),
+            risk_secret=TEST_RISK_SECRET,
+            evaluation_label="FIXTURE",
+            specialists=(_AbstainSpecialist(),),
+            apply_campaign_defaults=False,
+        )
+        base = campaign.run_session(_feed(date(2026, 9, 21)))
+        # Inject known non-positive session drawdowns; engines are per-session so
+        # campaign drawdown is worst single-session value, not continuous capital.
+        campaign._eods = [
+            replace(base, summary={**dict(base.summary), "max_drawdown": -500.0}, session_date=date(2026, 9, 21)),
+            replace(base, summary={**dict(base.summary), "max_drawdown": -1500.0}, session_date=date(2026, 9, 22)),
+            replace(base, summary={**dict(base.summary), "max_drawdown": -250.0}, session_date=date(2026, 9, 23)),
+        ]
+        report = campaign.report()
+        self.assertEqual(report.worst_session_drawdown, -1500.0)
+        payload = report.to_dict()
+        self.assertEqual(payload["worst_session_drawdown"], -1500.0)
+        self.assertNotIn("combined_max_drawdown", payload)
+
+    def test_campaign_run_is_one_shot(self) -> None:
+        feeds = (
+            _feed(date(2026, 9, 21)),
+            _feed(date(2026, 9, 22)),
+        )
+        campaign = PaperCampaign(
+            _config(),
+            risk_secret=TEST_RISK_SECRET,
+            evaluation_label="FIXTURE",
+            specialists=(_AbstainSpecialist(),),
+            apply_campaign_defaults=False,
+        )
+        first = campaign.run(feeds)
+        self.assertEqual(first.session_count, 2)
+        self.assertEqual(campaign.status, "ENDED")
+        self.assertEqual(first.broker_order_calls, 0)
+        self.assertEqual(first.to_dict()["broker_order_calls"], 0)
+        with self.assertRaises(GrowSafetyError) as ctx:
+            campaign.run(feeds)
+        self.assertIn("construct a fresh PaperCampaign", str(ctx.exception))
+        self.assertEqual(len(campaign.eod_reports), 2)
+        with self.assertRaises(GrowSafetyError):
+            campaign.run_session(_feed(date(2026, 9, 23)))
+        self.assertEqual(len(campaign.eod_reports), 2)
+        # Rerun rejection leaves broker_order_calls at zero on the completed report.
+        self.assertEqual(campaign.report().broker_order_calls, 0)
+
     def test_historical_label_forbidden_for_paper_campaign(self) -> None:
         with self.assertRaises(GrowConfigError) as ctx:
             PaperCampaign(

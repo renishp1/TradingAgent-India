@@ -72,7 +72,12 @@ class SessionFeed:
 
 @dataclass(frozen=True)
 class PaperCampaignReport:
-    """Roll-up across all sessions in one paper campaign."""
+    """Roll-up across all sessions in one paper campaign.
+
+    Each session uses a fresh paper engine, so drawdown is not continuous capital.
+    ``worst_session_drawdown`` is the most negative single-session peak-to-trough
+    drawdown (min of session ``max_drawdown`` values), not a combined equity curve.
+    """
 
     campaign_id: str
     evaluation_label: str
@@ -82,7 +87,7 @@ class PaperCampaignReport:
     total_trades: int
     total_rejected: int
     combined_net_pnl: float
-    combined_max_drawdown: float
+    worst_session_drawdown: float
     eod_paths: tuple[str, ...]
     profitability_claim: bool = False
     broker_order_calls: int = 0
@@ -102,7 +107,7 @@ class PaperCampaignReport:
             "total_trades": self.total_trades,
             "total_rejected": self.total_rejected,
             "combined_net_pnl": self.combined_net_pnl,
-            "combined_max_drawdown": self.combined_max_drawdown,
+            "worst_session_drawdown": self.worst_session_drawdown,
             "eod_paths": list(self.eod_paths),
             "profitability_claim": False,
             "broker_order_calls": 0,
@@ -206,7 +211,12 @@ class PaperCampaign:
         )
         self._eods: list[SessionEODReport] = []
         self._eod_paths: list[str] = []
+        self._status = "CREATED"
         self.campaign_version = PAPER_CAMPAIGN_VERSION
+
+    @property
+    def status(self) -> str:
+        return self._status
 
     @property
     def eod_reports(self) -> tuple[SessionEODReport, ...]:
@@ -215,8 +225,16 @@ class PaperCampaign:
     def run_session(self, feed: SessionFeed) -> SessionEODReport:
         """Run one paper session and emit its EOD report."""
 
+        if self._status == "ENDED":
+            raise GrowSafetyError(
+                "paper campaign has ended; construct a fresh PaperCampaign for another run"
+            )
+
         assert_single_evaluation_label([self.evaluation_label])
         assert_campaign_snapshot_label(self.evaluation_label, feed.snapshots)
+
+        if self._status == "CREATED":
+            self._status = "RUNNING"
 
         clock = self.clock_factory(feed.session_date, feed.snapshots)
         campaign = CampaignRunner(
@@ -266,8 +284,22 @@ class PaperCampaign:
         return eod
 
     def run(self, feeds: Sequence[SessionFeed]) -> PaperCampaignReport:
-        """Run multiple NSE paper sessions chronologically and roll up results."""
+        """Run multiple NSE paper sessions chronologically and roll up results.
 
+        One-shot lifecycle (Phase 10 session pattern): CREATED → RUNNING → ENDED.
+        A second ``run()`` on the same instance is rejected; construct a fresh
+        ``PaperCampaign`` instead of resetting accumulated EODs.
+        """
+
+        if self._status != "CREATED":
+            raise GrowSafetyError(
+                f"paper campaign cannot run from status={self._status}; "
+                "construct a fresh PaperCampaign"
+            )
+        if self._eods or self._eod_paths:
+            raise GrowSafetyError(
+                "paper campaign already has session EODs; construct a fresh PaperCampaign"
+            )
         if not feeds:
             raise GrowConfigError("PAPER_CAMPAIGN_NO_SESSIONS")
         ordered = tuple(sorted(feeds, key=lambda feed: feed.session_date))
@@ -279,17 +311,21 @@ class PaperCampaign:
         all_snaps = [snap for feed in ordered for snap in feed.snapshots]
         assert_campaign_snapshot_label(self.evaluation_label, all_snaps)
 
+        self._status = "RUNNING"
         for feed in ordered:
             self.run_session(feed)
 
-        return self.report()
+        report = self.report()
+        self._status = "ENDED"
+        return report
 
     def report(self) -> PaperCampaignReport:
         if not self._eods:
             raise GrowConfigError("PAPER_CAMPAIGN_NO_EOD")
         assert_no_fixture_profitability_claim(self.evaluation_label, profitability_claim=False)
         combined_net = round(sum(float(eod.summary.get("net_pnl", 0.0)) for eod in self._eods), 4)
-        combined_dd = round(min(float(eod.summary.get("max_drawdown", 0.0)) for eod in self._eods), 4)
+        # Per-session engines: take the worst (most negative) single-session drawdown.
+        worst_dd = round(min(float(eod.summary.get("max_drawdown", 0.0)) for eod in self._eods), 4)
         return PaperCampaignReport(
             campaign_id=self.campaign_id,
             evaluation_label=self.evaluation_label.value,
@@ -299,7 +335,7 @@ class PaperCampaign:
             total_trades=sum(int(eod.telemetry.get("trade_count", 0)) for eod in self._eods),
             total_rejected=sum(int(eod.telemetry.get("rejected_decision_count", 0)) for eod in self._eods),
             combined_net_pnl=combined_net,
-            combined_max_drawdown=combined_dd,
+            worst_session_drawdown=worst_dd,
             eod_paths=tuple(self._eod_paths),
             profitability_claim=False,
             broker_order_calls=0,
