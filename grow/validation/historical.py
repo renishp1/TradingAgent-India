@@ -27,7 +27,11 @@ from grow.market_data.normalized.models import (
     UnderlyingQuoteView,
     snapshot_digest,
 )
-from grow.market_data.provenance import MarketDataSource, classify_fixture_flags
+from grow.market_data.provenance import (
+    MarketDataSource,
+    classify_agent_snapshot,
+    classify_fixture_flags,
+)
 from grow.validation.availability import assert_historical_not_today
 from grow.validation.labels import (
     EvaluationLabel,
@@ -44,6 +48,67 @@ from grow.validation.runner import WalkForwardValidationResult, WalkForwardValid
 
 
 HISTORICAL_VALIDATION_VERSION = "grow.validation.historical.v1"
+HISTORICAL_FIXTURE_PROVENANCE_FORBIDDEN = "HISTORICAL_FIXTURE_PROVENANCE_FORBIDDEN"
+HISTORICAL_MIXED_PROVENANCE_FORBIDDEN = "HISTORICAL_MIXED_PROVENANCE_FORBIDDEN"
+HISTORICAL_FIXTURE_QUOTE_FORBIDDEN = "HISTORICAL_FIXTURE_QUOTE_FORBIDDEN"
+HISTORICAL_PROVENANCE_MIXED_ACROSS_CYCLES = "HISTORICAL_PROVENANCE_MIXED_ACROSS_CYCLES"
+
+
+def snapshot_option_provenance(snapshot: AgentMarketSnapshot) -> MarketDataSource:
+    """Classify option provenance from the actual snapshot quotes (not store meta)."""
+
+    contracts = tuple(snapshot.option_contracts or ())
+    if contracts:
+        return classify_fixture_flags(bool(row.is_fixture) for row in contracts)
+    source = getattr(snapshot, "market_data_source", None)
+    if isinstance(source, MarketDataSource):
+        return source
+    return classify_agent_snapshot(snapshot)
+
+
+def assert_historical_evaluation_provenance(
+    evaluation_label: str | EvaluationLabel,
+    cycles: Sequence[HistoricalCycle],
+) -> MarketDataSource | None:
+    """Fail closed when a HISTORICAL evaluation consumes fixture or mixed PIT data.
+
+    Inspects every cycle snapshot's option-quote provenance. Store metadata alone
+    is not sufficient: FIXTURE / MIXED quotes, or provenance that differs across
+    cycles, reject the entire evaluation.
+    """
+
+    label = parse_evaluation_label(evaluation_label)
+    if label is not EvaluationLabel.HISTORICAL:
+        return None
+    if not cycles:
+        raise GrowConfigError("HISTORICAL_NO_CYCLES")
+
+    sources: list[MarketDataSource] = []
+    for cycle in cycles:
+        snap = cycle.snapshot
+        source = snapshot_option_provenance(snap)
+        sources.append(source)
+        if any(bool(row.is_fixture) for row in snap.option_contracts) and source is MarketDataSource.LIVE:
+            # Inconsistent stamp: fixture flags present but classification says LIVE.
+            raise GrowConfigError(HISTORICAL_FIXTURE_QUOTE_FORBIDDEN)
+
+    unique = {item.value for item in sources}
+    if len(unique) > 1:
+        raise GrowConfigError(HISTORICAL_PROVENANCE_MIXED_ACROSS_CYCLES)
+
+    only = sources[0]
+    if only is MarketDataSource.FIXTURE:
+        raise GrowConfigError(HISTORICAL_FIXTURE_PROVENANCE_FORBIDDEN)
+    if only is MarketDataSource.MIXED:
+        raise GrowConfigError(HISTORICAL_MIXED_PROVENANCE_FORBIDDEN)
+    if any(bool(cycle.snapshot.is_fixture) for cycle in cycles):
+        raise GrowConfigError(HISTORICAL_FIXTURE_PROVENANCE_FORBIDDEN)
+    if any(bool(row.is_fixture) for cycle in cycles for row in cycle.snapshot.option_contracts):
+        raise GrowConfigError(HISTORICAL_FIXTURE_QUOTE_FORBIDDEN)
+    if only is not MarketDataSource.LIVE:
+        raise GrowConfigError(f"HISTORICAL_NON_LIVE_PROVENANCE:{only.value}")
+    return only
+
 
 
 @dataclass(frozen=True)
@@ -169,26 +234,40 @@ def build_historical_agent_snapshot(
     chain_ids = {c.provider_contract_id for c in chain.contracts}
     assert_historical_not_today(historical_ids, chain_ids)
 
-    is_fixture = bool(store.meta.is_fixture)
+    store_fixture = bool(store.meta.is_fixture) or bool(chain.is_fixture)
+    hist_contracts, hist_quotes = store.snapshot_quotes(underlying, moment)
+    hist_by_provider = {c.provider_contract_id: c for c in hist_contracts}
+    hist_by_id = {c.contract_id: c for c in hist_contracts}
+    quote_by_cid = {q.contract_id: q for q in hist_quotes}
     options: list[OptionQuoteView] = []
     for contract in chain.contracts:
         age = (moment - contract.timestamp.astimezone(IST)).total_seconds()
         if age < 0:
             raise GrowConfigError("LOOKAHEAD_OPTION_QUOTE")
         lot = None
-        try:
-            resolved = store.contract_for_candidate(
-                underlying=contract.underlying,
-                expiry=contract.expiry,
-                strike=float(contract.strike),
-                option_type=contract.option_type.value,
-                as_of=moment,
-                provider_contract_id=contract.provider_contract_id,
-            )
-            if resolved is not None:
-                lot = resolved.lot_size
-        except GrowConfigError:
-            lot = None
+        resolved = hist_by_provider.get(contract.provider_contract_id)
+        if resolved is None:
+            try:
+                resolved = store.contract_for_candidate(
+                    underlying=contract.underlying,
+                    expiry=contract.expiry,
+                    strike=float(contract.strike),
+                    option_type=contract.option_type.value,
+                    as_of=moment,
+                    provider_contract_id=contract.provider_contract_id,
+                )
+            except GrowConfigError:
+                resolved = None
+        if resolved is not None:
+            lot = resolved.lot_size
+            hist_by_id.setdefault(resolved.contract_id, resolved)
+        raw_quote = None
+        if resolved is not None:
+            raw_quote = quote_by_cid.get(resolved.contract_id)
+        # Per-quote provenance: store/chain fixture OR explicit FIXTURE quality flag.
+        quote_fixture = store_fixture
+        if raw_quote is not None and any(str(flag).upper() == "FIXTURE" for flag in raw_quote.quality_flags):
+            quote_fixture = True
         options.append(
             OptionQuoteView(
                 underlying=contract.underlying,
@@ -212,7 +291,7 @@ def build_historical_agent_snapshot(
                 theta=contract.theta,
                 vega=contract.vega,
                 expiry_class=contract.expiry_class.value if contract.expiry_class is not None else None,
-                is_fixture=is_fixture,
+                is_fixture=quote_fixture,
             )
         )
     pit_options = filter_quotes_pit(options, moment)
@@ -237,7 +316,7 @@ def build_historical_agent_snapshot(
     source = (
         classify_fixture_flags(row.is_fixture for row in pit_options)
         if pit_options
-        else (MarketDataSource.FIXTURE if is_fixture else MarketDataSource.LIVE)
+        else (MarketDataSource.FIXTURE if store_fixture else MarketDataSource.LIVE)
     )
     version = snapshot_digest(
         {
@@ -389,6 +468,9 @@ class HistoricalValidationCampaign:
         )
         if not cycles:
             raise GrowConfigError("HISTORICAL_NO_CYCLES")
+
+        # Fail closed on actual PIT option provenance — not store.meta alone.
+        assert_historical_evaluation_provenance(self.evaluation_label, cycles)
 
         # Re-check today-chain substitution against the actual cycle universe.
         cycle_universe = {

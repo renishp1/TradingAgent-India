@@ -8,6 +8,7 @@ import unittest
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 from grow.backtest.calendar import weekday_sessions
 from grow.clock import IST
@@ -32,14 +33,20 @@ from grow.history.models import (
 )
 from grow.history.sample import build_sample_store
 from grow.history.store import CanonicalStore
-from grow.market_data.normalized.models import DataQualityStatus
+from grow.market_data.normalized.models import DataQualityStatus, OptionQuoteView
+from grow.market_data.provenance import MarketDataSource
 from grow.orchestration.models import AggregateAnalysisPackage
 from grow.validation.availability import assert_historical_not_today
 from grow.validation.historical import (
+    HISTORICAL_FIXTURE_PROVENANCE_FORBIDDEN,
+    HISTORICAL_MIXED_PROVENANCE_FORBIDDEN,
+    HISTORICAL_PROVENANCE_MIXED_ACROSS_CYCLES,
     HistoricalValidationCampaign,
+    assert_historical_evaluation_provenance,
     build_historical_agent_snapshot,
     build_historical_cycles,
     listed_contracts_from_store,
+    snapshot_option_provenance,
 )
 from grow.validation.labels import (
     EvaluationLabel,
@@ -484,6 +491,120 @@ class HistoricalPitCampaignTests(unittest.TestCase):
                 today_universe={"NIFTY-2099-01-01-99999-CE"},
             )
         self.assertIn("TODAY_CHAIN_RECONSTRUCTION_FORBIDDEN", str(ctx.exception))
+
+    def test_historical_campaign_rejects_fixture_option_quote_in_non_fixture_store(self) -> None:
+        store = _build_historical_store(sessions=5, publish=False)
+        self.assertFalse(store.meta.is_fixture)
+        idx = next(
+            i
+            for i, quote in enumerate(store._quotes)
+            if store.contract(quote.contract_id).underlying == "NIFTY"
+        )
+        polluted = replace(store._quotes[idx], quality_flags=("FIXTURE",))
+        store._quotes[idx] = polluted
+        store.publish()
+
+        campaign = HistoricalValidationCampaign(
+            store,
+            risk_secret=TEST_RISK_SECRET,
+            config=_config(),
+            qualification=_qualification(store),
+            evaluation_label="HISTORICAL",
+            underlying="NIFTY",
+        )
+        cycles = build_historical_cycles(store, underlying="NIFTY")
+        packages = _packages_for_cycles(cycles)
+        with self.assertRaises(GrowConfigError) as ctx:
+            campaign.run(packages=packages, include_fee_stress=False)
+        text = str(ctx.exception)
+        self.assertTrue(
+            HISTORICAL_MIXED_PROVENANCE_FORBIDDEN in text
+            or HISTORICAL_PROVENANCE_MIXED_ACROSS_CYCLES in text
+            or "HISTORICAL_FIXTURE_QUOTE_FORBIDDEN" in text,
+            msg=text,
+        )
+
+    def test_historical_campaign_rejects_mixed_option_provenance_snapshot(self) -> None:
+        store = _build_historical_store(sessions=5)
+        campaign = HistoricalValidationCampaign(
+            store,
+            risk_secret=TEST_RISK_SECRET,
+            config=_config(),
+            qualification=_qualification(store),
+            evaluation_label="HISTORICAL",
+            underlying="NIFTY",
+        )
+        cycles = build_historical_cycles(store, underlying="NIFTY")
+        self.assertGreaterEqual(len(cycles), 2)
+        base = cycles[0].snapshot
+        mixed_options = tuple(
+            replace(row, is_fixture=(i == 0)) for i, row in enumerate(base.option_contracts)
+        )
+        mixed_snap = replace(base, option_contracts=mixed_options)
+        self.assertEqual(snapshot_option_provenance(mixed_snap), MarketDataSource.MIXED)
+        mixed_cycles = tuple(
+            replace(cycle, snapshot=mixed_snap) if i == 0 else cycle for i, cycle in enumerate(cycles)
+        )
+        with self.assertRaises(GrowConfigError) as ctx:
+            assert_historical_evaluation_provenance("HISTORICAL", mixed_cycles)
+        self.assertIn(HISTORICAL_PROVENANCE_MIXED_ACROSS_CYCLES, str(ctx.exception))
+
+        packages = _packages_for_cycles(cycles)
+        with patch("grow.validation.historical.build_historical_cycles", return_value=mixed_cycles):
+            with self.assertRaises(GrowConfigError) as ctx:
+                campaign.run(packages=packages, include_fee_stress=False)
+        self.assertIn(HISTORICAL_PROVENANCE_MIXED_ACROSS_CYCLES, str(ctx.exception))
+
+    def test_historical_campaign_rejects_mixed_provenance_across_cycles(self) -> None:
+        store = _build_historical_store(sessions=5)
+        campaign = HistoricalValidationCampaign(
+            store,
+            risk_secret=TEST_RISK_SECRET,
+            config=_config(),
+            qualification=_qualification(store),
+            evaluation_label="HISTORICAL",
+            underlying="NIFTY",
+        )
+        cycles = build_historical_cycles(store, underlying="NIFTY")
+        self.assertGreaterEqual(len(cycles), 2)
+        fixture_snap = replace(
+            cycles[1].snapshot,
+            option_contracts=tuple(replace(row, is_fixture=True) for row in cycles[1].snapshot.option_contracts),
+        )
+        self.assertEqual(snapshot_option_provenance(fixture_snap), MarketDataSource.FIXTURE)
+        mixed_cycles = tuple(
+            replace(cycle, snapshot=fixture_snap) if i == 1 else cycle for i, cycle in enumerate(cycles)
+        )
+        with self.assertRaises(GrowConfigError) as ctx:
+            assert_historical_evaluation_provenance("HISTORICAL", mixed_cycles)
+        self.assertIn(HISTORICAL_PROVENANCE_MIXED_ACROSS_CYCLES, str(ctx.exception))
+
+        packages = _packages_for_cycles(cycles)
+        with patch("grow.validation.historical.build_historical_cycles", return_value=mixed_cycles):
+            with self.assertRaises(GrowConfigError) as ctx:
+                campaign.run(packages=packages, include_fee_stress=False)
+        self.assertIn(HISTORICAL_PROVENANCE_MIXED_ACROSS_CYCLES, str(ctx.exception))
+
+    def test_historical_rejects_uniform_mixed_and_fixture_snapshots(self) -> None:
+        store = _build_historical_store(sessions=3)
+        cycles = build_historical_cycles(store, underlying="NIFTY")
+        mixed_options = tuple(
+            replace(row, is_fixture=(i % 2 == 0)) for i, row in enumerate(cycles[0].snapshot.option_contracts)
+        )
+        mixed_snap = replace(cycles[0].snapshot, option_contracts=mixed_options)
+        all_mixed = tuple(replace(cycle, snapshot=mixed_snap) for cycle in cycles)
+        with self.assertRaises(GrowConfigError) as ctx:
+            assert_historical_evaluation_provenance("HISTORICAL", all_mixed)
+        self.assertIn(HISTORICAL_MIXED_PROVENANCE_FORBIDDEN, str(ctx.exception))
+
+        fixture_snap = replace(
+            cycles[0].snapshot,
+            option_contracts=tuple(replace(row, is_fixture=True) for row in cycles[0].snapshot.option_contracts),
+        )
+        all_fixture = tuple(replace(cycle, snapshot=fixture_snap) for cycle in cycles)
+        with self.assertRaises(GrowConfigError) as ctx:
+            assert_historical_evaluation_provenance("HISTORICAL", all_fixture)
+        self.assertIn(HISTORICAL_FIXTURE_PROVENANCE_FORBIDDEN, str(ctx.exception))
 
     def test_synthetic_campaign_never_claims_profitability(self) -> None:
         store = build_sample_store()

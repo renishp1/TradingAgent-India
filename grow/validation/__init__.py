@@ -9,9 +9,11 @@ from grow.validation.historical import (
     HISTORICAL_VALIDATION_VERSION,
     HistoricalValidationCampaign,
     HistoricalValidationResult,
+    assert_historical_evaluation_provenance,
     build_historical_agent_snapshot,
     build_historical_cycles,
     listed_contracts_from_store,
+    snapshot_option_provenance,
 )
 from grow.validation.labels import (
     EvaluationLabel,
@@ -34,6 +36,7 @@ __all__ = [
     "WalkForwardValidationResult",
     "WalkForwardValidationRunner",
     "WalkWindow",
+    "assert_historical_evaluation_provenance",
     "assert_no_fixture_profitability_claim",
     "assert_single_evaluation_label",
     "build_historical_agent_snapshot",
@@ -41,5 +44,6 @@ __all__ = [
     "classify_store_evaluation_label",
     "listed_contracts_from_store",
     "require_historical_evaluation_dataset",
+    "snapshot_option_provenance",
     "split_walk_windows",
 ]
