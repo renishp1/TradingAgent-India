@@ -55,7 +55,7 @@ function renderMarket(market) {
     <div class="kpi">
       <div class="label">Market Status</div>
       <div class="value">${esc(fmt(market.session_state))}</div>
-      <div class="tag">Market Data: ${esc(fmt(market.market_data))}</div>
+      <div class="tag">Data: ${esc(fmt(market.market_data))} · Zerodha: ${esc(fmt(market.zerodha_status))}</div>
     </div>`;
   const noteBits = [
     market.note,
@@ -69,7 +69,7 @@ function renderMarket(market) {
   document.getElementById("market-data-note").textContent =
     noteBits.join(" · ") || "Market state from session calendar + Zerodha / snapshot artifacts.";
   document.getElementById("market-status-pill").textContent =
-    `Market: ${fmt(market.session_state)} · Data: ${fmt(market.market_data)}`;
+    `Market: ${fmt(market.session_state)} · Data: ${fmt(market.market_data)} · Zerodha: ${fmt(market.zerodha_status)}`;
 }
 
 function renderSystem(system) {
@@ -456,14 +456,28 @@ async function refresh(opts = {}) {
   renderAgentsPage(data.agents || {});
   renderPlaceholder("signals-page", data.signals || {});
   renderPlaceholder("research-page", data.research || {});
-  const q = opts.probe ? "?probe=1" : "";
-  const settings = await getJson(`/api/settings${q}`);
+  // Prefer verified Zerodha block embedded in /api/dashboard market payload so
+  // Settings cannot flip CONNECTED → DISCONNECTED on unprobed refresh.
+  const zFromMarket = (data.market && data.market.zerodha) || {
+    status: data.market && data.market.zerodha_status,
+    access_token_present: undefined,
+    purpose: "market_data_only",
+  };
+  const settings = await getJson("/api/settings");
   document.getElementById("settings-page").textContent = JSON.stringify(settings, null, 2);
-  renderZerodha(settings.zerodha_market_data || {});
+  // Prefer dashboard market.zerodha (verified) when present so Settings never
+  // paints an unverified DISCONNECTED over LIVE market status.
+  const zMarket = data.market && data.market.zerodha;
+  const zSettings = settings.zerodha_market_data;
+  const zPick =
+    zMarket && String(zMarket.status || "").toUpperCase() === "CONNECTED"
+      ? zMarket
+      : zSettings || zMarket || zFromMarket || {};
+  renderZerodha(zPick);
 }
 
 wireNav();
-refresh({ probe: true }).catch((err) => {
+refresh().catch((err) => {
   document.getElementById("ceo-panel").innerHTML =
     `<div class="empty">Failed to load dashboard: ${esc(err.message)}</div>`;
 });
@@ -471,7 +485,7 @@ refresh({ probe: true }).catch((err) => {
 window.addEventListener("message", (ev) => {
   if (ev.origin !== window.location.origin) return;
   if (ev.data && ev.data.type === "zerodha-auth") {
-    refresh({ probe: true }).catch(() => {});
+    refresh().catch(() => {});
   }
 });
 

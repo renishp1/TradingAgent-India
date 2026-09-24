@@ -76,7 +76,7 @@ grow:
   strategies:
     universe:
       - NIFTY
-      - BANKNIFTY
+      - SENSEX
     primary_timeframe: M15
     supported_timeframes:
       - M5

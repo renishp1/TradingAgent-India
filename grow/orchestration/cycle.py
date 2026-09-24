@@ -15,6 +15,7 @@ from grow.agents.options import OptionsChainAgent
 from grow.agents.regime import RegimeAgent
 from grow.agents.strategy_research import StrategyResearchAgent
 from grow.agents.technical import TechnicalAgent
+from grow.config import GrowConfig
 from grow.execution.lock import assert_paper_runtime
 from grow.market_data.normalized.models import AgentMarketSnapshot
 from grow.market_data.snapshots.builder import gate_snapshot_quality
@@ -64,6 +65,7 @@ class AnalysisOrchestrator:
         store: AnalysisCycleStore | None = None,
         execution_mode: str = "paper",
         live_trading: bool = False,
+        config: GrowConfig | None = None,
     ) -> None:
         assert_paper_runtime(execution_mode, live_trading, "PAPER")
         self.agent_timeout_seconds = agent_timeout_seconds
@@ -75,7 +77,8 @@ class AnalysisOrchestrator:
                 OptionsChainAgent(),
                 RegimeAgent(),
                 StrategyResearchAgent(configured_strategies),
-                CampaignOptionsAgent(),
+                # Inherit paper cash / max_per_trade_risk for early feasibility.
+                CampaignOptionsAgent(config),
             )
         self.specialists = specialists
 

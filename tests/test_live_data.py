@@ -583,8 +583,10 @@ class SafetyTests(unittest.TestCase):
 
     def test_timing_config_bounds(self) -> None:
         base = load_config()
+        # 0 disables LivePaperLoop-style wall-clock timeout (campaign path).
+        replace(base, live_data=replace(base.live_data, session_timeout_seconds=0)).assert_safe()
         with self.assertRaises(GrowConfigError) as ctx:
-            replace(base, live_data=replace(base.live_data, session_timeout_seconds=0)).assert_safe()
+            replace(base, live_data=replace(base.live_data, session_timeout_seconds=-1)).assert_safe()
         self.assertIn("session_timeout_seconds", str(ctx.exception))
         with self.assertRaises(GrowConfigError) as ctx:
             replace(base, live_data=replace(base.live_data, snapshot_interval_seconds=-1)).assert_safe()

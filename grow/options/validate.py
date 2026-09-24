@@ -9,7 +9,7 @@ from grow.config import OptionsConfig
 from grow.options.models import FieldSource, OptionChainSnapshot, OptionContract, OptionType, RejectedContract
 
 _VALID_SOURCE = frozenset({FieldSource.PROVIDER, FieldSource.COMPUTED})
-_INDEX = frozenset({"NIFTY", "BANKNIFTY"})
+_INDEX = frozenset({"NIFTY", "BANKNIFTY", "SENSEX"})
 _FORBIDDEN_UNDERLYING = frozenset({"RELIANCE", "TCS", "FUT", "FUTURES"})
 _CHAIN_PROVIDERS = frozenset({"fixture", "historical", "paper_stream"})
 

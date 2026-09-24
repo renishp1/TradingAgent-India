@@ -296,9 +296,9 @@ class StrategyEngineTests(unittest.TestCase):
 
 class MeanReversionTests(unittest.TestCase):
     def test_oversold_range_can_fire(self) -> None:
-        symbol = Symbol("BANKNIFTY")
+        symbol = Symbol("NIFTY")
         start = datetime(2026, 9, 14, 9, 15, tzinfo=IST)
-        prices = [50000.0] * 40 + [50000 - i * 40 for i in range(25)]
+        prices = [23200.0] * 40 + [23200 - i * 40 for i in range(25)]
         m15 = _series(symbol, prices, start)
         snap = _snapshot(symbol, m15)
         result = StrategyEngine(load_config()).evaluate(snap)

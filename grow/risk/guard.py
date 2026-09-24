@@ -26,6 +26,16 @@ from grow.risk.stamp import stamp_token
 from grow.types import Intent, MarketBrief, RiskStamp, RiskVerdict, Side, TradeProposal, Venue
 
 
+def risk_allowed_tickers(config: GrowConfig) -> frozenset[str]:
+    """Configured RiskGuard allowlist: cash market book ∪ strategy index universe.
+
+    Milestone-1 ``market.universe`` is the cash paper book. Index-option campaigns
+    trade underlyings from ``strategies.universe`` (e.g. NIFTY, BANKNIFTY). Both are
+    explicit config allowlists — unknown tickers remain rejected.
+    """
+    return frozenset(config.market.universe) | frozenset(config.strategies.universe)
+
+
 class RiskGuard:
     def __init__(
         self,
@@ -82,10 +92,11 @@ class RiskGuard:
             proposal.venue is Venue.PAPER,
             f"venue={proposal.venue.value}",
         )
+        allowed = risk_allowed_tickers(self.config)
         rule(
             "symbol.universe",
-            proposal.symbol.ticker in self.config.market.universe,
-            f"{proposal.symbol.ticker} listed={proposal.symbol.ticker in self.config.market.universe}",
+            proposal.symbol.ticker in allowed,
+            f"{proposal.symbol.ticker} listed={proposal.symbol.ticker in allowed}",
         )
         rule(
             "quantity.positive",

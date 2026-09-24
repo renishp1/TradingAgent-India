@@ -94,6 +94,7 @@ class CampaignRunner:
             configured_strategies=configured_strategies,
             execution_mode=self.config.execution.mode,
             live_trading=False,
+            config=self.config,
         )
         self.decision_engine = DecisionEngine(
             self.config,

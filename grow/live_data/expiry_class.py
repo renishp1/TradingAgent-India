@@ -20,9 +20,10 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from grow.clock import IST, Clock, FrozenClock
 from grow.live_data.catalog import KNOWN_EXPIRY_CLASSES, UNKNOWN_EXPIRY_CLASS
+from grow.market.bse_fo_calendar import BSE_FO_HOLIDAYS_2026
 from grow.market.fo_calendar import FO_CALENDAR_VERSION, FO_CALENDAR_YEARS, FO_HOLIDAYS_2026
 
-POLICY_VERSION = "expiry.class.nse.v2"
+POLICY_VERSION = "expiry.class.nse_bse.v3"
 CALENDAR_VERSION = FO_CALENDAR_VERSION
 PROVIDER = "PROVIDER"
 CALENDAR = "CALENDAR"
@@ -43,17 +44,23 @@ PROVIDER_CLASS_UNSUPPORTED = "PROVIDER_CLASS_UNSUPPORTED"
 CALENDAR_UNSUPPORTED_YEAR = "CALENDAR_UNSUPPORTED_YEAR"
 
 TUESDAY = 1
+THURSDAY = 3
 
 
 @dataclass(frozen=True)
 class ExpirySchedule:
-    """Per-underlying weekday rules. Not a hard-coded trading universe."""
+    """Per-underlying weekday rules. Not a hard-coded trading universe.
+
+    Optional ``holidays`` overrides the classifier default holiday set (NSE F&O).
+    SENSEX uses the BSE F&O holiday calendar — never the NSE list by default.
+    """
 
     canonical_symbol: str
     weekly_weekday: int | None
     monthly_weekday: int | None
     active_from: date
     active_to: date | None = None
+    holidays: frozenset[date] | None = None
 
     def active_on(self, day: date) -> bool:
         if day < self.active_from:
@@ -94,12 +101,15 @@ class ExpiryClassification:
 
 
 def default_expiry_schedules() -> tuple[ExpirySchedule, ...]:
-    """Versioned NSE weekday policy. Not an allow-list and not a universe.
+    """Versioned per-exchange weekday policy. Not an allow-list and not a universe.
 
     Weekly is supported only when weekly_weekday is set. Monthly is the last
     monthly_weekday of the month, holiday-adjusted to the previous F&O session.
     When weekly and monthly share a weekday, the last occurrence is MONTHLY.
     Do not infer WEEKLY from option-ness or from the monthly weekday alone.
+
+    NIFTY (NSE): Tuesday weekly / monthly.
+    SENSEX (BSE): Thursday weekly / monthly, with BSE F&O holidays.
     """
     start = date(2019, 1, 1)
     return (
@@ -107,6 +117,13 @@ def default_expiry_schedules() -> tuple[ExpirySchedule, ...]:
         ExpirySchedule("BANKNIFTY", None, TUESDAY, start),
         ExpirySchedule("MIDCPNIFTY", None, TUESDAY, date(2023, 1, 1)),
         ExpirySchedule("FINNIFTY", None, TUESDAY, date(2021, 1, 1)),
+        ExpirySchedule(
+            "SENSEX",
+            THURSDAY,
+            THURSDAY,
+            date(2023, 1, 1),
+            holidays=BSE_FO_HOLIDAYS_2026,
+        ),
     )
 
 
@@ -340,32 +357,51 @@ class ExpiryClassifier:
     def _calendar_class(self, schedule: ExpirySchedule, expiry: date) -> str | None:
         if not self.supports_year(expiry.year):
             return None
+        holidays = self._schedule_holidays(schedule)
         monthlies = set()
         for year, month in _adjacent_months(expiry.year, expiry.month):
-            marked = self._monthly_date(year, month, schedule.monthly_weekday)
+            marked = self._monthly_date(year, month, schedule.monthly_weekday, holidays=holidays)
             if marked is not None:
                 monthlies.add(marked)
         if expiry in monthlies:
             return "MONTHLY"
         if schedule.weekly_weekday is None:
             return None
-        weeklies = self._weekly_dates(expiry, schedule.weekly_weekday) - monthlies
+        weeklies = self._weekly_dates(expiry, schedule.weekly_weekday, holidays=holidays) - monthlies
         if expiry in weeklies:
             return "WEEKLY"
         return None
 
-    def _monthly_date(self, year: int, month: int, weekday: int | None) -> date | None:
+    def _monthly_date(
+        self,
+        year: int,
+        month: int,
+        weekday: int | None,
+        *,
+        holidays: frozenset[date] | None = None,
+    ) -> date | None:
         if weekday is None or year not in self.supported_years:
             return None
         raw = last_weekday_of_month(year, month, weekday)
         if raw.year not in self.supported_years:
             return None
-        adjusted = previous_session_day(raw, self._holidays_for_year(year))
+        holiday_set = (
+            frozenset(day for day in holidays if day.year == year)
+            if holidays is not None
+            else self._holidays_for_year(year)
+        )
+        adjusted = previous_session_day(raw, holiday_set)
         if adjusted is None or adjusted.year not in self.supported_years:
             return None
         return adjusted
 
-    def _weekly_dates(self, around: date, weekday: int) -> set[date]:
+    def _weekly_dates(
+        self,
+        around: date,
+        weekday: int,
+        *,
+        holidays: frozenset[date] | None = None,
+    ) -> set[date]:
         start = around.replace(day=1) - timedelta(days=7)
         if around.month == 12:
             end = date(around.year + 1, 1, 1) + timedelta(days=7)
@@ -375,11 +411,22 @@ class ExpiryClassifier:
         cursor = start
         while cursor < end:
             if cursor.weekday() == weekday and cursor.year in self.supported_years:
-                adjusted = previous_session_day(cursor, self._holidays_for_year(cursor.year))
+                holiday_set = (
+                    frozenset(day for day in holidays if day.year == cursor.year)
+                    if holidays is not None
+                    else self._holidays_for_year(cursor.year)
+                )
+                adjusted = previous_session_day(cursor, holiday_set)
                 if adjusted is not None and adjusted.year in self.supported_years:
                     found.add(adjusted)
             cursor += timedelta(days=1)
         return found
+
+    def _schedule_holidays(self, schedule: ExpirySchedule) -> frozenset[date] | None:
+        """None → use classifier NSE default per year; else BSE/other override."""
+        if schedule.holidays is None:
+            return None
+        return frozenset(day for day in schedule.holidays if day.year in self.supported_years)
 
     def _holidays_for_year(self, year: int) -> frozenset[date]:
         """Never apply another year's holiday list as a stand-in calendar."""

@@ -13,7 +13,7 @@ INDICATOR_CONFIG_VERSION = "technical.indicators.v1"
 
 class TechnicalAgent:
     agent_name = "technical"
-    agent_version = "technical.v2"
+    agent_version = "technical.v3"
 
     def analyze(self, snapshot: AgentMarketSnapshot, *, cycle_id: str = ""):
         return timed_ms(lambda: self._analyze(snapshot, cycle_id=cycle_id))
@@ -38,38 +38,56 @@ class TechnicalAgent:
                 missing=("underlyings",),
                 cycle_id=cycle_id,
             )
+
+        # Multi-index: evaluate each underlying independently; emit SMA_FAST_*
+        # only when all evaluated underlyings agree (avoids DIRECTION_CONFLICT).
         first = next(iter(snapshot.underlyings.values()))
-        missing = _missing_ohlc(first)
-        if missing:
-            return no_data(
-                agent_name=self.agent_name,
-                agent_version=self.agent_version,
-                snapshot=snapshot,
-                missing=missing,
-                cycle_id=cycle_id,
-            )
-
-        closes = _history_closes(snapshot, first)
+        per_side: dict[str, str] = {}
         metrics: dict[str, float | str | None] = {
-            "ltp": first.ltp,
-            "high": first.high,
-            "low": first.low,
             "indicator_config": INDICATOR_CONFIG_VERSION,
-            "history_bars": len(closes),
+            "underlyings_evaluated": len(snapshot.underlyings),
         }
-        range_pct = 0.0
-        if first.ltp and first.high is not None and first.low is not None and first.ltp > 0:
-            range_pct = round((first.high - first.low) / first.ltp, 6)
-        metrics["range_pct"] = range_pct
-
         findings: list[str] = []
         interpretation: list[str] = []
         assumptions = (
             "Indicators use only closes present in the shared snapshot/history window.",
             f"indicator_config={INDICATOR_CONFIG_VERSION}",
+            "Multi-index snapshots emit SMA_FAST_* only when all underlyings agree.",
         )
 
-        if len(closes) < 14:
+        for name, quote in snapshot.underlyings.items():
+            missing = _missing_ohlc(quote)
+            if missing:
+                findings.append(f"MISSING_OHLC_{name}")
+                continue
+            closes = _history_closes(snapshot, quote)
+            metrics[f"{name}_history_bars"] = len(closes)
+            metrics[f"{name}_ltp"] = quote.ltp
+            if len(closes) < 14:
+                findings.append(f"INSUFFICIENT_HISTORY_{name}")
+                continue
+            sma_fast = sma(closes, 5)
+            sma_slow = sma(closes, 14)
+            metrics[f"{name}_sma_5"] = sma_fast
+            metrics[f"{name}_sma_14"] = sma_slow
+            if sma_fast is not None and sma_slow is not None:
+                if sma_fast > sma_slow:
+                    per_side[name] = "ABOVE"
+                elif sma_fast < sma_slow:
+                    per_side[name] = "BELOW"
+
+        # Primary metrics from first underlying (backward-compatible consumers).
+        closes0 = _history_closes(snapshot, first)
+        metrics["ltp"] = first.ltp
+        metrics["high"] = first.high
+        metrics["low"] = first.low
+        metrics["history_bars"] = len(closes0)
+        range_pct = 0.0
+        if first.ltp and first.high is not None and first.low is not None and first.ltp > 0:
+            range_pct = round((first.high - first.low) / first.ltp, 6)
+        metrics["range_pct"] = range_pct
+
+        if not per_side:
             return make_result(
                 agent_name=self.agent_name,
                 agent_version=self.agent_version,
@@ -78,7 +96,7 @@ class TechnicalAgent:
                 observations=(
                     f"underlying={first.underlying}",
                     f"ltp={first.ltp}",
-                    f"history_bars={len(closes)}",
+                    f"history_bars={len(closes0)}",
                 ),
                 calculated_metrics=metrics,
                 interpretation=(
@@ -96,30 +114,39 @@ class TechnicalAgent:
                 confidence=0.3,
             )
 
-        sma_fast = sma(closes, 5)
-        sma_slow = sma(closes, 14)
-        ema_fast = ema(closes, 5)
-        rsi_14 = rsi(closes, 14)
-        metrics.update(
-            {
-                "sma_5": sma_fast,
-                "sma_14": sma_slow,
-                "ema_5": ema_fast,
-                "rsi_14": rsi_14,
-            }
-        )
-        if sma_fast is not None and sma_slow is not None:
-            if sma_fast > sma_slow:
-                findings.append("SMA_FAST_ABOVE_SLOW")
-                interpretation.append("Short SMA above long SMA — bullish structure candidate.")
-            elif sma_fast < sma_slow:
-                findings.append("SMA_FAST_BELOW_SLOW")
-                interpretation.append("Short SMA below long SMA — bearish structure candidate.")
-        if rsi_14 is not None:
-            if rsi_14 >= 70:
-                findings.append("RSI_OVERBOUGHT")
-            elif rsi_14 <= 30:
-                findings.append("RSI_OVERSOLD")
+        if len(closes0) >= 14:
+            sma_fast = sma(closes0, 5)
+            sma_slow = sma(closes0, 14)
+            ema_fast = ema(closes0, 5)
+            rsi_14 = rsi(closes0, 14)
+            metrics.update(
+                {
+                    "sma_5": sma_fast,
+                    "sma_14": sma_slow,
+                    "ema_5": ema_fast,
+                    "rsi_14": rsi_14,
+                }
+            )
+            if rsi_14 is not None:
+                if rsi_14 >= 70:
+                    findings.append("RSI_OVERBOUGHT")
+                elif rsi_14 <= 30:
+                    findings.append("RSI_OVERSOLD")
+
+        sides = set(per_side.values())
+        if sides == {"ABOVE"}:
+            findings.append("SMA_FAST_ABOVE_SLOW")
+            interpretation.append("Short SMA above long SMA — bullish structure candidate.")
+        elif sides == {"BELOW"}:
+            findings.append("SMA_FAST_BELOW_SLOW")
+            interpretation.append("Short SMA below long SMA — bearish structure candidate.")
+        else:
+            findings.append("MULTI_INDEX_SMA_MIXED")
+            interpretation.append(
+                "Underlyings disagree on SMA fast/slow; no single bullish/bearish technical signal."
+            )
+            for n, s in per_side.items():
+                metrics[f"{n}_sma_side"] = s
 
         return make_result(
             agent_name=self.agent_name,
@@ -127,10 +154,11 @@ class TechnicalAgent:
             snapshot=snapshot,
             status=AgentStatus.PASS,
             observations=(
-                f"underlying={first.underlying}",
+                f"underlyings={','.join(snapshot.underlyings.keys())}",
                 f"ltp={first.ltp}",
                 f"range_pct={range_pct:.4f}",
-                f"history_bars={len(closes)}",
+                f"history_bars={len(closes0)}",
+                f"sma_agreement={','.join(sorted(sides))}",
             ),
             calculated_metrics=metrics,
             interpretation=tuple(interpretation)
@@ -144,10 +172,10 @@ class TechnicalAgent:
             ),
             metrics_used=("ltp", "high", "low", "range_pct", "sma_5", "sma_14", "ema_5", "rsi_14"),
             candidate_action=CandidateAction.NONE,
-            candidate_instrument=first.underlying,
+            candidate_instrument=",".join(snapshot.underlyings.keys()) or first.underlying,
             invalidation_reason="technical findings are research-only",
             cycle_id=cycle_id,
-            confidence=0.55,
+            confidence=0.55 if len(sides) == 1 else 0.4,
         )
 
 
@@ -163,10 +191,16 @@ def _missing_ohlc(quote: UnderlyingQuoteView) -> tuple[str, ...]:
 
 
 def _history_closes(snapshot: AgentMarketSnapshot, quote: UnderlyingQuoteView) -> tuple[float, ...]:
+    from collections.abc import Mapping
+
+    name = str(quote.underlying or "").strip().upper()
+    by = snapshot.diagnostics.get("history_closes_by_underlying") if snapshot.diagnostics else None
+    if isinstance(by, Mapping) and name in by and by[name]:
+        return tuple(float(v) for v in by[name])
     raw = snapshot.diagnostics.get("history_closes") if snapshot.diagnostics else None
     if isinstance(raw, (list, tuple)) and raw:
-        closes = tuple(float(v) for v in raw)
-        return closes
+        if len(snapshot.underlyings) <= 1:
+            return tuple(float(v) for v in raw)
     # Fall back to what the point-in-time quote provides — never invent bars.
     values: list[float] = []
     for value in (quote.open, quote.high, quote.low, quote.close, quote.ltp or quote.spot):

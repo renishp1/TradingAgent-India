@@ -21,6 +21,9 @@ INDEX_ALIASES = {
     "MIDCPNIFTY": "MIDCPNIFTY",
     "NIFTY FIN SERVICE": "FINNIFTY",
     "FINNIFTY": "FINNIFTY",
+    "SENSEX": "SENSEX",
+    "BSE SENSEX": "SENSEX",
+    "BSESENSEX": "SENSEX",
 }
 
 _OPTION = re.compile(r"^([A-Z]+)(\d{6})(\d+)(CE|PE)$")

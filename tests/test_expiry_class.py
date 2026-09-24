@@ -193,7 +193,7 @@ class ClassifierUnitTests(unittest.TestCase):
         self.assertEqual(other.expiry_class, UNKNOWN_EXPIRY_CLASS)
 
     def test_unknown_underlying_is_not_ready(self) -> None:
-        result = _classify(canonical_symbol="SENSEX", provider_class="WEEKLY")
+        result = _classify(canonical_symbol="UNKNOWNIDX", provider_class="WEEKLY")
         self.assertEqual(result.expiry_class, UNKNOWN_EXPIRY_CLASS)
         self.assertEqual(result.diagnostic, CLASSIFIER_NOT_READY)
 
@@ -239,8 +239,10 @@ class CurrentNseScheduleTests(unittest.TestCase):
         self.assertEqual(by_name["FINNIFTY"].monthly_weekday, 1)
         self.assertIsNone(by_name["MIDCPNIFTY"].weekly_weekday)
         self.assertEqual(by_name["MIDCPNIFTY"].monthly_weekday, 1)
-        self.assertEqual(POLICY_VERSION, "expiry.class.nse.v2")
+        self.assertEqual(POLICY_VERSION, "expiry.class.nse_bse.v3")
         self.assertEqual(CALENDAR_VERSION, "nse.fo.2026.v1")
+        self.assertEqual(by_name["SENSEX"].weekly_weekday, 3)
+        self.assertEqual(by_name["SENSEX"].monthly_weekday, 3)
 
     def test_nifty_tuesday_weekly_and_last_tuesday_monthly(self) -> None:
         self.assertEqual(_class_of("NIFTY", NIFTY_WEEKLY).expiry_class, "WEEKLY")

@@ -1129,8 +1129,12 @@ class PaperExecutionEngine:
             self._daily_loss_halt = False
 
     def _enforce_timeout(self, moment: datetime) -> bool:
+        limit = int(self.config.live_data.session_timeout_seconds)
+        # 0 = disabled (campaign paper uses square-off / session-close instead).
+        if limit <= 0:
+            return False
         elapsed = (self.clock.now() - self.started_at).total_seconds()
-        if elapsed < self.config.live_data.session_timeout_seconds:
+        if elapsed < limit:
             return False
         if self._timeout_recorded:
             # Still timed out — block new entries — but do not prevent close recovery.

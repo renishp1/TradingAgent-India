@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
+import urllib.parse
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Mapping
@@ -23,6 +25,15 @@ from grow.options.select import session_day
 from grow.paper.checkpoint import load_paper_checkpoint
 from grow.paper.ledger import PaperBook, Position
 from grow.types import Symbol
+
+# Short TTLs: verified auth / live quotes refresh without hammering Kite.
+_ZERODHA_AUTH_TTL_OK_S = 30.0
+_ZERODHA_AUTH_TTL_FAIL_S = 10.0
+_LIVE_QUOTE_TTL_OK_S = 15.0
+_LIVE_QUOTE_TTL_FAIL_S = 8.0
+_LIVE_CHAIN_TTL_OK_S = 20.0
+_LIVE_CHAIN_TTL_FAIL_S = 8.0
+_CHAIN_STRIKE_WINDOW = 5  # display ±N strikes around ATM from instrument dump
 
 
 def _lock_status() -> dict[str, Any]:
@@ -139,7 +150,10 @@ class DashboardService:
         self._market_snapshot: dict[str, Any] | None = (
             dict(market_snapshot) if market_snapshot is not None else None
         )
-        self._nifty_cache: dict[str, Any] | None = None
+        # (expires_at_monotonic, payload) — failures use short TTL so they can retry.
+        self._zerodha_cache: tuple[float, dict[str, Any]] | None = None
+        self._nifty_cache: tuple[float, dict[str, Any]] | None = None
+        self._chain_cache: tuple[float, dict[str, Any]] | None = None
         self.book = book if book is not None else _empty_book(self.config)
         if book is None:
             self._try_load_checkpoint()
@@ -280,15 +294,65 @@ class DashboardService:
             ),
         }
 
-    def _zerodha_public(self, *, probe: bool = False) -> dict[str, Any]:
+    def _cache_get(self, entry: tuple[float, dict[str, Any]] | None) -> dict[str, Any] | None:
+        if entry is None:
+            return None
+        expires_at, payload = entry
+        if time.monotonic() >= expires_at:
+            return None
+        return dict(payload)
+
+    def _cache_put(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        ok: bool,
+        ttl_ok: float,
+        ttl_fail: float,
+    ) -> tuple[float, dict[str, Any]]:
+        ttl = ttl_ok if ok else ttl_fail
+        return (time.monotonic() + ttl, dict(payload))
+
+    def _zerodha_public(self, *, probe: bool = True, force: bool = False) -> dict[str, Any]:
+        """Zerodha status for dashboard surfaces.
+
+        When ``probe`` is True (default for market/system), run a read-only
+        profile check with a short TTL so CONNECTED means verified.
+        """
         from grow.dashboard.zerodha_auth import auth_status
 
-        return auth_status(probe=probe).to_public_dict()
+        if not probe:
+            return auth_status(probe=False).to_public_dict()
 
-    def _probe_nifty_ltp(self) -> dict[str, Any]:
-        """Best-effort LIVE index LTP via existing Kite market-data transport (quotes only)."""
-        if self._nifty_cache is not None:
-            return dict(self._nifty_cache)
+        if not force:
+            cached = self._cache_get(self._zerodha_cache)
+            if cached is not None:
+                return cached
+
+        status = auth_status(probe=True).to_public_dict()
+        connected = str(status.get("status") or "").upper() == "CONNECTED"
+        self._zerodha_cache = self._cache_put(
+            status,
+            ok=connected,
+            ttl_ok=_ZERODHA_AUTH_TTL_OK_S,
+            ttl_fail=_ZERODHA_AUTH_TTL_FAIL_S,
+        )
+        return dict(status)
+
+    def _live_kite_transport(self):
+        """Existing read-only Kite transport (quotes only; no orders)."""
+        from grow.live_data.kite_market import RealKiteTransport, load_kite_market_secrets
+
+        api_key, access_token = load_kite_market_secrets(dict(os.environ))
+        return RealKiteTransport(api_key=api_key, access_token=access_token)
+
+    def _probe_nifty_ltp(self, *, force: bool = False) -> dict[str, Any]:
+        """LIVE index LTP via existing Kite HTTP quote path (no websocket required)."""
+        if not force:
+            cached = self._cache_get(self._nifty_cache)
+            if cached is not None:
+                return cached
+
         result: dict[str, Any] = {
             "price": _NOT_AVAILABLE,
             "timestamp": _NOT_AVAILABLE,
@@ -296,96 +360,302 @@ class DashboardService:
             "freshness": _NOT_AVAILABLE,
             "quote_age_seconds": _NOT_AVAILABLE,
             "reason": "Zerodha market-data session not available",
+            "ok": False,
         }
         try:
-            from grow.live_data.kite_market import RealKiteTransport, load_kite_market_secrets
-
-            api_key, access_token = load_kite_market_secrets(dict(os.environ))
-            transport = RealKiteTransport(api_key=api_key, access_token=access_token)
-            transport.connect()
-            try:
-                price, _token = transport.fetch_index_quote("NIFTY")
-            finally:
-                transport.disconnect()
+            transport = self._live_kite_transport()
+            # HTTP quote only — avoid websocket connect (quotes do not need it).
+            price, _token = transport.fetch_index_quote("NIFTY")
             now = SystemClock().now().astimezone(IST)
             result = {
                 "price": float(price),
                 "timestamp": now.isoformat(),
                 "provenance": "LIVE",
                 "freshness": "REST_QUOTE",
-                "quote_age_seconds": _NOT_AVAILABLE,
+                "quote_age_seconds": 0.0,
                 "reason": None,
+                "ok": True,
             }
         except Exception as exc:
-            result["reason"] = type(exc).__name__
-        self._nifty_cache = dict(result)
-        return result
+            # Prefer GrowConfigError code text when present; never include secrets.
+            detail = str(exc).strip() or type(exc).__name__
+            if len(detail) > 120:
+                detail = type(exc).__name__
+            result["reason"] = detail
+            result["ok"] = False
+
+        self._nifty_cache = self._cache_put(
+            result,
+            ok=bool(result.get("ok")),
+            ttl_ok=_LIVE_QUOTE_TTL_OK_S,
+            ttl_fail=_LIVE_QUOTE_TTL_FAIL_S,
+        )
+        return dict(result)
+
+    def _fetch_live_option_chain(self, *, spot: float, force: bool = False) -> dict[str, Any]:
+        """Read-only option quotes via existing Kite instruments + quote APIs."""
+        if not force:
+            cached = self._cache_get(self._chain_cache)
+            if cached is not None:
+                return cached
+
+        empty: dict[str, Any] = {
+            "available": False,
+            "message": _NOT_AVAILABLE,
+            "label": "Live option chain unavailable",
+            "data_label": _NOT_AVAILABLE,
+            "provenance": _NOT_AVAILABLE,
+            "freshness": _NOT_AVAILABLE,
+            "rows": [],
+            "selected": None,
+            "ce": _NOT_AVAILABLE,
+            "strike": _NOT_AVAILABLE,
+            "pe": _NOT_AVAILABLE,
+            "reason": None,
+            "ok": False,
+        }
+        try:
+            from grow.live_data.expiry_class import ExpiryClassifier
+            from grow.live_data.kite_market import (
+                QUOTE_URL,
+                decode_http_text,
+                parse_nfo_instruments,
+                select_option_pair,
+            )
+
+            transport = self._live_kite_transport()
+            now = SystemClock().now().astimezone(IST)
+            as_of = now.date()
+            catalog = parse_nfo_instruments(transport.fetch_instruments())
+            nifty_rows = [row for row in catalog if row.underlying == "NIFTY"]
+            if not nifty_rows:
+                empty["reason"] = "METADATA_UNAVAILABLE"
+                empty["message"] = "NOT AVAILABLE — no NIFTY option instruments"
+                self._chain_cache = self._cache_put(
+                    empty, ok=False, ttl_ok=_LIVE_CHAIN_TTL_OK_S, ttl_fail=_LIVE_CHAIN_TTL_FAIL_S
+                )
+                return dict(empty)
+
+            classifier = ExpiryClassifier()
+            # Policy-preferred expiry (NIFTY: WEEKLY_PREFERRED), then ATM CE/PE.
+            atm_ce, atm_pe = select_option_pair(
+                nifty_rows,
+                spots={"NIFTY": float(spot)},
+                as_of=as_of,
+                classifier=classifier,
+            )
+            expiry = atm_ce.expiry
+            pool = [row for row in nifty_rows if row.expiry == expiry]
+            strikes = sorted({float(row.strike) for row in pool})
+            atm = float(atm_ce.strike)
+            # Display-only window around ATM (not campaign scoring / selection policy).
+            ordered = sorted(strikes, key=lambda s: (abs(s - atm), s))
+            window = sorted(ordered[: max(1, _CHAIN_STRIKE_WINDOW * 2 + 1)])
+
+            by_strike: dict[float, dict[str, Any]] = {}
+            query_parts: list[str] = []
+            for strike in window:
+                by_strike[strike] = {
+                    "underlying": "NIFTY",
+                    "expiry": expiry.isoformat() if hasattr(expiry, "isoformat") else str(expiry),
+                    "strike": strike,
+                    "dte": (expiry - as_of).days if isinstance(expiry, date) else _NOT_AVAILABLE,
+                    "ce_ltp": _NOT_AVAILABLE,
+                    "ce_bid": _NOT_AVAILABLE,
+                    "ce_ask": _NOT_AVAILABLE,
+                    "pe_ltp": _NOT_AVAILABLE,
+                    "pe_bid": _NOT_AVAILABLE,
+                    "pe_ask": _NOT_AVAILABLE,
+                    "score": _NOT_AVAILABLE,
+                    "eligibility": "LIVE_QUOTE",
+                    "rejection_reason": _NOT_AVAILABLE,
+                }
+                for side in ("CE", "PE"):
+                    match = next(
+                        (
+                            row
+                            for row in pool
+                            if float(row.strike) == strike and row.option_type == side
+                        ),
+                        None,
+                    )
+                    if match is not None:
+                        query_parts.append(f"i={urllib.parse.quote('NFO:' + match.tradingsymbol)}")
+
+            if not query_parts:
+                empty["reason"] = "NO_VALID_OPTION"
+                empty["message"] = "NOT AVAILABLE — no quotable CE/PE near ATM"
+                self._chain_cache = self._cache_put(
+                    empty, ok=False, ttl_ok=_LIVE_CHAIN_TTL_OK_S, ttl_fail=_LIVE_CHAIN_TTL_FAIL_S
+                )
+                return dict(empty)
+
+            url = f"{QUOTE_URL}?{'&'.join(query_parts)}"
+            body = json.loads(decode_http_text(transport._get(url)))
+            data = body.get("data") or {}
+            if not isinstance(data, Mapping) or not data:
+                empty["reason"] = "METADATA_UNAVAILABLE"
+                empty["message"] = "NOT AVAILABLE — option quote response empty"
+                self._chain_cache = self._cache_put(
+                    empty, ok=False, ttl_ok=_LIVE_CHAIN_TTL_OK_S, ttl_fail=_LIVE_CHAIN_TTL_FAIL_S
+                )
+                return dict(empty)
+
+            for key, row in data.items():
+                if not isinstance(row, Mapping):
+                    continue
+                # key like NFO:NIFTY25SEP23250CE
+                sym = str(key).split(":", 1)[-1]
+                match = next((r for r in pool if r.tradingsymbol == sym), None)
+                if match is None:
+                    continue
+                strike = float(match.strike)
+                bucket = by_strike.get(strike)
+                if bucket is None:
+                    continue
+                depth = row.get("depth") or {}
+                buy = (depth.get("buy") or [{}])
+                sell = (depth.get("sell") or [{}])
+                bid = (buy[0] or {}).get("price") if buy else None
+                ask = (sell[0] or {}).get("price") if sell else None
+                ltp = row.get("last_price")
+                prefix = "ce" if match.option_type == "CE" else "pe"
+                bucket[f"{prefix}_ltp"] = ltp if ltp is not None else _NOT_AVAILABLE
+                bucket[f"{prefix}_bid"] = bid if bid is not None else _NOT_AVAILABLE
+                bucket[f"{prefix}_ask"] = ask if ask is not None else _NOT_AVAILABLE
+                # Optional greeks when provider includes them.
+                for g in ("delta", "gamma", "theta", "vega", "iv", "implied_volatility"):
+                    if row.get(g) is not None:
+                        bucket[g if g != "implied_volatility" else "iv"] = row.get(g)
+
+            rows = [by_strike[s] for s in window if s in by_strike]
+            selected = {
+                "strike": float(atm_ce.strike),
+                "expiry": atm_ce.expiry.isoformat()
+                if hasattr(atm_ce.expiry, "isoformat")
+                else str(atm_ce.expiry),
+                "option_type": "CE",
+                "instrument": atm_ce.tradingsymbol,
+            }
+            payload = {
+                "available": bool(rows),
+                "message": None if rows else _NOT_AVAILABLE,
+                "label": f"{len(rows)} strike(s) from live Kite quotes",
+                "data_label": "LIVE",
+                "provenance": "LIVE",
+                "freshness": "REST_QUOTE",
+                "snapshot_id": _NOT_AVAILABLE,
+                "rows": rows,
+                "selected": selected,
+                "ce": "CE",
+                "strike": float(atm_ce.strike),
+                "pe": "PE",
+                "reason": None,
+                "ok": bool(rows),
+            }
+            self._chain_cache = self._cache_put(
+                payload, ok=True, ttl_ok=_LIVE_CHAIN_TTL_OK_S, ttl_fail=_LIVE_CHAIN_TTL_FAIL_S
+            )
+            return dict(payload)
+        except Exception as exc:
+            detail = str(exc).strip() or type(exc).__name__
+            if len(detail) > 120:
+                detail = type(exc).__name__
+            empty["reason"] = detail
+            empty["message"] = f"NOT AVAILABLE — {detail}"
+            self._chain_cache = self._cache_put(
+                empty, ok=False, ttl_ok=_LIVE_CHAIN_TTL_OK_S, ttl_fail=_LIVE_CHAIN_TTL_FAIL_S
+            )
+            return dict(empty)
 
     def market_status(self) -> dict[str, Any]:
         calendar = SessionCalendar(self.config.market)
         state = calendar.state()
-        zerodha = self._zerodha_public(probe=False)
+        zerodha = self._zerodha_public(probe=True)
         connected = str(zerodha.get("status") or "").upper() == "CONNECTED"
         token_present = bool(zerodha.get("access_token_present"))
         nifty = {"price": _NOT_AVAILABLE, "label": _NOT_AVAILABLE, "timestamp": _NOT_AVAILABLE}
-        provenance = _NOT_AVAILABLE
-        freshness = _NOT_AVAILABLE
+        provenance: Any = _NOT_AVAILABLE
+        freshness: Any = _NOT_AVAILABLE
         quote_age: Any = _NOT_AVAILABLE
         note_parts: list[str] = []
+        data_status = "NOT AVAILABLE"
 
         snap = self._market_snapshot
+        snap_provenance = _NOT_AVAILABLE
         if isinstance(snap, Mapping):
-            provenance = str(snap.get("market_data_source") or snap.get("diagnostics", {}).get("market_data_source") or _NOT_AVAILABLE)
+            snap_provenance = str(
+                snap.get("market_data_source")
+                or (snap.get("diagnostics") or {}).get("market_data_source")
+                or _NOT_AVAILABLE
+            )
+
+        # Live quotes when Zerodha session is verified CONNECTED.
+        live_ok = False
+        if connected:
+            probed = self._probe_nifty_ltp()
+            if probed.get("ok") and probed.get("price") is not _NOT_AVAILABLE:
+                live_ok = True
+                nifty = {
+                    "price": probed["price"],
+                    "label": "LIVE",
+                    "timestamp": probed.get("timestamp") or _NOT_AVAILABLE,
+                }
+                provenance = "LIVE"
+                freshness = probed.get("freshness") or "REST_QUOTE"
+                quote_age = probed.get("quote_age_seconds", 0.0)
+                data_status = "LIVE"
+            else:
+                reason = probed.get("reason") or "quote unavailable"
+                note_parts.append(f"NIFTY live quote: {reason}")
+                data_status = "NOT AVAILABLE"
+        elif token_present:
+            note_parts.append(
+                "Access token present but Zerodha session not verified (DISCONNECTED)."
+            )
+            data_status = "NOT AVAILABLE"
+        else:
+            note_parts.append(
+                "Zerodha market-data not connected. Use Settings → Connect (quotes only; no orders)."
+            )
+            data_status = "NOT CONNECTED"
+
+        # Snapshot provenance only when live is unavailable — never label fixture as LIVE.
+        if not live_ok and isinstance(snap, Mapping):
+            provenance = snap_provenance
             under = (snap.get("underlyings") or {}).get("NIFTY") or {}
-            if isinstance(under, Mapping):
+            if isinstance(under, Mapping) and nifty["price"] is _NOT_AVAILABLE:
                 price = under.get("ltp") if under.get("ltp") is not None else under.get("spot")
                 if price is not None:
                     nifty = {
                         "price": price,
                         "label": provenance,
-                        "timestamp": under.get("quote_timestamp") or snap.get("decision_timestamp") or _NOT_AVAILABLE,
+                        "timestamp": under.get("quote_timestamp")
+                        or snap.get("decision_timestamp")
+                        or _NOT_AVAILABLE,
                     }
-                age = under.get("quote_age_seconds")
-                if age is not None:
-                    quote_age = age
-            quality = snap.get("data_quality")
-            freshness = str(quality) if quality is not None else freshness
+                    age = under.get("quote_age_seconds")
+                    if age is not None:
+                        quote_age = age
+                    quality = snap.get("data_quality")
+                    freshness = str(quality) if quality is not None else freshness
+                    if provenance == "FIXTURE":
+                        data_status = "FIXTURE"
+                    elif provenance == "MIXED":
+                        data_status = "NOT AVAILABLE"
+                    elif data_status == "NOT AVAILABLE" and provenance not in {_NOT_AVAILABLE, ""}:
+                        data_status = str(provenance)
             notes = snap.get("quality_notes") or ()
             if notes:
                 note_parts.append(", ".join(str(n) for n in notes[:6]))
-
-        # Prefer campaign/replay snapshot. Live REST probe only when no snapshot
-        # exists — never overwrite STALE/MIXED campaign data with a fresh quote.
-        snap_quality = str(freshness).upper() if freshness != _NOT_AVAILABLE else ""
-        allow_probe = snap is None and nifty["price"] is _NOT_AVAILABLE and token_present
-        if allow_probe:
-            probed = self._probe_nifty_ltp()
-            if probed.get("price") is not _NOT_AVAILABLE:
-                nifty = {
-                    "price": probed["price"],
-                    "label": probed.get("provenance") or "LIVE",
-                    "timestamp": probed.get("timestamp") or _NOT_AVAILABLE,
-                }
-                provenance = probed.get("provenance") or provenance
-                freshness = probed.get("freshness") or freshness
-                quote_age = probed.get("quote_age_seconds", quote_age)
-            elif probed.get("reason"):
-                note_parts.append(f"NIFTY probe: {probed['reason']}")
-        elif snap is not None and snap_quality in {"STALE", "INSUFFICIENT", "REJECTED"}:
-            note_parts.append(f"Snapshot data quality: {snap_quality} (fail-closed; not replaced with live quote).")
-
-        if connected:
-            market_data = "CONNECTED"
-        elif token_present:
-            market_data = "TOKEN PRESENT (not verified)"
-        else:
-            market_data = "NOT CONNECTED"
-            note_parts.append(
-                "Zerodha market-data not connected. Use Settings → Connect (quotes only; no orders)."
-            )
+            if str(snap.get("data_quality") or "").upper() in {"STALE", "INSUFFICIENT", "REJECTED"}:
+                note_parts.append(
+                    f"Snapshot data quality: {snap.get('data_quality')} (fail-closed)."
+                )
 
         if provenance == "MIXED":
             note_parts.append("MIXED provenance is rejected for paper campaign trading.")
+            data_status = "NOT AVAILABLE"
 
         return {
             "exchange": self.config.market.exchange,
@@ -394,22 +664,32 @@ class DashboardService:
             "session_close": self.config.market.session_close,
             "square_off": self.config.market.square_off,
             "timezone": self.config.timezone,
-            "market_data": market_data,
-            "market_data_connected": connected,
+            "market_data": data_status,
+            "market_data_connected": connected and live_ok,
             "zerodha_status": zerodha.get("status"),
+            "zerodha": zerodha,
             "data_provider": self.config.data.provider,
-            "data_label": provenance if provenance != _NOT_AVAILABLE else (
-                "FIXTURE / PAPER DATA" if self.config.data.provider == "fixture" else "PAPER DATA"
-            ),
+            "data_label": provenance,
             "provenance": provenance,
             "freshness": freshness,
             "quote_age_seconds": quote_age,
             "indices": {
                 "NIFTY": nifty,
-                "BANKNIFTY": {"price": _NOT_AVAILABLE, "label": _NOT_AVAILABLE, "timestamp": _NOT_AVAILABLE},
+                "BANKNIFTY": {
+                    "price": _NOT_AVAILABLE,
+                    "label": _NOT_AVAILABLE,
+                    "timestamp": _NOT_AVAILABLE,
+                },
             },
-            "note": " · ".join(note_parts) if note_parts else (
-                f"Session {state.value}. Market-data via existing Zerodha path when connected."
+            "note": " · ".join(note_parts)
+            if note_parts
+            else (
+                f"Session {state.value}. "
+                + (
+                    "Live Zerodha market-data quotes."
+                    if live_ok
+                    else "Awaiting verified Zerodha market-data."
+                )
             ),
         }
 
@@ -860,19 +1140,38 @@ class DashboardService:
         )
 
     def option_chain_view(self) -> dict[str, Any]:
+        # Prefer live Kite quotes when Zerodha session is verified CONNECTED.
+        zerodha = self._zerodha_public(probe=True)
+        connected = str(zerodha.get("status") or "").upper() == "CONNECTED"
+        if connected:
+            nifty = self._probe_nifty_ltp()
+            spot = nifty.get("price")
+            if nifty.get("ok") and isinstance(spot, (int, float)):
+                live = self._fetch_live_option_chain(spot=float(spot))
+                if live.get("ok"):
+                    return redact_secrets(live)
+                # Fall through to snapshot only as non-LIVE artifact display.
+                live_reason = live.get("reason") or live.get("message") or _NOT_AVAILABLE
+            else:
+                live_reason = nifty.get("reason") or "NIFTY quote unavailable"
+        else:
+            live_reason = "Zerodha session not CONNECTED"
+
         snap = self._market_snapshot
         if not isinstance(snap, Mapping):
             return {
                 "available": False,
                 "message": _NOT_AVAILABLE,
-                "label": "Option chain artifact not loaded (set GROW_DASHBOARD_MARKET_SNAPSHOT or trade replay).",
+                "label": f"Live option chain unavailable ({live_reason})",
                 "data_label": _NOT_AVAILABLE,
                 "provenance": _NOT_AVAILABLE,
+                "freshness": _NOT_AVAILABLE,
                 "rows": [],
                 "selected": None,
                 "ce": _NOT_AVAILABLE,
                 "strike": _NOT_AVAILABLE,
                 "pe": _NOT_AVAILABLE,
+                "reason": live_reason,
             }
 
         contracts = snap.get("option_contracts") or []
@@ -884,7 +1183,6 @@ class DashboardService:
         except ValueError:
             sess_d = session_day(SystemClock().now().astimezone(IST))
 
-        # Optional score / rejection hints from replay decision signal or package.
         score_by_id: dict[str, Any] = {}
         rejection: Any = _NOT_AVAILABLE
         decision = self._decision_payload() or {}
@@ -901,7 +1199,6 @@ class DashboardService:
                 rejection = code
                 break
 
-        # Pair CE/PE by (underlying, expiry, strike).
         buckets: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
         for raw in contracts:
             if not isinstance(raw, Mapping):
@@ -966,22 +1263,46 @@ class DashboardService:
                 "instrument": cand.get("instrument", _NOT_AVAILABLE),
             }
         provenance = snap.get("market_data_source") or _NOT_AVAILABLE
+        # Never relabel snapshot FIXTURE/MIXED as LIVE.
         return redact_secrets(
             {
                 "available": bool(rows),
                 "message": None if rows else "Option chain empty in loaded snapshot",
-                "label": f"{len(rows)} strike(s) from campaign/replay snapshot",
+                "label": (
+                    f"{len(rows)} strike(s) from snapshot ({provenance}); "
+                    f"live path: {live_reason}"
+                ),
                 "data_label": provenance,
                 "provenance": provenance,
                 "freshness": snap.get("data_quality") or _NOT_AVAILABLE,
                 "snapshot_id": snap.get("snapshot_id"),
                 "rows": rows,
                 "selected": selected,
-                "ce": selected.get("option_type") if selected and selected.get("option_type") == "CE" else _NOT_AVAILABLE,
+                "ce": selected.get("option_type")
+                if selected and selected.get("option_type") == "CE"
+                else _NOT_AVAILABLE,
                 "strike": (selected or {}).get("strike", _NOT_AVAILABLE),
-                "pe": selected.get("option_type") if selected and selected.get("option_type") == "PE" else _NOT_AVAILABLE,
+                "pe": selected.get("option_type")
+                if selected and selected.get("option_type") == "PE"
+                else _NOT_AVAILABLE,
+                "reason": live_reason,
             }
         )
+
+    def settings_view(self, *, probe_zerodha: bool = True) -> dict[str, Any]:
+        # Default verified status (TTL) so Settings matches market/system.
+        zerodha = self._zerodha_public(probe=True if probe_zerodha else False)
+        return {
+            "read_only": True,
+            "can_enable_live_trading": False,
+            "can_place_orders": False,
+            "message": (
+                "Trading settings remain view-only. "
+                "Zerodha Connect authorises market-data only (no orders)."
+            ),
+            "zerodha_market_data": zerodha,
+            "config_summary": self.config_view(),
+        }
 
     def signals_view(self) -> dict[str, Any]:
         decision = self._decision_payload()
@@ -1015,22 +1336,6 @@ class DashboardService:
             "message": _NOT_AVAILABLE,
             "research_label": "HISTORICAL RESEARCH / NOT LIVE",
             "note": "Research artifacts are not streamed into the dashboard read model.",
-        }
-
-    def settings_view(self, *, probe_zerodha: bool = False) -> dict[str, Any]:
-        from grow.dashboard.zerodha_auth import auth_status
-
-        zerodha = auth_status(probe=probe_zerodha).to_public_dict()
-        return {
-            "read_only": True,
-            "can_enable_live_trading": False,
-            "can_place_orders": False,
-            "message": (
-                "Trading settings remain view-only. "
-                "Zerodha Connect authorises market-data only (no orders)."
-            ),
-            "zerodha_market_data": zerodha,
-            "config_summary": self.config_view(),
         }
 
     def dashboard(self) -> dict[str, Any]:

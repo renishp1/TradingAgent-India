@@ -9,6 +9,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -65,11 +66,13 @@ class DashboardApiTests(unittest.TestCase):
             body["market"]["market_data"],
             {
                 "NOT CONNECTED",
-                "TOKEN PRESENT (not verified)",
-                "CONNECTED",
+                "NOT AVAILABLE",
+                "LIVE",
+                "FIXTURE",
             },
         )
         self.assertEqual(body["system"]["market_data_status"], body["market"]["market_data"])
+        self.assertEqual(body["system"]["zerodha_status"], body["market"]["zerodha_status"])
 
     def test_config_endpoint(self) -> None:
         res = _client().get("/api/config")
@@ -173,15 +176,26 @@ class DashboardApiTests(unittest.TestCase):
         }
         svc = _service(market_snapshot=snap, checkpoint_path=Path("__none__"))
         svc.checkpoint_path = None
-        agents = svc.agents_view()
-        self.assertTrue(agents["available"])
-        self.assertEqual(agents["decisions"][0]["final_action"], "NO TRADE")
-        self.assertIn("STALE", agents["decisions"][0]["reason"])
-        market = svc.market_status()
-        self.assertEqual(market["indices"]["NIFTY"]["price"], 25000.0)
-        self.assertEqual(market["freshness"], "STALE")
-        self.assertEqual(market["provenance"], "LIVE")
-        self.assertIn("fail-closed", market["note"].lower())
+        # Isolate from developer Zerodha session so snapshot path is exercised.
+        with patch.object(
+            svc,
+            "_zerodha_public",
+            return_value={
+                "status": "DISCONNECTED",
+                "access_token_present": False,
+                "api_key_present": False,
+                "api_secret_present": False,
+            },
+        ):
+            agents = svc.agents_view()
+            self.assertTrue(agents["available"])
+            self.assertEqual(agents["decisions"][0]["final_action"], "NO TRADE")
+            self.assertIn("STALE", agents["decisions"][0]["reason"])
+            market = svc.market_status()
+            self.assertEqual(market["indices"]["NIFTY"]["price"], 25000.0)
+            self.assertEqual(market["freshness"], "STALE")
+            self.assertEqual(market["provenance"], "LIVE")
+            self.assertIn("fail-closed", market["note"].lower())
 
     def test_provenance_live_fixture_mixed(self) -> None:
         for source, expect_no_trade in (("LIVE", False), ("FIXTURE", False), ("MIXED", True)):
@@ -198,12 +212,23 @@ class DashboardApiTests(unittest.TestCase):
             }
             svc = _service(market_snapshot=snap, checkpoint_path=Path("__none__"))
             svc.checkpoint_path = None
-            market = svc.market_status()
-            self.assertEqual(market["provenance"], source)
-            if expect_no_trade:
-                agents = svc.agents_view()
-                self.assertEqual(agents["decisions"][0]["final_action"], "NO TRADE")
-                self.assertIn("MIXED", agents["decisions"][0]["reason"])
+            with patch.object(
+                svc,
+                "_zerodha_public",
+                return_value={
+                    "status": "DISCONNECTED",
+                    "access_token_present": False,
+                    "api_key_present": False,
+                    "api_secret_present": False,
+                },
+            ):
+                market = svc.market_status()
+                self.assertEqual(market["provenance"], source)
+                if expect_no_trade:
+                    agents = svc.agents_view()
+                    self.assertEqual(agents["decisions"][0]["final_action"], "NO TRADE")
+                    self.assertIn("MIXED", agents["decisions"][0]["reason"])
+                    self.assertEqual(market["market_data"], "NOT AVAILABLE")
 
     def test_option_chain_from_snapshot(self) -> None:
         snap = {
@@ -261,7 +286,17 @@ class DashboardApiTests(unittest.TestCase):
             checkpoint_path=Path("__none__"),
         )
         svc.checkpoint_path = None
-        chain = svc.option_chain_view()
+        with patch.object(
+            svc,
+            "_zerodha_public",
+            return_value={
+                "status": "DISCONNECTED",
+                "access_token_present": False,
+                "api_key_present": False,
+                "api_secret_present": False,
+            },
+        ):
+            chain = svc.option_chain_view()
         self.assertTrue(chain["available"])
         self.assertEqual(len(chain["rows"]), 1)
         row = chain["rows"][0]
@@ -486,15 +521,278 @@ class DashboardApiTests(unittest.TestCase):
             try:
                 svc = _service(checkpoint_path=Path("__none__"))
                 svc.checkpoint_path = None
-                agents = svc.agents_view()
-                self.assertTrue(agents["available"])
-                self.assertEqual(agents["decisions"][0]["final_action"], "NO TRADE")
-                self.assertEqual(svc.market_status()["provenance"], "FIXTURE")
+                with patch.object(
+                    svc,
+                    "_zerodha_public",
+                    return_value={
+                        "status": "DISCONNECTED",
+                        "access_token_present": False,
+                        "api_key_present": False,
+                        "api_secret_present": False,
+                    },
+                ):
+                    agents = svc.agents_view()
+                    self.assertTrue(agents["available"])
+                    self.assertEqual(agents["decisions"][0]["final_action"], "NO TRADE")
+                    self.assertEqual(svc.market_status()["provenance"], "FIXTURE")
             finally:
                 if prev is None:
                     os.environ.pop("GROW_DASHBOARD_REPLAY", None)
                 else:
                     os.environ["GROW_DASHBOARD_REPLAY"] = prev
+
+
+class DashboardLiveMarketTests(unittest.TestCase):
+    """Verified Zerodha + live quote/option-chain dashboard behavior."""
+
+    @staticmethod
+    def _fake_zerodha(status: str, *, token: bool = True) -> dict:
+        return {
+            "provider": "zerodha",
+            "purpose": "market_data_only",
+            "api_key_present": True,
+            "api_secret_present": True,
+            "access_token_present": token,
+            "status": status,
+            "can_connect": True,
+            "message": "unit",
+            "live_trading": False,
+            "broker_order_path": False,
+        }
+
+    def test_verified_token_shows_connected(self) -> None:
+        svc = _service(checkpoint_path=Path("__none__"))
+        svc.checkpoint_path = None
+        with patch.object(svc, "_zerodha_public", return_value=self._fake_zerodha("CONNECTED")):
+            with patch.object(
+                svc,
+                "_probe_nifty_ltp",
+                return_value={
+                    "price": 23210.0,
+                    "timestamp": "2026-09-24T09:30:00+05:30",
+                    "provenance": "LIVE",
+                    "freshness": "REST_QUOTE",
+                    "quote_age_seconds": 0.0,
+                    "reason": None,
+                    "ok": True,
+                },
+            ):
+                market = svc.market_status()
+        self.assertEqual(market["zerodha_status"], "CONNECTED")
+        self.assertEqual(market["market_data"], "LIVE")
+        self.assertEqual(market["provenance"], "LIVE")
+        self.assertEqual(market["indices"]["NIFTY"]["price"], 23210.0)
+        dash = svc.dashboard()
+        # Re-patch for dashboard() which calls market_status again
+        with patch.object(svc, "_zerodha_public", return_value=self._fake_zerodha("CONNECTED")):
+            with patch.object(
+                svc,
+                "_probe_nifty_ltp",
+                return_value={
+                    "price": 23210.0,
+                    "timestamp": "2026-09-24T09:30:00+05:30",
+                    "provenance": "LIVE",
+                    "freshness": "REST_QUOTE",
+                    "quote_age_seconds": 0.0,
+                    "reason": None,
+                    "ok": True,
+                },
+            ):
+                with patch.object(
+                    svc,
+                    "_fetch_live_option_chain",
+                    return_value={
+                        "available": True,
+                        "ok": True,
+                        "message": None,
+                        "provenance": "LIVE",
+                        "freshness": "REST_QUOTE",
+                        "data_label": "LIVE",
+                        "rows": [
+                            {
+                                "expiry": "2026-09-29",
+                                "dte": 5,
+                                "strike": 23200.0,
+                                "ce_ltp": 100.0,
+                                "ce_bid": 99.0,
+                                "ce_ask": 101.0,
+                                "pe_ltp": 90.0,
+                                "pe_bid": 89.0,
+                                "pe_ask": 91.0,
+                            }
+                        ],
+                        "selected": None,
+                        "ce": "CE",
+                        "strike": 23200.0,
+                        "pe": "PE",
+                        "label": "live",
+                        "reason": None,
+                    },
+                ):
+                    dash = svc.dashboard()
+        self.assertEqual(dash["system"]["zerodha_status"], "CONNECTED")
+        self.assertEqual(dash["system"]["market_data_status"], "LIVE")
+        self.assertEqual(dash["capital"]["paper_capital"], 10_000.0)
+        self.assertEqual(dash["risk"]["max_daily_loss"], 2_000.0)
+        self.assertEqual(dash["risk"]["max_per_trade_risk"], 1_000.0)
+        self.assertEqual(dash["risk"]["max_open_positions"], 2)
+
+    def test_invalid_token_disconnected(self) -> None:
+        svc = _service(checkpoint_path=Path("__none__"))
+        svc.checkpoint_path = None
+        with patch.object(svc, "_zerodha_public", return_value=self._fake_zerodha("DISCONNECTED")):
+            market = svc.market_status()
+        self.assertEqual(market["zerodha_status"], "DISCONNECTED")
+        self.assertNotEqual(market["zerodha_status"], "CONNECTED")
+        self.assertEqual(market["market_data"], "NOT AVAILABLE")
+
+    def test_token_present_unverified_not_connected(self) -> None:
+        """probe=False must not claim CONNECTED when status is DISCONNECTED."""
+        from grow.dashboard.zerodha_auth import ZerodhaAuthStatus
+
+        st = ZerodhaAuthStatus(
+            api_key_present=True,
+            api_secret_present=True,
+            access_token_present=True,
+            status="DISCONNECTED",
+            can_connect=True,
+            message="token stored but not verified",
+        )
+        pub = st.to_public_dict()
+        self.assertEqual(pub["status"], "DISCONNECTED")
+        self.assertTrue(pub["access_token_present"])
+        svc = _service(checkpoint_path=Path("__none__"))
+        svc.checkpoint_path = None
+        with patch(
+            "grow.dashboard.zerodha_auth.auth_status",
+            return_value=st,
+        ):
+            unverified = svc._zerodha_public(probe=False)
+        self.assertEqual(unverified["status"], "DISCONNECTED")
+        self.assertNotEqual(unverified["status"], "CONNECTED")
+
+    def test_nifty_failure_can_retry(self) -> None:
+        svc = _service(checkpoint_path=Path("__none__"))
+        svc.checkpoint_path = None
+        calls = {"n": 0}
+
+        def fake_transport():
+            class T:
+                def fetch_index_quote(self, name):
+                    calls["n"] += 1
+                    if calls["n"] == 1:
+                        from grow.errors import GrowConfigError
+
+                        raise GrowConfigError("AUTH_FAILED")
+                    return 23250.0, 256265
+
+            return T()
+
+        with patch.object(svc, "_live_kite_transport", side_effect=fake_transport):
+            first = svc._probe_nifty_ltp(force=True)
+            self.assertFalse(first["ok"])
+            self.assertIn("AUTH_FAILED", str(first["reason"]))
+            # Expire failure cache immediately.
+            svc._nifty_cache = (0.0, first)
+            second = svc._probe_nifty_ltp(force=False)
+            self.assertTrue(second["ok"])
+            self.assertEqual(second["price"], 23250.0)
+            self.assertEqual(second["provenance"], "LIVE")
+
+    def test_live_option_chain_rows(self) -> None:
+        svc = _service(checkpoint_path=Path("__none__"))
+        svc.checkpoint_path = None
+        with patch.object(svc, "_zerodha_public", return_value=self._fake_zerodha("CONNECTED")):
+            with patch.object(
+                svc,
+                "_probe_nifty_ltp",
+                return_value={
+                    "price": 23200.0,
+                    "timestamp": "t",
+                    "provenance": "LIVE",
+                    "freshness": "REST_QUOTE",
+                    "quote_age_seconds": 0.0,
+                    "reason": None,
+                    "ok": True,
+                },
+            ):
+                with patch.object(
+                    svc,
+                    "_fetch_live_option_chain",
+                    return_value={
+                        "available": True,
+                        "ok": True,
+                        "message": None,
+                        "provenance": "LIVE",
+                        "freshness": "REST_QUOTE",
+                        "data_label": "LIVE",
+                        "rows": [
+                            {
+                                "expiry": "2026-09-29",
+                                "dte": 5,
+                                "strike": 23200.0,
+                                "ce_ltp": 10.0,
+                                "ce_bid": 9.5,
+                                "ce_ask": 10.5,
+                                "pe_ltp": 11.0,
+                                "pe_bid": 10.5,
+                                "pe_ask": 11.5,
+                            }
+                        ],
+                        "selected": {"strike": 23200.0, "expiry": "2026-09-29", "option_type": "CE"},
+                        "ce": "CE",
+                        "strike": 23200.0,
+                        "pe": "PE",
+                        "label": "live",
+                        "reason": None,
+                    },
+                ):
+                    chain = svc.option_chain_view()
+        self.assertTrue(chain["available"])
+        self.assertEqual(chain["provenance"], "LIVE")
+        self.assertEqual(chain["rows"][0]["ce_ltp"], 10.0)
+        self.assertEqual(chain["rows"][0]["pe_ask"], 11.5)
+
+    def test_refresh_preserves_verified_connection(self) -> None:
+        svc = _service(checkpoint_path=Path("__none__"))
+        svc.checkpoint_path = None
+        payload = self._fake_zerodha("CONNECTED")
+        svc._zerodha_cache = (1e18, payload)  # long-lived cache
+        first = svc._zerodha_public(probe=True)
+        second = svc._zerodha_public(probe=True)
+        self.assertEqual(first["status"], "CONNECTED")
+        self.assertEqual(second["status"], "CONNECTED")
+        from grow.dashboard.zerodha_auth import ZerodhaAuthStatus
+
+        disc = ZerodhaAuthStatus(
+            api_key_present=True,
+            api_secret_present=True,
+            access_token_present=True,
+            status="DISCONNECTED",
+            can_connect=True,
+            message="unverified",
+        )
+        with patch("grow.dashboard.zerodha_auth.auth_status", return_value=disc):
+            unverified = svc._zerodha_public(probe=False)
+        # Cached verified status remains available for market/system.
+        self.assertEqual(svc._zerodha_public(probe=True)["status"], "CONNECTED")
+        self.assertEqual(unverified["status"], "DISCONNECTED")
+
+    def test_fixture_not_labeled_live_when_disconnected(self) -> None:
+        snap = {
+            "snapshot_id": "fix",
+            "market_data_source": "FIXTURE",
+            "data_quality": "OK",
+            "underlyings": {"NIFTY": {"ltp": 1.0}},
+            "option_contracts": [],
+        }
+        svc = _service(market_snapshot=snap, checkpoint_path=Path("__none__"))
+        svc.checkpoint_path = None
+        with patch.object(svc, "_zerodha_public", return_value=self._fake_zerodha("DISCONNECTED", token=False)):
+            market = svc.market_status()
+        self.assertEqual(market["provenance"], "FIXTURE")
+        self.assertNotEqual(market["provenance"], "LIVE")
+        self.assertEqual(market["market_data"], "FIXTURE")
 
 
 if __name__ == "__main__":

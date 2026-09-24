@@ -74,7 +74,12 @@ NIFTY_INDICES: tuple[str, ...] = (
     "FINNIFTY",
     "MIDCPNIFTY",
     "NIFTYIT",
+    "SENSEX",
 )
+
+# Indices that live on BSE (everything else in NIFTY_INDICES is NSE).
+BSE_INDICES: frozenset[str] = frozenset({"SENSEX"})
+
 
 SELECTED_NSE_STOCKS: tuple[str, ...] = (
     "RELIANCE",
@@ -96,7 +101,9 @@ def _kind(ticker: str) -> InstrumentKind:
 
 def data_universe() -> tuple[Symbol, ...]:
     names = tuple(dict.fromkeys((*NIFTY_INDICES, *NIFTY50_EQUITIES)))
-    return tuple(Symbol(ticker=name, exchange="NSE") for name in names)
+    return tuple(
+        Symbol(ticker=name, exchange="BSE" if name in BSE_INDICES else "NSE") for name in names
+    )
 
 
 def is_in_data_universe(ticker: str) -> bool:

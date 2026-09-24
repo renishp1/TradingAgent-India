@@ -3,6 +3,7 @@
 from grow.campaign.config import (
     CAMPAIGN_CAPITAL_PROFILE,
     CAMPAIGN_PRICE_MODE,
+    CAMPAIGN_SESSION_TIMEOUT_SECONDS,
     campaign_paper_config,
 )
 from grow.campaign.eod import EOD_SCHEMA, SessionEODReport, build_session_eod_report
@@ -35,6 +36,7 @@ from grow.campaign.summary import SESSION_SUMMARY_SCHEMA, PaperSessionSummary
 __all__ = [
     "CAMPAIGN_CAPITAL_PROFILE",
     "CAMPAIGN_PRICE_MODE",
+    "CAMPAIGN_SESSION_TIMEOUT_SECONDS",
     "CAMPAIGN_REPORT_SCHEMA",
     "CAMPAIGN_RUNNER_VERSION",
     "EOD_SCHEMA",

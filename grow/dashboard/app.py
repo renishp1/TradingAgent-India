@@ -145,15 +145,19 @@ def create_app(service: DashboardService | None = None) -> FastAPI:
 
     @app.get("/api/settings")
     def api_settings(request: Request) -> dict[str, Any]:
-        probe = str(request.query_params.get("probe") or "").strip() in {"1", "true", "yes"}
+        # Default to verified status (same TTL path as market/system) so Settings
+        # cannot flip CONNECTED → DISCONNECTED on unprobed refresh.
+        probe_raw = str(request.query_params.get("probe") or "1").strip().lower()
+        probe = probe_raw not in {"0", "false", "no"}
         return request.app.state.service.settings_view(probe_zerodha=probe)
 
     @app.get("/api/zerodha/status")
     def api_zerodha_status(request: Request) -> dict[str, Any]:
-        from grow.dashboard.zerodha_auth import auth_status
-
-        probe = str(request.query_params.get("probe") or "").strip() in {"1", "true", "yes"}
-        return auth_status(probe=probe).to_public_dict()
+        probe = str(request.query_params.get("probe") or "1").strip().lower()
+        # Default probe=1 so status matches dashboard market/system verified path.
+        do_probe = probe not in {"0", "false", "no"}
+        force = str(request.query_params.get("force") or "").strip() in {"1", "true", "yes"}
+        return request.app.state.service._zerodha_public(probe=do_probe, force=force)
 
     @app.get("/api/zerodha/connect", response_model=None)
     def api_zerodha_connect():

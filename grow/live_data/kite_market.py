@@ -38,14 +38,25 @@ from grow.live_data.expiry_class import ExpiryClassifier, classification_counts
 from grow.live_data.models import KITE_MARKET_PROVIDER_ID, LiveHealth, SessionHealth
 from grow.live_data.provider import _FORBIDDEN_FALLBACK
 
-KITE_MARKET_ADAPTER_VERSION = "live_data.kite.market.v1"
+KITE_MARKET_ADAPTER_VERSION = "live_data.kite.market.v2"
 INSTRUMENTS_URL = "https://api.kite.trade/instruments/NFO"
+BFO_INSTRUMENTS_URL = "https://api.kite.trade/instruments/BFO"
 QUOTE_URL = "https://api.kite.trade/quote"
 HISTORICAL_URL = "https://api.kite.trade/instruments/historical"
 SOCKET_URL = "wss://ws.kite.trade"
+# Legacy single-stream order (websocket provider). Campaign multi-index uses CAMPAIGN_UNDERLYINGS.
 UNDERLYING_ORDER = ("NIFTY", "BANKNIFTY")
-INDEX_QUERY = {"NIFTY": "NSE:NIFTY 50", "BANKNIFTY": "NSE:NIFTY BANK"}
-INDEX_TOKEN = {"NIFTY": 256265, "BANKNIFTY": 260105}
+CAMPAIGN_UNDERLYINGS = ("NIFTY", "SENSEX")
+NFO_UNDERLYINGS = frozenset({"NIFTY", "BANKNIFTY"})
+BFO_UNDERLYINGS = frozenset({"SENSEX"})
+INDEX_QUERY = {
+    "NIFTY": "NSE:NIFTY 50",
+    "BANKNIFTY": "NSE:NIFTY BANK",
+    "SENSEX": "BSE:SENSEX",
+}
+INDEX_EXCHANGE = {"NIFTY": "NSE", "BANKNIFTY": "NSE", "SENSEX": "BSE"}
+INDEX_TOKEN = {"NIFTY": 256265, "BANKNIFTY": 260105, "SENSEX": 265}
+OPTION_QUOTE_PREFIX = {"NIFTY": "NFO", "BANKNIFTY": "NFO", "SENSEX": "BFO"}
 INDICES_SEGMENT = 9
 _PACKET_LENGTHS = frozenset({8, 28, 32, 44, 184})
 
@@ -208,6 +219,22 @@ def load_kite_market_secrets(environ: Mapping[str, str]) -> tuple[str, str]:
 
 def parse_nfo_instruments(text: str) -> tuple[NfoOption, ...]:
     """NIFTY and BANKNIFTY CE/PE rows from an NFO instrument dump."""
+    return parse_fo_instruments(text, allowed=NFO_UNDERLYINGS, exchanges=frozenset({"", "NFO"}), segments=frozenset({"", "NFO-OPT"}))
+
+
+def parse_bfo_instruments(text: str) -> tuple[NfoOption, ...]:
+    """SENSEX CE/PE rows from a BFO instrument dump."""
+    return parse_fo_instruments(text, allowed=BFO_UNDERLYINGS, exchanges=frozenset({"", "BFO", "BSE"}), segments=frozenset({"", "BFO-OPT", "BSE-OPT"}))
+
+
+def parse_fo_instruments(
+    text: str,
+    *,
+    allowed: frozenset[str],
+    exchanges: frozenset[str],
+    segments: frozenset[str],
+) -> tuple[NfoOption, ...]:
+    """Parse CE/PE rows for the allowed underlyings from an FO instrument dump."""
     body = str(text or "").lstrip("\ufeff").strip()
     if not body:
         raise GrowConfigError("METADATA_UNAVAILABLE")
@@ -218,16 +245,16 @@ def parse_nfo_instruments(text: str) -> tuple[NfoOption, ...]:
     for raw in reader:
         row = {(key or "").strip().lower(): (value or "").strip() for key, value in raw.items()}
         underlying = row.get("name", "").upper()
-        if underlying not in UNDERLYING_ORDER:
+        if underlying not in allowed:
             continue
         option_type = row.get("instrument_type", "").upper()
         if option_type not in {"CE", "PE"}:
             continue
         segment = row.get("segment", "").upper()
         exchange = row.get("exchange", "").upper()
-        if segment not in {"", "NFO-OPT"} and exchange not in {"", "NFO"}:
+        if segment not in segments and exchange not in exchanges:
             continue
-        if exchange not in {"", "NFO"}:
+        if exchange not in exchanges:
             continue
         symbol = row.get("tradingsymbol", "")
         if not symbol:
@@ -258,6 +285,10 @@ def parse_nfo_instruments(text: str) -> tuple[NfoOption, ...]:
             )
         )
     return tuple(found)
+
+
+def fetch_bfo_instruments(transport: "RealKiteTransport") -> str:
+    return transport.fetch_bfo_instruments()
 
 
 def _classified_live_rows(
@@ -679,6 +710,9 @@ class RealKiteTransport:
 
     def fetch_instruments(self) -> str:
         return decode_http_text(self._get(INSTRUMENTS_URL))
+
+    def fetch_bfo_instruments(self) -> str:
+        return decode_http_text(self._get(BFO_INSTRUMENTS_URL))
 
     def fetch_index_quote(self, underlying: str) -> tuple[float, int]:
         name = underlying.upper()

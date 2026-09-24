@@ -36,7 +36,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.paper.price_mode, "conservative")
         self.assertEqual(config.data.provider, "fixture")
         self.assertFalse(config.data.allow_live_feed)
-        self.assertEqual(config.strategies.universe, ("NIFTY", "BANKNIFTY"))
+        self.assertEqual(config.strategies.universe, ("NIFTY", "SENSEX"))
         self.assertEqual(config.strategies.primary_timeframe, "M15")
         self.assertEqual(config.strategies.supported_timeframes, ("M5", "M15", "D1"))
         self.assertEqual(config.options.provider, "fixture")

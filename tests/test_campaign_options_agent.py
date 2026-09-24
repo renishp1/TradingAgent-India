@@ -124,6 +124,11 @@ class CampaignOptionsAgentTests(unittest.TestCase):
         self.assertEqual(result.candidate_action, CandidateAction.PAPER_OPEN)
         self.assertEqual(result.calculated_metrics["direction"], "BULLISH")
         self.assertEqual(result.calculated_metrics["option_type"], "CE")
+        self.assertEqual(result.calculated_metrics["lots"], 1)
+        self.assertEqual(
+            result.calculated_metrics["quantity"],
+            result.calculated_metrics["lots"] * result.calculated_metrics["lot_size"],
+        )
         self.assertIn("dte_days", result.calculated_metrics)
         self.assertFalse(result.calculated_metrics["theta_in_score"])
 

@@ -122,6 +122,13 @@ def default_index_policies() -> tuple[IndexPolicy, ...]:
         _policy("NIFTY", name="Nifty 50", profile=WEEKLY_PREFERRED, active_from=date(2019, 1, 1)),
         _policy("BANKNIFTY", name="Nifty Bank", profile=MONTHLY_ONLY, active_from=date(2019, 1, 1)),
         _policy("MIDCPNIFTY", name="Nifty Midcap Select", profile=MONTHLY_ONLY, active_from=date(2023, 1, 1)),
+        _policy(
+            "SENSEX",
+            name="S&P BSE Sensex",
+            profile=WEEKLY_PREFERRED,
+            active_from=date(2023, 1, 1),
+            exchange="BSE",
+        ),
     )
 
 

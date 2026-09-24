@@ -434,9 +434,9 @@ class GrowConfig:
         allowed_tf = {"D1", "M15", "M5"}
         if not self.data.timeframes or any(tf not in allowed_tf for tf in self.data.timeframes):
             raise GrowConfigError("2A timeframes must be a non-empty subset of D1, M15, M5.")
-        allowed_idx = {"NIFTY", "BANKNIFTY"}
+        allowed_idx = {"NIFTY", "BANKNIFTY", "SENSEX"}
         if not self.strategies.universe or any(s not in allowed_idx for s in self.strategies.universe):
-            raise GrowConfigError("2B strategy universe must be a non-empty subset of NIFTY, BANKNIFTY.")
+            raise GrowConfigError("2B strategy universe must be a non-empty subset of NIFTY, BANKNIFTY, SENSEX.")
         if self.strategies.primary_timeframe != "M15":
             raise GrowConfigError("2B primary_timeframe is locked to M15. M5/D1 are context only.")
         if tuple(self.strategies.supported_timeframes) != ("M5", "M15", "D1"):
@@ -512,8 +512,9 @@ class GrowConfig:
             raise GrowConfigError("live_data.reconnect.max_backoff_seconds must be >= 1")
         if self.live_data.max_staleness_seconds < 1:
             raise GrowConfigError("live_data.max_staleness_seconds must be >= 1")
-        if self.live_data.session_timeout_seconds < 1:
-            raise GrowConfigError("live_data.session_timeout_seconds must be >= 1")
+        # 0 disables the LivePaperLoop-style wall-clock session timeout (campaign path).
+        if self.live_data.session_timeout_seconds < 0:
+            raise GrowConfigError("live_data.session_timeout_seconds must be >= 0")
         if self.live_data.snapshot_interval_seconds < 0:
             raise GrowConfigError("live_data.snapshot_interval_seconds must be >= 0")
         if self.live_data.quantity < 1:
@@ -822,7 +823,7 @@ def _build(raw: dict[str, Any], source_path: str) -> GrowConfig:
         raise GrowConfigError("grow.data.timeframes must be a list")
     if not isinstance(raw_strategies, dict):
         raise GrowConfigError("grow.strategies must be a mapping")
-    strategy_universe = raw_strategies.get("universe") or ["NIFTY", "BANKNIFTY"]
+    strategy_universe = raw_strategies.get("universe") or ["NIFTY", "SENSEX"]
     if not isinstance(strategy_universe, list) or not strategy_universe:
         raise GrowConfigError("grow.strategies.universe must be a non-empty list")
     specs = _strategy_specs(raw_strategies)
