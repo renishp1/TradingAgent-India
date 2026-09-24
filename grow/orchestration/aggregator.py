@@ -11,6 +11,85 @@ from grow.decision.contracts.agent_result import AgentResult, AgentStatus
 from grow.orchestration.models import AgentDispatchRecord, AggregateAnalysisPackage
 
 
+# Structured direction findings only — never substring-scan explanatory prose.
+_BULLISH_FINDINGS = frozenset(
+    {
+        "BULLISH",
+        "TRENDING_UP_CANDIDATE",
+        "SMA_FAST_ABOVE_SLOW",
+        "SMA_FAST_ABOVE",
+    }
+)
+_BEARISH_FINDINGS = frozenset(
+    {
+        "BEARISH",
+        "TRENDING_DOWN_CANDIDATE",
+        "SMA_FAST_BELOW_SLOW",
+        "SMA_FAST_BELOW",
+    }
+)
+_NEUTRAL_FINDINGS = frozenset(
+    {
+        "NO_DIRECTION",
+        "NEUTRAL",
+        "TECHNICAL_NEUTRAL",
+        "RANGING_CANDIDATE",
+        "INSUFFICIENT_HISTORY",
+        "INSUFFICIENT_DATA",
+        "UNKNOWN",
+        "HIGH_VOLATILITY",
+    }
+)
+_NEUTRAL_DIRECTIONS = frozenset({"", "NEUTRAL", "NONE", "UNKNOWN", "NULL"})
+
+
+def direction_vote(row: AgentResult) -> str | None:
+    """Return BULLISH / BEARISH from structured agent fields, else None.
+
+    Precedence:
+    1. calculated_metrics.direction
+    2. observations ``direction=<value>``
+    3. exact finding tokens
+
+    Does not scan interpretation prose for the substrings BULL/BEAR.
+    """
+    metrics = row.calculated_metrics or {}
+    raw_dir = str(metrics.get("direction") or "").strip().upper()
+    if raw_dir in {"BULLISH", "BEARISH"}:
+        return raw_dir
+    if raw_dir in _NEUTRAL_DIRECTIONS and raw_dir != "":
+        return None
+
+    for obs in row.observations or ():
+        text = str(obs).strip()
+        if "=" not in text:
+            continue
+        key, value = text.split("=", 1)
+        if key.strip().upper() != "DIRECTION":
+            continue
+        token = value.strip().upper()
+        if token in {"BULLISH", "BEARISH"}:
+            return token
+        if token in _NEUTRAL_DIRECTIONS or token == "NEUTRAL":
+            return None
+
+    bull = False
+    bear = False
+    for finding in row.findings or ():
+        token = str(finding).strip().upper()
+        if token in _NEUTRAL_FINDINGS:
+            return None
+        if token in _BULLISH_FINDINGS:
+            bull = True
+        if token in _BEARISH_FINDINGS:
+            bear = True
+    if bull and not bear:
+        return "BULLISH"
+    if bear and not bull:
+        return "BEARISH"
+    return None
+
+
 def aggregate_outputs(
     *,
     cycle_id: str,
@@ -24,17 +103,17 @@ def aggregate_outputs(
     debate = summarize_debate(outputs)
     conflicts = list(debate.conflicts)
 
-    # Finding-level conflicts (e.g. bullish technical vs bearish regime).
+    # Finding-level conflicts from structured direction votes only.
     # ERROR / unavailable specialists (including timeouts) never cast a direction vote.
     bullish = []
     bearish = []
     for row in outputs:
         if row.status is AgentStatus.ERROR:
             continue
-        blob = " ".join(row.findings + row.interpretation).upper()
-        if any(token in blob for token in ("BULL", "TRENDING_UP", "SMA_FAST_ABOVE")):
+        vote = direction_vote(row)
+        if vote == "BULLISH":
             bullish.append(row.agent_name)
-        if any(token in blob for token in ("BEAR", "TRENDING_DOWN", "SMA_FAST_BELOW")):
+        elif vote == "BEARISH":
             bearish.append(row.agent_name)
     if bullish and bearish:
         conflicts.append(f"DIRECTION_CONFLICT:bullish={','.join(bullish)};bearish={','.join(bearish)}")
@@ -119,6 +198,6 @@ def _strip_timing(value: Any) -> Any:
                 "ended_at",
             }
         }
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return [_strip_timing(item) for item in value]
     return value

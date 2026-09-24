@@ -186,10 +186,59 @@ def build_agent_snapshot(
             "fixture": source is MarketDataSource.FIXTURE,
             "market_data_source": source.value,
             "market_data_health": feed_health.value,
+            **history_diagnostics_from_live(live, provenance=source.value),
         },
         is_fixture=source is MarketDataSource.FIXTURE,
         market_data_source=source,
     )
+
+
+def history_diagnostics_from_live(
+    live: LiveSnapshot,
+    *,
+    provenance: str,
+) -> dict:
+    """Copy M15 closes from the live market series into agent diagnostics.
+
+    Interval is explicit (M15) — locked to strategies.primary_timeframe.
+    """
+    for symbol in live.underlyings:
+        market = live.market.get(symbol)
+        if market is None:
+            continue
+        series = market.series.get(Timeframe.M15)
+        if series is None or not series.bars:
+            continue
+        closes = [float(bar.close) for bar in series.bars]
+        return {
+            "history_closes": closes,
+            "history_interval": "M15",
+            "history_bar_count": len(closes),
+            "history_earliest": series.bars[0].start.isoformat(),
+            "history_latest": series.bars[-1].end.isoformat(),
+            "history_provenance": provenance,
+        }
+    return {}
+
+
+def history_diagnostics_from_closes(
+    closes: list[float] | tuple[float, ...],
+    *,
+    interval: str,
+    earliest: str | None,
+    latest: str | None,
+    provenance: str,
+) -> dict:
+    """Build explicit history diagnostics for agent snapshots."""
+    rows = [float(v) for v in closes]
+    return {
+        "history_closes": rows,
+        "history_interval": interval,
+        "history_bar_count": len(rows),
+        "history_earliest": earliest,
+        "history_latest": latest,
+        "history_provenance": provenance,
+    }
 
 
 def build_fixture_snapshot(

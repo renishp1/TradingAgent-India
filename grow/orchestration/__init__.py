@@ -4,7 +4,7 @@ Canonical pipeline: ``AnalysisOrchestrator`` (dispatch → validate → aggregat
 ``AgentCycleOrchestrator`` remains a compatibility Risk Guard consumer only.
 """
 
-from grow.orchestration.aggregator import aggregate_outputs
+from grow.orchestration.aggregator import aggregate_outputs, direction_vote
 from grow.orchestration.cycle import AnalysisCycleStore, AnalysisOrchestrator, stable_cycle_id
 from grow.orchestration.dispatcher import dispatch_agents
 from grow.orchestration.models import AggregateAnalysisPackage, AgentDispatchRecord
@@ -17,6 +17,7 @@ __all__ = [
     "AnalysisOrchestrator",
     "ValidationOutcome",
     "aggregate_outputs",
+    "direction_vote",
     "dispatch_agents",
     "stable_cycle_id",
     "validate_agent_output",

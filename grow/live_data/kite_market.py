@@ -34,12 +34,22 @@ from grow.live_data.provider import _FORBIDDEN_FALLBACK
 KITE_MARKET_ADAPTER_VERSION = "live_data.kite.market.v1"
 INSTRUMENTS_URL = "https://api.kite.trade/instruments/NFO"
 QUOTE_URL = "https://api.kite.trade/quote"
+HISTORICAL_URL = "https://api.kite.trade/instruments/historical"
 SOCKET_URL = "wss://ws.kite.trade"
 UNDERLYING_ORDER = ("NIFTY", "BANKNIFTY")
 INDEX_QUERY = {"NIFTY": "NSE:NIFTY 50", "BANKNIFTY": "NSE:NIFTY BANK"}
 INDEX_TOKEN = {"NIFTY": 256265, "BANKNIFTY": 260105}
 INDICES_SEGMENT = 9
 _PACKET_LENGTHS = frozenset({8, 28, 32, 44, 184})
+
+# Locked to strategies.primary_timeframe = M15 (docs/strategy.md, grow/config.py).
+# Kite REST interval name for that timeframe; never silently change indicators.
+HISTORY_TIMEFRAME = "M15"
+HISTORY_KITE_INTERVAL = "15minute"
+HISTORY_MIN_CLOSES = 15  # SMA14 + RSI(14) need >=15 closes
+HISTORY_TARGET_BARS = 80  # safe buffer aligned with live mock history depth
+HISTORY_LOOKBACK_CALENDAR_DAYS = 12
+HISTORY_CACHE_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -394,6 +404,95 @@ def decode_binary_frame(blob: bytes) -> tuple[MarketTick, ...]:
     return tuple(decode_market_packet(packet) for packet in split_binary_packets(blob))
 
 
+def _parse_kite_candle_ts(raw: str) -> datetime:
+    text = str(raw).strip()
+    # Kite returns offsets like +0530 without a colon.
+    if len(text) >= 5 and text[-5] in {"+", "-"} and ":" not in text[-5:]:
+        text = f"{text[:-2]}:{text[-2:]}"
+    return datetime.fromisoformat(text).astimezone(IST)
+
+
+def candles_to_m15_spot_bars(
+    candles: Sequence[Sequence[Any]],
+    *,
+    underlying: str,
+) -> list[dict[str, Any]]:
+    """Map Kite OHLCV candle rows to grow.stream spot_bars (M15 only)."""
+    from grow.data.schedule import bar_duration
+    from grow.data.schema import Timeframe
+
+    dur = bar_duration(Timeframe.M15)
+    rows: list[dict[str, Any]] = []
+    for candle in candles:
+        if not isinstance(candle, (list, tuple)) or len(candle) < 5:
+            continue
+        start = _parse_kite_candle_ts(str(candle[0]))
+        end = start + dur
+        volume = int(candle[5]) if len(candle) > 5 and candle[5] is not None else 0
+        rows.append(
+            {
+                "underlying": underlying.upper(),
+                "timeframe": HISTORY_TIMEFRAME,
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+                "open": float(candle[1]),
+                "high": float(candle[2]),
+                "low": float(candle[3]),
+                "close": float(candle[4]),
+                "volume": volume,
+            }
+        )
+    return rows
+
+
+def synthetic_m15_candles(
+    *,
+    as_of: datetime,
+    start_px: float,
+    count: int = HISTORY_TARGET_BARS,
+) -> list[list[Any]]:
+    """Deterministic M15 candles for ScriptedKiteTransport (not fixture market data)."""
+    from grow.data.schedule import bar_duration, expected_starts
+    from grow.data.schema import Timeframe
+    from datetime import time as time_t
+
+    as_of = as_of.astimezone(IST)
+    days: list[date] = []
+    day = as_of.date()
+    while len(days) < 12:
+        if day.weekday() < 5:
+            days.append(day)
+        day -= timedelta(days=1)
+    days.reverse()
+    dur = bar_duration(Timeframe.M15)
+    out: list[list[Any]] = []
+    px = float(start_px) - (count * 0.5)
+    for session in days:
+        for start in expected_starts(
+            session,
+            Timeframe.M15,
+            session_open=time_t(9, 15),
+            session_close=time_t(15, 30),
+        ):
+            end = start + dur
+            if end > as_of:
+                continue
+            px += 0.5
+            out.append(
+                [
+                    start.isoformat(),
+                    round(px - 0.4, 2),
+                    round(px + 0.8, 2),
+                    round(px - 0.8, 2),
+                    round(px, 2),
+                    1000,
+                ]
+            )
+    if len(out) > count:
+        out = out[-count:]
+    return out
+
+
 class ScriptedKiteTransport:
     """In-memory frames for parser tests. Not a live socket and not a fixture feed."""
 
@@ -403,10 +502,12 @@ class ScriptedKiteTransport:
         instruments_csv: str,
         spots: Mapping[str, float],
         frames: Sequence[bytes | str] = (),
+        historical_candles: Sequence[Sequence[Any]] | None = None,
     ) -> None:
         self.instruments_csv = instruments_csv
         self.spots = {str(key).upper(): float(value) for key, value in spots.items()}
         self.frames = list(frames)
+        self.historical_candles = None if historical_candles is None else [list(row) for row in historical_candles]
         self.connected = False
         self.subscribed: list[int] = []
         self.mode: str | None = None
@@ -426,6 +527,23 @@ class ScriptedKiteTransport:
         if name not in self.spots:
             raise GrowConfigError("METADATA_UNAVAILABLE")
         return self.spots[name], INDEX_TOKEN[name]
+
+    def fetch_historical_candles(
+        self,
+        instrument_token: int,
+        *,
+        interval: str,
+        from_date: date,
+        to_date: date,
+        as_of: datetime | None = None,
+    ) -> list[list[Any]]:
+        if interval != HISTORY_KITE_INTERVAL:
+            raise GrowConfigError("UNSUPPORTED_HISTORY_INTERVAL")
+        if self.historical_candles is not None:
+            return [list(row) for row in self.historical_candles]
+        spot = next(iter(self.spots.values()), 24000.0)
+        moment = as_of or datetime.combine(to_date, datetime.min.time(), tzinfo=IST)
+        return synthetic_m15_candles(as_of=moment, start_px=float(spot))
 
     def subscribe(self, tokens: Sequence[int], *, mode: str) -> None:
         if not self.connected:
@@ -512,6 +630,30 @@ class RealKiteTransport:
         except (TypeError, ValueError) as exc:
             raise GrowConfigError("METADATA_UNAVAILABLE") from exc
         return price, ident
+
+    def fetch_historical_candles(
+        self,
+        instrument_token: int,
+        *,
+        interval: str,
+        from_date: date,
+        to_date: date,
+        as_of: datetime | None = None,
+    ) -> list[list[Any]]:
+        """Read-only Kite historical OHLC. No orders."""
+        if interval != HISTORY_KITE_INTERVAL:
+            raise GrowConfigError("UNSUPPORTED_HISTORY_INTERVAL")
+        url = (
+            f"{HISTORICAL_URL}/{int(instrument_token)}/{interval}"
+            f"?from={from_date.isoformat()}&to={to_date.isoformat()}"
+        )
+        body = json.loads(decode_http_text(self._get(url)))
+        if body.get("status") != "success":
+            raise GrowConfigError("METADATA_UNAVAILABLE")
+        candles = (body.get("data") or {}).get("candles") or []
+        if not isinstance(candles, list):
+            raise GrowConfigError("METADATA_UNAVAILABLE")
+        return [list(row) for row in candles if isinstance(row, (list, tuple))]
 
     def subscribe(self, tokens: Sequence[int], *, mode: str) -> None:
         if not self.connected or self._ws is None:
@@ -607,6 +749,7 @@ class KiteMarketProvider:
         self._chain: tuple[NfoOption, ...] = ()
         self.selected: NfoOption | None = None
         self.selected_put: NfoOption | None = None
+        self._history_cache: dict[str, tuple[datetime, list[dict[str, Any]]]] = {}
         self._contracts: dict[int, NfoOption] = {}
         self._side_quotes: dict[str, NormalizedOptionQuote] = {}
         self._spots: dict[str, float] = {}
@@ -889,6 +1032,61 @@ class KiteMarketProvider:
             is_fixture=False,
         )
 
+    def _m15_spot_bars_for(self, underlyings: Sequence[str], *, as_of: datetime) -> list[dict[str, Any]]:
+        """Fetch read-only M15 index candles into stream spot_bars (cached)."""
+        if self.transport is None:
+            return []
+        now = self.clock.now().astimezone(IST)
+        as_of = as_of.astimezone(IST)
+        bars: list[dict[str, Any]] = []
+        to_day = as_of.date()
+        from_day = to_day - timedelta(days=HISTORY_LOOKBACK_CALENDAR_DAYS)
+        for symbol in underlyings:
+            name = str(symbol).upper()
+            cached = self._history_cache.get(name)
+            if cached is not None:
+                cached_at, cached_bars = cached
+                if (now - cached_at).total_seconds() <= HISTORY_CACHE_SECONDS:
+                    bars.extend(cached_bars)
+                    continue
+            token = INDEX_TOKEN.get(name)
+            if token is None:
+                for ident, symbol in self._index_tokens.items():
+                    if symbol == name:
+                        token = ident
+                        break
+            if token is None:
+                continue
+            try:
+                candles = self.transport.fetch_historical_candles(
+                    int(token),
+                    interval=HISTORY_KITE_INTERVAL,
+                    from_date=from_day,
+                    to_date=to_day,
+                    as_of=as_of,
+                )
+            except GrowConfigError:
+                continue
+            except TypeError:
+                # Older scripted transports without as_of kwarg.
+                try:
+                    candles = self.transport.fetch_historical_candles(
+                        int(token),
+                        interval=HISTORY_KITE_INTERVAL,
+                        from_date=from_day,
+                        to_date=to_day,
+                    )
+                except GrowConfigError:
+                    continue
+            mapped = candles_to_m15_spot_bars(candles, underlying=name)
+            if len(mapped) > HISTORY_TARGET_BARS:
+                mapped = mapped[-HISTORY_TARGET_BARS:]
+            if len(mapped) < HISTORY_MIN_CLOSES:
+                continue
+            self._history_cache[name] = (now, mapped)
+            bars.extend(mapped)
+        return bars
+
     def _assemble(self, event_time: datetime, *, include_quote: bool) -> dict[str, Any]:
         underlyings = list(self.discover_underlyings())
         if not underlyings or not self._spots:
@@ -945,6 +1143,7 @@ class KiteMarketProvider:
                 missing_fields.append(f"MISSING_ASK:{row.get('option_type')}")
             if row.get("oi") is None:
                 missing_fields.append(f"MISSING_OI:{row.get('option_type')}")
+        spot_bars = self._m15_spot_bars_for(underlyings, as_of=event_time)
         return {
             "provider": self.identity,
             "adapter_version": self.adapter_version,
@@ -957,7 +1156,7 @@ class KiteMarketProvider:
             "instrument_type": "OPTIDX",
             "underlyings": underlyings,
             "spots": dict(self._spots),
-            "spot_bars": [],
+            "spot_bars": spot_bars,
             "contract_master": master,
             "option_quotes": quotes,
             "is_fixture": False,
