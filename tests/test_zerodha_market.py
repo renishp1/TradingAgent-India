@@ -8,12 +8,12 @@ import importlib
 import io
 import struct
 import unittest
-from datetime import timedelta
+from datetime import datetime, timedelta
 from email.message import Message
 from pathlib import Path
 from unittest.mock import patch
 
-from grow.clock import FrozenClock
+from grow.clock import FrozenClock, IST
 from grow.errors import GrowConfigError, GrowLiveTradingDisabled
 from grow.execution.lock import inspect_environment
 from grow.live_data.kite_market import (
@@ -555,6 +555,94 @@ class PairSelectionTests(unittest.TestCase):
         with self.assertRaises(GrowConfigError) as ctx:
             provider.connect()
         self.assertEqual(str(ctx.exception), "NO_VALID_OPTION")
+
+    def test_earlier_monthly_later_weekly_selects_weekly(self) -> None:
+        """NIFTY WEEKLY_PREFERRED: skip nearer MONTHLY when a future WEEKLY exists."""
+        from grow.live_data.expiry_class import ExpiryClassifier
+
+        # 2026-09-29 = last Tuesday = MONTHLY; 2026-10-06 = WEEKLY.
+        as_of = datetime(2026, 9, 24, 11, 0, tzinfo=IST)
+        csv = """instrument_token,exchange_token,tradingsymbol,name,last_price,expiry,strike,tick_size,lot_size,instrument_type,segment,exchange
+1000,1,NIFTY26SEP23200CE,NIFTY,10,2026-09-29,23200,0.05,65,CE,NFO-OPT,NFO
+1001,2,NIFTY26SEP23200PE,NIFTY,12,2026-09-29,23200,0.05,65,PE,NFO-OPT,NFO
+1002,3,NIFTY26O0623200CE,NIFTY,40,2026-10-06,23200,0.05,65,CE,NFO-OPT,NFO
+1003,4,NIFTY26O0623200PE,NIFTY,41,2026-10-06,23200,0.05,65,PE,NFO-OPT,NFO
+1004,5,NIFTY26O0623250CE,NIFTY,35,2026-10-06,23250,0.05,65,CE,NFO-OPT,NFO
+1005,6,NIFTY26O0623250PE,NIFTY,36,2026-10-06,23250,0.05,65,PE,NFO-OPT,NFO
+"""
+        classifier = ExpiryClassifier(clock=FrozenClock(as_of))
+        call, put = select_option_pair(
+            parse_nfo_instruments(csv),
+            spots={"NIFTY": 23210.0},
+            as_of=as_of.date(),
+            classifier=classifier,
+        )
+        self.assertEqual(call.expiry.isoformat(), "2026-10-06")
+        self.assertEqual(put.expiry.isoformat(), "2026-10-06")
+        self.assertEqual(call.option_type, "CE")
+        self.assertEqual(put.option_type, "PE")
+        self.assertEqual(call.strike, put.strike)
+        self.assertEqual(call.strike, 23200.0)
+        klass = classifier.classify(
+            provider_symbol=call.tradingsymbol,
+            canonical_symbol="NIFTY",
+            expiry=call.expiry,
+            option_type="CE",
+            as_of=as_of,
+        ).expiry_class
+        self.assertEqual(klass, "WEEKLY")
+
+        single = select_option_contract(
+            parse_nfo_instruments(csv),
+            spots={"NIFTY": 23210.0},
+            as_of=as_of.date(),
+            classifier=classifier,
+        )
+        self.assertEqual(single.expiry.isoformat(), "2026-10-06")
+        self.assertEqual(single.option_type, "CE")
+
+    def test_weekly_only_catalog_selects_weekly(self) -> None:
+        from grow.live_data.expiry_class import ExpiryClassifier
+
+        as_of = datetime(2026, 9, 24, 11, 0, tzinfo=IST)
+        csv = """instrument_token,exchange_token,tradingsymbol,name,last_price,expiry,strike,tick_size,lot_size,instrument_type,segment,exchange
+2000,1,NIFTY26O0623200CE,NIFTY,10,2026-10-06,23200,0.05,65,CE,NFO-OPT,NFO
+2001,2,NIFTY26O0623200PE,NIFTY,12,2026-10-06,23200,0.05,65,PE,NFO-OPT,NFO
+"""
+        call, put = select_option_pair(
+            parse_nfo_instruments(csv),
+            spots={"NIFTY": 23200.0},
+            as_of=as_of.date(),
+            classifier=ExpiryClassifier(clock=FrozenClock(as_of)),
+        )
+        self.assertEqual(call.expiry.isoformat(), "2026-10-06")
+        self.assertEqual(put.expiry, call.expiry)
+
+    def test_monthly_only_nifty_fails_closed(self) -> None:
+        """NIFTY WEEKLY_PREFERRED must not fall back to MONTHLY."""
+        from grow.live_data.expiry_class import ExpiryClassifier
+
+        as_of = datetime(2026, 9, 24, 11, 0, tzinfo=IST)
+        csv = """instrument_token,exchange_token,tradingsymbol,name,last_price,expiry,strike,tick_size,lot_size,instrument_type,segment,exchange
+3000,1,NIFTY26SEP23200CE,NIFTY,10,2026-09-29,23200,0.05,65,CE,NFO-OPT,NFO
+3001,2,NIFTY26SEP23200PE,NIFTY,12,2026-09-29,23200,0.05,65,PE,NFO-OPT,NFO
+"""
+        with self.assertRaises(GrowConfigError) as ctx:
+            select_option_pair(
+                parse_nfo_instruments(csv),
+                spots={"NIFTY": 23200.0},
+                as_of=as_of.date(),
+                classifier=ExpiryClassifier(clock=FrozenClock(as_of)),
+            )
+        self.assertEqual(str(ctx.exception), "NO_VALID_OPTION")
+        with self.assertRaises(GrowConfigError) as ctx2:
+            select_option_contract(
+                parse_nfo_instruments(csv),
+                spots={"NIFTY": 23200.0},
+                as_of=as_of.date(),
+                classifier=ExpiryClassifier(clock=FrozenClock(as_of)),
+            )
+        self.assertEqual(str(ctx2.exception), "NO_VALID_OPTION")
 
 
 class TransportFailureTests(unittest.TestCase):

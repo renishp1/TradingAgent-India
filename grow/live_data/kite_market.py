@@ -25,7 +25,14 @@ from uuid import uuid4
 
 from grow.clock import IST, Clock, FrozenClock
 from grow.errors import GrowConfigError
-from grow.history.universe import IndexUniverseRegistry, default_index_registry, is_forbidden_instrument
+from grow.history.models import HistoricalExpiryRecord
+from grow.history.resolver import resolve_nearest_expiry
+from grow.history.universe import (
+    WEEKLY_PREFERRED,
+    IndexUniverseRegistry,
+    default_index_registry,
+    is_forbidden_instrument,
+)
 from grow.live_data.catalog import is_tradable_expiry_class
 from grow.live_data.expiry_class import ExpiryClassifier, classification_counts
 from grow.live_data.models import KITE_MARKET_PROVIDER_ID, LiveHealth, SessionHealth
@@ -253,15 +260,14 @@ def parse_nfo_instruments(text: str) -> tuple[NfoOption, ...]:
     return tuple(found)
 
 
-def select_option_contract(
+def _classified_live_rows(
     options: Sequence[NfoOption],
     *,
-    spots: Mapping[str, float],
     as_of: date,
     classifier: ExpiryClassifier,
-) -> NfoOption:
-    """Nearest live expiry, then the strike closest to spot. CE before PE."""
-    grouped: dict[str, list[NfoOption]] = {name: [] for name in UNDERLYING_ORDER}
+) -> dict[str, list[tuple[NfoOption, str]]]:
+    """Future CE/PE rows with a tradable WEEKLY/MONTHLY class, keyed by underlying."""
+    grouped: dict[str, list[tuple[NfoOption, str]]] = {name: [] for name in UNDERLYING_ORDER}
     for row in options:
         if row.expiry < as_of:
             continue
@@ -272,16 +278,88 @@ def select_option_contract(
             option_type=row.option_type,
             as_of=as_of,
         )
-        if not is_tradable_expiry_class(classified.expiry_class):
+        klass = str(classified.expiry_class or "").upper()
+        if not is_tradable_expiry_class(klass):
             continue
-        grouped[row.underlying].append(row)
+        if row.underlying in grouped:
+            grouped[row.underlying].append((row, klass))
+    return grouped
+
+
+def _preferred_live_expiry(
+    rows: Sequence[tuple[NfoOption, str]],
+    *,
+    underlying: str,
+    as_of: date,
+    registry: IndexUniverseRegistry | None = None,
+) -> date | None:
+    """Pick expiry via the same IndexPolicy profile as campaign/TrueData (no silent monthly fallback).
+
+    NIFTY → WEEKLY_PREFERRED; BANKNIFTY → MONTHLY_ONLY. Fail closed when the preferred class
+    has no future eligible day.
+    """
+    if not rows:
+        return None
+    reg = registry or default_index_registry()
+    policy = reg.policy(underlying, as_of)
+    profile = policy.expiry_policy_profile if policy is not None else WEEKLY_PREFERRED
+    moment = datetime(as_of.year, as_of.month, as_of.day, 11, 0, tzinfo=IST)
+    seen: set[tuple[date, str]] = set()
+    records: list[HistoricalExpiryRecord] = []
+    for _row, klass in rows:
+        key = (_row.expiry, klass)
+        if key in seen:
+            continue
+        seen.add(key)
+        records.append(
+            HistoricalExpiryRecord(
+                underlying=underlying,
+                expiry=_row.expiry,
+                expiry_class=klass,
+                first_seen_at=moment - timedelta(days=14),
+                last_seen_at=moment + timedelta(days=14),
+                listing_status="LISTED",
+                source_id=KITE_MARKET_PROVIDER_ID,
+                dataset_version=KITE_MARKET_ADAPTER_VERSION,
+            )
+        )
+    resolution = resolve_nearest_expiry(
+        underlying,
+        moment,
+        tuple(records),
+        profile,
+        allow_same_day=False,
+    )
+    if not resolution.selected_expiry:
+        return None
+    return date.fromisoformat(resolution.selected_expiry)
+
+
+def select_option_contract(
+    options: Sequence[NfoOption],
+    *,
+    spots: Mapping[str, float],
+    as_of: date,
+    classifier: ExpiryClassifier,
+    registry: IndexUniverseRegistry | None = None,
+) -> NfoOption:
+    """Policy-preferred live expiry, then the strike closest to spot. CE before PE.
+
+    Expiry selection follows the IndexUniverseRegistry profile (NIFTY:
+    WEEKLY_PREFERRED — nearest future weekly, no monthly fallback).
+    """
+    grouped = _classified_live_rows(options, as_of=as_of, classifier=classifier)
     for underlying in UNDERLYING_ORDER:
         spot = spots.get(underlying)
-        rows = grouped[underlying]
+        rows = grouped.get(underlying) or []
         if spot is None or not rows:
             continue
-        expiry = min(row.expiry for row in rows)
-        pool = [row for row in rows if row.expiry == expiry]
+        expiry = _preferred_live_expiry(rows, underlying=underlying, as_of=as_of, registry=registry)
+        if expiry is None:
+            continue
+        pool = [row for row, _klass in rows if row.expiry == expiry]
+        if not pool:
+            continue
         strike = min((row.strike for row in pool), key=lambda value: (abs(value - float(spot)), value))
         at_strike = [row for row in pool if row.strike == strike]
         calls = [row for row in at_strike if row.option_type == "CE"]
@@ -299,29 +377,26 @@ def select_option_pair(
     spots: Mapping[str, float],
     as_of: date,
     classifier: ExpiryClassifier,
+    registry: IndexUniverseRegistry | None = None,
 ) -> tuple[NfoOption, NfoOption]:
-    """Nearest live expiry, then the closest strike that has both a CE and a PE."""
-    grouped: dict[str, list[NfoOption]] = {name: [] for name in UNDERLYING_ORDER}
-    for row in options:
-        if row.expiry < as_of:
-            continue
-        classified = classifier.classify(
-            provider_symbol=row.tradingsymbol,
-            canonical_symbol=row.underlying,
-            expiry=row.expiry,
-            option_type=row.option_type,
-            as_of=as_of,
-        )
-        if not is_tradable_expiry_class(classified.expiry_class):
-            continue
-        grouped[row.underlying].append(row)
+    """Policy-preferred live expiry, then the closest strike that has both a CE and a PE.
+
+    Expiry selection follows the IndexUniverseRegistry profile (NIFTY:
+    WEEKLY_PREFERRED — nearest future weekly, no monthly fallback), matching
+    ``resolve_nearest_expiry`` / ``choose_expiry`` used by campaign filtering.
+    """
+    grouped = _classified_live_rows(options, as_of=as_of, classifier=classifier)
     for underlying in UNDERLYING_ORDER:
         spot = spots.get(underlying)
-        rows = grouped[underlying]
+        rows = grouped.get(underlying) or []
         if spot is None or not rows:
             continue
-        expiry = min(row.expiry for row in rows)
-        pool = [row for row in rows if row.expiry == expiry]
+        expiry = _preferred_live_expiry(rows, underlying=underlying, as_of=as_of, registry=registry)
+        if expiry is None:
+            continue
+        pool = [row for row, _klass in rows if row.expiry == expiry]
+        if not pool:
+            continue
         strikes = sorted({row.strike for row in pool}, key=lambda value: (abs(value - float(spot)), value))
         for strike in strikes:
             at_strike = [row for row in pool if row.strike == strike]
