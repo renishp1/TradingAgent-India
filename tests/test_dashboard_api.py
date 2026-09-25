@@ -34,7 +34,14 @@ _TEST_ENV = {
 
 def _service(**kwargs) -> DashboardService:
     config = load_config(CONFIG, environ=dict(_TEST_ENV))
-    return DashboardService(config, **kwargs)
+    if "risk_override_path" not in kwargs:
+        kwargs["risk_override_path"] = Path(tempfile.mkdtemp()) / "no-override.json"
+    if "checkpoint_path" not in kwargs:
+        kwargs["checkpoint_path"] = Path("__none__")
+    svc = DashboardService(config, **kwargs)
+    if kwargs.get("checkpoint_path") == Path("__none__") or str(kwargs.get("checkpoint_path")) == "__none__":
+        svc.checkpoint_path = None
+    return svc
 
 
 def _client(service: DashboardService | None = None) -> TestClient:
@@ -98,7 +105,12 @@ class DashboardApiTests(unittest.TestCase):
             quantity=10,
             average_price=2500.0,
         )
-        svc = DashboardService(config, book=book, checkpoint_path=Path("__none__"))
+        svc = DashboardService(
+            config,
+            book=book,
+            checkpoint_path=Path("__none__"),
+            risk_override_path=Path(tempfile.mkdtemp()) / "no-override.json",
+        )
         svc.checkpoint_path = None
         res = _client(svc).get("/api/positions")
         body = res.json()
@@ -111,11 +123,71 @@ class DashboardApiTests(unittest.TestCase):
         self.assertEqual(res.status_code, 200)
         body = res.json()
         self.assertEqual(body["status"], "ACTIVE")
-        self.assertTrue(body["read_only"])
+        self.assertFalse(body["read_only"])
+        self.assertTrue(body["editable"])
         effective = align_dashboard_config(load_config(CONFIG, environ=dict(_TEST_ENV)))
         self.assertEqual(body["max_daily_loss"], effective.risk.max_daily_loss)
         self.assertEqual(body["paper_capital"], effective.paper.starting_cash)
         self.assertEqual(body["starting_capital"], effective.paper.starting_cash)
+
+    def test_paper_risk_config_update_and_reset(self) -> None:
+        override = Path(tempfile.mkdtemp()) / "risk.json"
+        svc = _service(risk_override_path=override)
+        client = _client(svc)
+        res = client.post(
+            "/api/risk/config",
+            json={
+                "starting_cash": 10000,
+                "max_daily_loss": 2000,
+                "max_per_trade_risk": 1700,
+                "max_open_positions": 2,
+            },
+        )
+        self.assertEqual(res.status_code, 200)
+        body = res.json()
+        self.assertTrue(body["ok"])
+        self.assertTrue(body["override_active"])
+        self.assertEqual(body["fields"]["max_per_trade_risk"], 1700.0)
+        self.assertEqual(svc.config.risk.max_per_trade_risk, 1700.0)
+        self.assertTrue(override.is_file())
+
+        refused = client.post(
+            "/api/risk/config",
+            json={
+                "starting_cash": 10000,
+                "max_daily_loss": 2000,
+                "max_per_trade_risk": 1700,
+                "max_open_positions": 2,
+                "live_trading": True,
+            },
+        )
+        self.assertEqual(refused.status_code, 400)
+        self.assertIn("REFUSED", refused.json()["error"])
+
+        reset = client.post("/api/risk/config/reset")
+        self.assertEqual(reset.status_code, 200)
+        self.assertFalse(reset.json()["override_active"])
+        self.assertEqual(svc.config.risk.max_per_trade_risk, 1000.0)
+        self.assertFalse(override.is_file())
+
+    def test_paper_risk_config_does_not_enable_live(self) -> None:
+        client = _client()
+        res = client.post(
+            "/api/risk/config",
+            json={
+                "starting_cash": 10000,
+                "max_daily_loss": 2000,
+                "max_per_trade_risk": 1500,
+                "max_open_positions": 2,
+            },
+        )
+        self.assertEqual(res.status_code, 200)
+        body = res.json()
+        self.assertFalse(body["live_trading"])
+        self.assertFalse(body["broker_order_path"])
+        safety = client.get("/api/safety").json()
+        self.assertFalse(safety["can_enable_live_trading"])
+        self.assertTrue(safety["broker_orders_disabled"])
 
     def test_dashboard_capital_equals_effective_growconfig(self) -> None:
         """Dashboard capital must match campaign/RiskGuard effective profile.
@@ -133,7 +205,11 @@ class DashboardApiTests(unittest.TestCase):
         self.assertEqual(effective.risk.max_per_trade_risk, 1_000.0)
         self.assertEqual(effective.risk.max_open_positions, 2)
 
-        svc = DashboardService(raw, checkpoint_path=Path("__none__"))
+        svc = DashboardService(
+            raw,
+            checkpoint_path=Path("__none__"),
+            risk_override_path=Path(tempfile.mkdtemp()) / "no-override.json",
+        )
         svc.checkpoint_path = None
         dash = svc.dashboard()
         self.assertEqual(dash["capital"]["paper_capital"], effective.paper.starting_cash)
@@ -367,7 +443,7 @@ class DashboardApiTests(unittest.TestCase):
                 "PAPER TRADING",
                 "LIVE TRADING DISABLED",
                 "BROKER ORDERS DISABLED",
-                "READ ONLY UI",
+                "PAPER RISK EDITABLE",
             ],
         )
 
