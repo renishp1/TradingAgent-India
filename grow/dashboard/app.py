@@ -1,7 +1,7 @@
-"""Read-only FastAPI dashboard (Phase 1).
+"""Paper dashboard FastAPI app.
 
-Serves a static trading-terminal UI and GET-only JSON APIs.
-Zerodha Connect is market-data OAuth only (login + token store).
+Serves a static trading-terminal UI and JSON APIs.
+Paper risk limits are editable; Zerodha Connect is market-data OAuth only.
 Does not place orders or enable live trading.
 """
 
@@ -118,6 +118,54 @@ def create_app(service: DashboardService | None = None) -> FastAPI:
     @app.get("/api/risk")
     def api_risk(request: Request) -> dict[str, Any]:
         return request.app.state.service.risk_view()
+
+    @app.get("/api/risk/config")
+    def api_risk_config_get(request: Request) -> dict[str, Any]:
+        return request.app.state.service.risk_config_view()
+
+    @app.post("/api/risk/config")
+    async def api_risk_config_set(request: Request) -> JSONResponse:
+        """Update paper capital / risk limits. Never enables live trading."""
+        if LIVE_TRADING_COMPILED:
+            return JSONResponse(
+                status_code=403,
+                content={"ok": False, "error": "LIVE_TRADING_COMPILED", "live_trading": False},
+            )
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse(status_code=400, content={"ok": False, "error": "INVALID_JSON"})
+        if not isinstance(body, dict):
+            return JSONResponse(status_code=400, content={"ok": False, "error": "INVALID_JSON"})
+        try:
+            result = request.app.state.service.update_paper_risk_config(body)
+            return JSONResponse(result)
+        except GrowConfigError as exc:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "ok": False,
+                    "error": str(exc),
+                    "live_trading": False,
+                    "broker_order_path": False,
+                },
+            )
+
+    @app.post("/api/risk/config/reset")
+    def api_risk_config_reset(request: Request) -> JSONResponse:
+        if LIVE_TRADING_COMPILED:
+            return JSONResponse(
+                status_code=403,
+                content={"ok": False, "error": "LIVE_TRADING_COMPILED", "live_trading": False},
+            )
+        try:
+            result = request.app.state.service.reset_paper_risk_config()
+            return JSONResponse(result)
+        except GrowConfigError as exc:
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "error": str(exc), "live_trading": False},
+            )
 
     @app.get("/api/agents")
     def api_agents(request: Request) -> dict[str, Any]:

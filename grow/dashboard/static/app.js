@@ -1,4 +1,4 @@
-/* TradingAgent-India paper dashboard — read-only client. */
+/* TradingAgent-India paper dashboard — paper risk editable; no live orders. */
 
 const state = {
   dashboard: null,
@@ -231,12 +231,92 @@ function renderRisk(risk) {
     ["Max positions", risk.max_positions ?? risk.max_open_positions],
     ["RiskGuard status", risk.status_label || risk.status],
     ["Capital profile", risk.capital_profile],
+    ["UI override", risk.override_active ? "ACTIVE" : "OFF"],
     ["Ruleset", risk.ruleset],
   ];
   const html = kvHtml(rows);
   document.getElementById("risk-panel").innerHTML = html;
   document.getElementById("risk-page").innerHTML = html +
     `<p class="muted" style="margin-top:0.75rem">${esc(risk.note || "")}</p>`;
+  fillRiskForm(risk);
+}
+
+function fillRiskForm(risk) {
+  const cash = document.getElementById("risk-starting-cash");
+  const daily = document.getElementById("risk-max-daily-loss");
+  const perTrade = document.getElementById("risk-max-per-trade");
+  const open = document.getElementById("risk-max-open");
+  if (!cash || cash.dataset.dirty === "1") return;
+  cash.value = risk.starting_capital ?? risk.paper_capital ?? "";
+  daily.value = risk.max_daily_loss ?? "";
+  perTrade.value = risk.max_per_trade_risk ?? "";
+  open.value = risk.max_positions ?? risk.max_open_positions ?? "";
+}
+
+function setRiskMsg(text, ok) {
+  const el = document.getElementById("risk-config-msg");
+  if (!el) return;
+  el.textContent = text || "";
+  el.style.color = ok ? "var(--accent)" : "#ff8e8e";
+}
+
+async function saveRiskConfig() {
+  const body = {
+    starting_cash: Number(document.getElementById("risk-starting-cash").value),
+    max_daily_loss: Number(document.getElementById("risk-max-daily-loss").value),
+    max_per_trade_risk: Number(document.getElementById("risk-max-per-trade").value),
+    max_open_positions: Number(document.getElementById("risk-max-open").value),
+  };
+  setRiskMsg("Saving…", true);
+  const res = await fetch("/api/risk/config", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.ok === false) {
+    setRiskMsg(data.error || `Save failed (${res.status})`, false);
+    return;
+  }
+  setRiskMsg(
+    `Saved. Max risk/trade ₹${fmt(data.fields && data.fields.max_per_trade_risk)}. Live trading still disabled.`,
+    true
+  );
+  ["risk-starting-cash", "risk-max-daily-loss", "risk-max-per-trade", "risk-max-open"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) delete el.dataset.dirty;
+  });
+  await refresh();
+}
+
+async function resetRiskConfig() {
+  setRiskMsg("Resetting…", true);
+  const res = await fetch("/api/risk/config/reset", { method: "POST" });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.ok === false) {
+    setRiskMsg(data.error || `Reset failed (${res.status})`, false);
+    return;
+  }
+  setRiskMsg("Restored INDIA_INDEX_OPTIONS_PAPER_10K profile.", true);
+  ["risk-starting-cash", "risk-max-daily-loss", "risk-max-per-trade", "risk-max-open"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) delete el.dataset.dirty;
+  });
+  await refresh();
+}
+
+function wireRiskForm() {
+  const saveBtn = document.getElementById("risk-config-save");
+  const resetBtn = document.getElementById("risk-config-reset");
+  if (saveBtn) saveBtn.addEventListener("click", () => saveRiskConfig().catch((e) => setRiskMsg(e.message, false)));
+  if (resetBtn) resetBtn.addEventListener("click", () => resetRiskConfig().catch((e) => setRiskMsg(e.message, false)));
+  ["risk-starting-cash", "risk-max-daily-loss", "risk-max-per-trade", "risk-max-open"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.addEventListener("input", () => {
+      el.dataset.dirty = "1";
+    });
+  });
 }
 
 function renderAgentsPage(agents) {
@@ -477,6 +557,7 @@ async function refresh(opts = {}) {
 }
 
 wireNav();
+wireRiskForm();
 refresh().catch((err) => {
   document.getElementById("ceo-panel").innerHTML =
     `<div class="empty">Failed to load dashboard: ${esc(err.message)}</div>`;

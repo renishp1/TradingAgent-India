@@ -113,6 +113,36 @@
             <div class="risk-status" id="risk-status-page"></div>
             <div class="kv" id="risk-page"></div>
           </article>
+          <article class="card">
+            <h2>Paper risk configuration</h2>
+            <p class="muted">
+              Adjust paper capital and risk caps used by RiskGuard / campaign feasibility.
+              Live trading and broker orders stay disabled.
+            </p>
+            <div class="cred-form" id="risk-config-form">
+              <label class="field">
+                <span>Starting cash (₹)</span>
+                <input type="number" id="risk-starting-cash" min="1" step="100" />
+              </label>
+              <label class="field">
+                <span>Max daily loss (₹)</span>
+                <input type="number" id="risk-max-daily-loss" min="1" step="100" />
+              </label>
+              <label class="field">
+                <span>Max risk / trade (₹)</span>
+                <input type="number" id="risk-max-per-trade" min="1" step="50" />
+              </label>
+              <label class="field">
+                <span>Max open positions</span>
+                <input type="number" id="risk-max-open" min="1" step="1" />
+              </label>
+              <p class="muted" id="risk-config-msg"></p>
+              <div class="actions">
+                <button type="button" class="btn btn-primary" id="risk-config-save">Save paper risk</button>
+                <button type="button" class="btn" id="risk-config-reset">Reset to 10K profile</button>
+              </div>
+            </div>
+          </article>
         </section>
 
         <section class="view" id="view-research">
@@ -155,7 +185,10 @@
           </article>
           <article class="card">
             <h2>Settings</h2>
-            <p class="muted">Trading controls remain view-only. There is no control to enable live trading.</p>
+            <p class="muted">
+              Paper risk limits are editable on the Risk Guard page.
+              There is no control to enable live trading or place broker orders.
+            </p>
             <pre class="code" id="settings-page"></pre>
           </article>
         </section>

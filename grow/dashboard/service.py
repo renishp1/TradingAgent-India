@@ -19,6 +19,15 @@ from typing import Any, Mapping
 from grow.campaign.config import campaign_paper_config
 from grow.clock import IST, SystemClock
 from grow.config import GrowConfig, load_config
+from grow.dashboard.risk_override import (
+    OVERRIDE_PROFILE,
+    apply_override,
+    clear_override,
+    load_override,
+    resolve_override_path,
+    save_override,
+)
+from grow.errors import GrowConfigError
 from grow.execution.lock import LIVE_TRADING_COMPILED, scrub_broker_credentials_for_paper
 from grow.market.session import SessionCalendar
 from grow.options.select import session_day
@@ -124,7 +133,7 @@ def _book_from_checkpoint_ledger(config: GrowConfig, ledger: Mapping[str, Any]) 
 
 
 class DashboardService:
-    """In-process read model for the paper dashboard (read-only)."""
+    """In-process paper dashboard. Orders / live trading stay disabled; paper risk is editable."""
 
     def __init__(
         self,
@@ -136,9 +145,17 @@ class DashboardService:
         option_positions: list[dict[str, Any]] | None = None,
         replay_root: Path | str | None = None,
         market_snapshot: Mapping[str, Any] | None = None,
+        risk_override_path: Path | str | None = None,
     ) -> None:
         raw = config if config is not None else load_config()
-        self.config = align_dashboard_config(raw)
+        self._base_config = align_dashboard_config(raw)
+        self._risk_override_path = (
+            Path(risk_override_path)
+            if risk_override_path is not None
+            else resolve_override_path()
+        )
+        self._risk_override = load_override(self._risk_override_path)
+        self.config = apply_override(self._base_config, self._risk_override)
         self.config.assert_safe()
         self.checkpoint_path = self._resolve_checkpoint_path(checkpoint_path)
         self.replay_root = self._resolve_replay_root(replay_root)
@@ -159,6 +176,61 @@ class DashboardService:
             self._try_load_checkpoint()
         if self.last_cycle is None:
             self._try_load_cycle_artifacts()
+
+    def update_paper_risk_config(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Save paper capital/risk limits from the UI. Never enables live trading."""
+        if LIVE_TRADING_COMPILED:
+            raise GrowConfigError("LIVE_TRADING_COMPILED")
+        path = save_override(payload, self._risk_override_path)
+        self._risk_override = load_override(path)
+        prev_cash = float(self.config.paper.starting_cash)
+        self.config = apply_override(self._base_config, self._risk_override)
+        self.config.assert_safe()
+        new_cash = float(self.config.paper.starting_cash)
+        # Re-seed idle paper book when cash changes and there are no open positions.
+        if abs(new_cash - prev_cash) > 1e-9 and not self.book.positions and not self._engine_positions:
+            self.book = _empty_book(self.config)
+        return self.risk_config_view()
+
+    def reset_paper_risk_config(self) -> dict[str, Any]:
+        """Clear UI override and restore campaign paper profile."""
+        if LIVE_TRADING_COMPILED:
+            raise GrowConfigError("LIVE_TRADING_COMPILED")
+        clear_override(self._risk_override_path)
+        self._risk_override = None
+        self.config = self._base_config
+        self.config.assert_safe()
+        if not self.book.positions and not self._engine_positions:
+            self.book = _empty_book(self.config)
+        return self.risk_config_view()
+
+    def risk_config_view(self) -> dict[str, Any]:
+        cfg = self.config
+        override = self._risk_override or {}
+        return redact_secrets(
+            {
+                "ok": True,
+                "editable": True,
+                "paper_only": True,
+                "live_trading": False,
+                "broker_order_path": False,
+                "override_active": bool(self._risk_override),
+                "capital_profile": cfg.paper.capital_profile or (
+                    OVERRIDE_PROFILE if self._risk_override else None
+                ),
+                "override_path": str(self._risk_override_path),
+                "fields": {
+                    "starting_cash": cfg.paper.starting_cash,
+                    "max_daily_loss": cfg.risk.max_daily_loss,
+                    "max_per_trade_risk": cfg.risk.max_per_trade_risk,
+                    "max_open_positions": cfg.risk.max_open_positions,
+                },
+                "override_fields": dict(override),
+                "message": (
+                    "Paper risk limits are editable. Live trading and broker orders stay disabled."
+                ),
+            }
+        )
 
     @staticmethod
     def _resolve_checkpoint_path(explicit: Path | str | None) -> Path | None:
@@ -283,13 +355,13 @@ class DashboardService:
                 "PAPER TRADING",
                 "LIVE TRADING DISABLED",
                 "BROKER ORDERS DISABLED",
-                "READ ONLY UI",
+                "PAPER RISK EDITABLE",
             ],
             "can_enable_live_trading": False,
-            "ui_mode": "read_only",
+            "ui_mode": "paper_risk_editable",
             "canonical_paper_path": "campaign",
             "note": (
-                "Read-only paper console. No buy/sell controls. "
+                "Paper console: risk limits editable in UI. No buy/sell or live-trading controls. "
                 "Canonical path: Analysis → CampaignOptions → Decision → CEO gate → RiskGuard → paper."
             ),
         }
@@ -864,9 +936,12 @@ class DashboardService:
                 "require_stop_loss": risk.require_stop_loss,
                 "allow_short": risk.allow_short,
                 "capital_profile": self.config.paper.capital_profile,
-                "read_only": True,
+                "read_only": False,
+                "editable": True,
+                "override_active": bool(self._risk_override),
                 "note": (
-                    "Limits from effective GrowConfig (same profile as RiskGuard / campaign). "
+                    "Paper risk limits are editable in Settings / Risk Guard. "
+                    "Live trading and broker orders stay disabled. "
                     f"True daily P&L may be {_NOT_AVAILABLE} until valuation exists."
                 ),
             }
@@ -1293,14 +1368,16 @@ class DashboardService:
         # Default verified status (TTL) so Settings matches market/system.
         zerodha = self._zerodha_public(probe=True if probe_zerodha else False)
         return {
-            "read_only": True,
+            "read_only": False,
+            "paper_risk_editable": True,
             "can_enable_live_trading": False,
             "can_place_orders": False,
             "message": (
-                "Trading settings remain view-only. "
+                "Paper risk limits are editable. Live trading and order placement stay disabled. "
                 "Zerodha Connect authorises market-data only (no orders)."
             ),
             "zerodha_market_data": zerodha,
+            "risk_config": self.risk_config_view(),
             "config_summary": self.config_view(),
         }
 
